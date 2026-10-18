@@ -1,0 +1,38 @@
+--- deepseek_scaling_rope.py.orig	2026-10-18 21:02:49.190504093 +0200
++++ deepseek_scaling_rope.py	2026-10-18 21:03:34.422290762 +0200
+@@ -221,6 +221,26 @@
+             return self.forward_native(positions, query, key, offsets)
+ 
+ 
++def _dsv41_rope_len(full: float) -> float:
++    """dsv41 patch 0033 (18.10.2026): build the fp32 cos/sin cache only up to
++    max_model_len + 2048 positions instead of the checkpoint's 1M (two caches,
++    -0.34 GiB per rank at max_model_len 320K). Every row is computed on its own
++    (outer product, then cos/sin), so the rows up to the cap are bit-identical;
++    the 2048 extra rows cover draft positions past the end of a request.
++    VLLM_DSV41_ROPE_CAP=0 builds the full length again."""
++    import os
++
++    if os.environ.get("VLLM_DSV41_ROPE_CAP", "1") == "0":
++        return full
++    try:
++        from vllm.config import get_current_vllm_config
++
++        max_len = get_current_vllm_config().model_config.max_model_len
++    except Exception:  # noqa: BLE001  (no config set: keep the full cache)
++        return full
++    return min(full, max_len + 2048)
++
++
+ class DeepseekV4ScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
+     """RotaryEmbedding extended with YaRN method.
+ 
+@@ -244,7 +264,7 @@
+     def _compute_cos_sin_cache(self) -> torch.Tensor:
+         inv_freq = self._compute_inv_freq(self.scaling_factor)
+         t = torch.arange(
+-            self.max_position_embeddings * self.scaling_factor,
++            _dsv41_rope_len(self.max_position_embeddings * self.scaling_factor),
+             device=inv_freq.device,
+             dtype=torch.float32,
+         )

@@ -1,0 +1,29 @@
+--- core.py.orig	2026-10-18 19:01:31.830648188 +0200
++++ core.py	2026-10-18 19:01:31.829767009 +0200
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import gc
+ import os
++
++_DSV41_PREFILL_EVERY_N = int(os.environ.get("VLLM_PREFILL_EVERY_N_STEPS", "1"))
+ import queue
+ import signal
+ import threading
+@@ -624,8 +626,15 @@
+ 
+     def _should_throttle_prefills(self) -> bool:
+         """Whether to defer new prefills this step (DP prefill balancing).
+-        Overridden by the DP engine core; never throttles otherwise."""
+-        return False
++        Overridden by the DP engine core. dsv41 fairness (18.10.2026): with VLLM_PREFILL_EVERY_N_STEPS=N > 1 the prefill
++        compute of throttled requests (priority >= VLLM_PREFILL_THROTTLE_MIN_PRIO) runs only on every N-th step while
++        decodes are running. On this MoE a step with any prefill tokens streams nearly all expert weights (~0.3 s on
++        2x GB10), a decode-only step ~40 ms, so a background prefill otherwise pins interactive decode at ~5 tok/s."""
++        n = _DSV41_PREFILL_EVERY_N
++        if n <= 1:
++            return False
++        self._dsv41_pf_steps = getattr(self, "_dsv41_pf_steps", 0) + 1
++        return self._dsv41_pf_steps % n != 0
+ 
+     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
+         """Schedule, execute, and make output.

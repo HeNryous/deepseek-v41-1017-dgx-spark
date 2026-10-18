@@ -1,0 +1,30 @@
+deepseek-v41-1017-dgx-spark
+Copyright 2026 HeNryous
+
+Our patches (patches/, docker/files/) are licensed under the Apache License, Version 2.0 (LICENSE). The files in
+docker/files/ are vLLM source files (Apache-2.0, github.com/vllm-project/vllm) with our changes; the published image
+is built on the sudoingX dgx-spark-deepseek-v41 serving image, whose NOTICE follows unchanged:
+
+----------------------------------------------------------------------------------------------------------
+dgx-spark-deepseek-v41
+Copyright 2026 sudoingX
+
+This repository is licensed under the Apache License, Version 2.0 (LICENSE). It builds on, and in places adapts, the
+following third-party work:
+
+- vLLM (Apache-2.0, github.com/vllm-project/vllm): the serving engine. patches/ holds our changes against upstream main
+  6e517b15c1833cf72a7f557ee32524d98682e617; vLLM itself is not vendored.
+- exllamav3 (MIT, github.com/turboderp-org/exllamav3): the EXL3 trellis format, its quantizer and kernels, called by our
+  plugin and quantization scripts, not copied (license text: patches/exl3_moe/vllm_exl3_moe/csrc/LICENSE.exllamav3).
+- TensorFold (Apache-2.0, github.com/ashhart/TensorFold and bertholomus's DeepSeek-V4.1 fork): the RDMA all-reduce ring,
+  the paced L2 prefetch kernel, its grouped EXL3 prompt kernels for the routed experts (copied unchanged into
+  csrc/tf_experts/ from TensorFold commit 90b68e06, on by default since v1.1), and design ideas behind the sparse verify attention and the shared-expert slot, each
+  file marked and listed in patches/exl3_moe/vllm_exl3_moe/csrc/NOTICE.tensorfold, which carries TensorFold's NOTICE:
+
+    TensorFold
+    Copyright 2026 TensorFold contributors
+    https://github.com/ashhart/TensorFold
+
+- DeepSeek-V4.1-Flash (MIT, Copyright (c) 2023 DeepSeek, huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash): the model.
+  Our quantized weights are derived from the official checkpoint at revision 2cba9e42 under its MIT license.
+- kit_bench.py (bertholomus) is the measurement client behind our speed numbers; it is not vendored here.

@@ -1,0 +1,43 @@
+--- o_proj.py.orig	2026-10-18 20:28:37.674238489 +0200
++++ o_proj.py	2026-10-18 20:28:37.668218488 +0200
+@@ -208,9 +208,39 @@
+ _WOA_FP8_ACT = _os.environ.get("VLLM_DSV41_WOA_FP8_ACT", "1") == "1"
+ 
+ 
++# Patch 0032 (18.10.2026): the round trip as ONE Triton kernel. The torch version below ran ~14 eager kernels with fp32
++# temporaries (~58 B per element; ~0.2 s per 2048-token prefill chunk on 2x GB10, ~15 % of TTFT). The scale uses the
++# reference's own IEEE-bit ceil(log2) (fast_log2_ceil / fast_pow2 in inference/kernel.py), not log2f/exp2f, so it is
++# exact where the torch version could round at power-of-two boundaries. VLLM_DSV41_WOA_QDQ_TRITON=0 = torch version.
++import triton as _triton
++import triton.language as _tl
++
++_QDQ_TRITON = _os.environ.get("VLLM_DSV41_WOA_QDQ_TRITON", "1") == "1"
++
++
++@_triton.jit
++def _qdq_ue8m0_kernel(x_ptr, y_ptr, n_groups, BLOCK_G: _tl.constexpr, GS: _tl.constexpr):
++    g = _tl.program_id(0) * BLOCK_G + _tl.arange(0, BLOCK_G)
++    offs = g[:, None] * GS + _tl.arange(0, GS)[None, :]
++    mask = g[:, None] < n_groups
++    x = _tl.load(x_ptr + offs, mask=mask, other=0.0).to(_tl.float32)
++    amax = _tl.maximum(_tl.max(_tl.abs(x), axis=1), 1e-4)
++    bits = (amax * (1.0 / 448.0)).to(_tl.uint32, bitcast=True)
++    e = ((bits >> 23) & 0xFF).to(_tl.int32) - 127 + _tl.where((bits & 0x7FFFFF) != 0, 1, 0)
++    s = ((e + 127) << 23).to(_tl.uint32).to(_tl.float32, bitcast=True)
++    q = _tl.clamp(x / s[:, None], -448.0, 448.0).to(_tl.float8e4nv)
++    _tl.store(y_ptr + offs, (q.to(_tl.float32) * s[:, None]).to(y_ptr.dtype.element_ty), mask=mask)
++
++
+ def _fp8_qdq_ue8m0(x: torch.Tensor, group_size: int = 32) -> torch.Tensor:
+-    """act_quant(x, 32, "ue8m0", e8m0, inplace=True) of DeepSeek's inference/kernel.py in torch:
++    """act_quant(x, 32, "ue8m0", e8m0, inplace=True) of DeepSeek's inference/kernel.py:
+     per 32 values amax (min 1e-4), scale = 2**ceil(log2(amax / 448)), e4m3 round trip, back to x.dtype."""
++    if _QDQ_TRITON and x.is_cuda and group_size == 32 and x.shape[-1] % 32 == 0:
++        x = x.contiguous()
++        y = torch.empty_like(x)
++        n_groups = x.numel() // 32
++        _qdq_ue8m0_kernel[(_triton.cdiv(n_groups, 64),)](x, y, n_groups, BLOCK_G=64, GS=32)
++        return y
+     shape = x.shape
+     xf = x.float().reshape(*shape[:-1], shape[-1] // group_size, group_size)
+     amax = xf.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)

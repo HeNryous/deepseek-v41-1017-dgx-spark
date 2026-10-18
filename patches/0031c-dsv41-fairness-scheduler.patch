@@ -1,0 +1,68 @@
+--- scheduler.py.orig	2026-10-18 19:01:31.831158666 +0200
++++ scheduler.py	2026-10-18 21:25:29.781520360 +0200
+@@ -1,5 +1,9 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os as _dsv41_os
++# dsv41 fairness (18.10.2026): long_prefill_token_threshold + DP-style prefill deferral only for requests with
++# priority >= this (proxy: Rene/Hermes 0, subagent 5, hindsight/transcript/prefix-warm 10); 0 = all requests.
++_DSV41_THROTTLE_MIN_PRIO = int(_dsv41_os.environ.get("VLLM_PREFILL_THROTTLE_MIN_PRIO", "0"))
+ import itertools
+ import time
+ from collections import defaultdict, deque
+@@ -618,7 +622,15 @@
+         # all prefill compute unless saturated.
+         defer_prefills = (
+             throttle_prefills and not self.prefill_capacity_bound
+-        ) and any(not r.is_prefill_chunk for r in self.running)
++        ) and any(
++            r.priority < _DSV41_THROTTLE_MIN_PRIO
++            if _DSV41_THROTTLE_MIN_PRIO > 0 else not r.is_prefill_chunk
++            for r in self.running
++        )  # dsv41 0031c: with a priority floor, throttle while a foreground request runs (decode OR prefill;
++        # 0031b counted only decoding ones, so background chunks also ate the budget of a foreground prefill).
++        # Admission of a WAITING foreground request needs budget left after the background chunks of a release
++        # step (else prefill_capacity_bound switches the throttle off and it starves: 150 s TTFT on 18.10.):
++        # keep long_prefill_token_threshold x (max_num_seqs - 1) < max_num_batched_tokens.
+ 
+         # `long_prefill_token_threshold` exists to stop a long prefill from
+         # starving other requests of the token budget. When it is the only
+@@ -666,7 +678,7 @@
+                 req_index += 1
+                 continue
+ 
+-            if defer_prefills and request.is_prefill_chunk:
++            if defer_prefills and request.is_prefill_chunk and request.priority >= _DSV41_THROTTLE_MIN_PRIO:
+                 # DP prefill balancing: defer this in-progress prefill chunk to a
+                 # cadence-aligned step; decodes still run to fill this step.
+                 req_index += 1
+@@ -688,7 +700,8 @@
+                 + request.num_output_placeholders
+                 - request.num_computed_tokens
+             )
+-            if 0 < long_prefill_token_threshold < num_new_tokens:
++            if (0 < long_prefill_token_threshold < num_new_tokens
++                    and request.priority >= _DSV41_THROTTLE_MIN_PRIO):
+                 num_new_tokens = long_prefill_token_threshold
+             num_new_tokens = min(
+                 num_new_tokens, token_budget, input_budget - draft_slots
+@@ -1080,7 +1093,8 @@
+                     # KVTransfer: loading remote KV, do not allocate for new work.
+                     assert num_external_computed_tokens > 0
+                     num_new_tokens = 0
+-                elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
++                elif (defer_prefills and num_computed_tokens < request.num_tokens - 1
++                      and request.priority >= _DSV41_THROTTLE_MIN_PRIO):
+                     # DP prefill balancing: defer this step's local prefill
+                     # compute to a cadence-aligned step.
+                     break
+@@ -1122,7 +1136,8 @@
+                             num_new_tokens = padded_num_tokens
+                             pad_spec_decode = True
+ 
+-                    if 0 < long_prefill_token_threshold < num_new_tokens:
++                    if (0 < long_prefill_token_threshold < num_new_tokens
++                            and request.priority >= _DSV41_THROTTLE_MIN_PRIO):
+                         num_new_tokens = long_prefill_token_threshold
+ 
+                     # chunked prefill has to be enabled explicitly to allow

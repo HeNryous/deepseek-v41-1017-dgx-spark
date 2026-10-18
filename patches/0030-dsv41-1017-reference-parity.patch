@@ -1,0 +1,89 @@
+DeepSeek-V4.1-Flash-1017 reference parity (ours, 17.10.2026). The 1017 checkpoint ships DeepSeek's corrected reference
+(inference/model.py, encoding/encoding.py identical to V4.1 main after Oct 12/16), which our pin predates:
+1. wo_a: o is FP8 quantized+dequantized (32 values per ue8m0 scale, e4m3) before the einsum (act_quant(..., True)) -
+   added on the EXL3 grouped_bmm path of deep_gemm_fp8_o_proj (VLLM_DSV41_WOA_FP8_ACT=1, 0 = old behaviour).
+2. encoder: user messages that only carry tool results do not start a new turn (find_last_user_index), so the
+   reasoning of a tool loop is kept; structured tool content (content_blocks) / list user content are passed through.
+The reference's indexer owns_k guard fixes the reference itself; vLLM keeps index keys per kv_source layer already.
+
+diff --git a/vllm/models/deepseek_v4/nvidia/ops/o_proj.py b/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
+index e5232dce4..f4543ee17 100644
+--- a/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
++++ b/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
+@@ -74,6 +74,10 @@ def deep_gemm_fp8_o_proj(
+             tma_aligned_scales=tma_aligned_scales,
+             quantize=False,
+         )
++        if _WOA_FP8_ACT:
++            # DeepSeek-V4.1-Flash reference since Oct 12 2026 (1017 ships it): o is block-wise FP8
++            # quantized and dequantized (32 activations per ue8m0 scale) before the wo_a einsum.
++            o_rot = _fp8_qdq_ue8m0(o_rot)
+         return wo_b(grouped_bmm(o_rot).flatten(1))
+     if getattr(wo_a, "sm12x_bmm_groups", None) and not isinstance(
+         o, QuantizedActivation
+@@ -197,3 +201,19 @@ def rope_quant_attn_out(num_tokens: int, device: torch.device) -> QuantizedActiv
+         orig_shape=data.shape,
+         quant_key=kFp8Dynamic128Sym,
+     )
++
++# --- DSV4.1-1017 reference parity (dsv41 recipe patch 0030) --------------------------------------------
++import os as _os
++
++_WOA_FP8_ACT = _os.environ.get("VLLM_DSV41_WOA_FP8_ACT", "1") == "1"
++
++
++def _fp8_qdq_ue8m0(x: torch.Tensor, group_size: int = 32) -> torch.Tensor:
++    """act_quant(x, 32, "ue8m0", e8m0, inplace=True) of DeepSeek's inference/kernel.py in torch:
++    per 32 values amax (min 1e-4), scale = 2**ceil(log2(amax / 448)), e4m3 round trip, back to x.dtype."""
++    shape = x.shape
++    xf = x.float().reshape(*shape[:-1], shape[-1] // group_size, group_size)
++    amax = xf.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
++    scale = torch.exp2(torch.ceil(torch.log2(amax * (1.0 / 448.0))))
++    y = (xf / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).float() * scale
++    return y.reshape(shape).to(x.dtype)
+diff --git a/vllm/tokenizers/deepseek_v41_encoding.py b/vllm/tokenizers/deepseek_v41_encoding.py
+index 6851d42f9..5e4b8223a 100644
+--- a/vllm/tokenizers/deepseek_v41_encoding.py
++++ b/vllm/tokenizers/deepseek_v41_encoding.py
+@@ -85,10 +85,14 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+ 
+         if role == "tool":
+             # Convert tool message to a user message with tool_result block
++            # 1017 reference: structured tool content (content_blocks) wins over a non-string content
++            content = msg.get("content", "")
++            if msg.get("content_blocks") and not isinstance(msg.get("content"), str):
++                content = msg["content_blocks"]
+             tool_block = {
+                 "type": "tool_result",
+                 "tool_use_id": msg.get("tool_call_id", ""),
+-                "content": msg.get("content", ""),
++                "content": content,
+             }
+             # Merge into previous message if it's already a user (merged tool)
+             if (
+@@ -107,7 +111,10 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+         elif role == "user":
+             content_blocks = msg.get("content_blocks")
+             if content_blocks is None:
+-                content_blocks = [{"type": "text", "text": msg.get("content", "")}]
++                content = msg.get("content", "")
++                content_blocks = (
++                    content if isinstance(content, list) else [{"type": "text", "text": content}]
++                )
+             if (
+                 merged
+                 and merged[-1].get("role") == "user"
+@@ -301,6 +308,13 @@ def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
+     for idx in range(len(messages) - 1, -1, -1):
+         role = messages[idx].get("role")
+         if role in ["user", "developer"] or (role == "system" and idx > 0):
++            # DeepSeek-V4.1-Flash reference (1017): user messages that only carry tool results do not
++            # start a new turn, so the reasoning of an agent's tool loop is kept.
++            content_blocks = messages[idx].get("content_blocks")
++            if content_blocks and not any(
++                block.get("type") in ("text", "image", "image_url") for block in content_blocks
++            ):
++                continue
+             last_user_index = idx
+             break
+     return last_user_index

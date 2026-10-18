@@ -1,0 +1,18 @@
+--- indexer.py.orig	2026-10-18 21:02:50.210497923 +0200
++++ indexer.py	2026-10-18 21:03:34.423975363 +0200
+@@ -831,7 +831,14 @@
+     # within the flashmla_sparse workspace.
+     # For DeepSeek-V3.2, the max_model_len is 163840.
+     #   40 * 163840 * 132 = 865075200 bytes = 825 MB
+-    return max_model_len * 40
++    # dsv41 patch 0033 (18.10.2026): factor 8 instead of 40 (-0.32 GiB per rank at
++    # max_model_len 320K). The prefill chunker splits a step's requests so their
++    # gathered keys fit the buffer, and 8 x max_model_len still holds all seats at
++    # full length in one chunk, so the results stay the same.
++    # VLLM_INDEXER_PREFILL_BUFFER_FACTOR=40 restores the upstream size.
++    import os
++
++    return max_model_len * int(os.environ.get("VLLM_INDEXER_PREFILL_BUFFER_FACTOR", "8"))
+ 
+ 
+ def _supports_varlen_paged_mqa_logits() -> bool:
