@@ -3,11 +3,11 @@
 # (scripts/launch/dsv41_tp2.sh from github.com/sudoingX/dgx-spark-deepseek-v41). Run on the head node; the worker is
 # reached over ssh. Fill in the placeholders. The model folder must exist on both nodes at the same path.
 set -euo pipefail
-RECIPE=/path/to/dgx-spark-deepseek-v41
+RECIPE=${RECIPE:-$HOME/dgx-spark-deepseek-v41}      # git clone https://github.com/sudoingX/dgx-spark-deepseek-v41
 export HEAD=<head-hostname> WORKER=<worker-hostname>
 export FAB_IF=<fabric-netdev, e.g. enp1s0f0np0> FAB_HCA=<RoCE device on it, e.g. rocep1s0f0>
 export IMAGE=ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v4h
-export MODEL_DIR=/path/to/DeepSeek-V4.1-Flash-1017-EXL3-2.75bpw-DGX-Spark   # incl. the two official Engram shards
+export MODEL_DIR=$HOME/models/DeepSeek-V4.1-Flash-1017-EXL3-2.75bpw-DGX-Spark   # incl. the two 1017 Engram shards (scripts/download_model.sh)
 export SERVED=DeepSeek-V4.1-Flash-1017-EXL3-Spark-TP2
 export TEXT_ONLY=0 MAX_LEN=327680 MAX_SEQS=4 MAX_BATCH=4096 UTIL=0.86
 export KV_BYTES=4026531840                       # 3.75 GiB per rank -> 989,460 tokens; UTIL then only gates the startup check
