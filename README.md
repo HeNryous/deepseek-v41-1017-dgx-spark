@@ -3,8 +3,8 @@
 A ready-to-run setup for **[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)** on
 **two DGX Spark / GB10** nodes with tensor parallelism 2: our EXL3 quantization
 ([HeNryous/DeepSeek-V4.1-Flash-1017-EXL3-2.75bpw-DGX-Spark](https://huggingface.co/HeNryous/DeepSeek-V4.1-Flash-1017-EXL3-2.75bpw-DGX-Spark),
-**KLD 0.0201** against the unquantized model), a complete vLLM serving image, 320K context, image input, tool calling
-and DSpark speculative decoding. Every number below was measured on this exact setup.
+**KLD 0.0201** against the native 1017 on sudoingX's KLD panel), a complete vLLM serving image, 320K context, image
+input, tool calling and DSpark speculative decoding. Every number below was measured on this exact setup.
 
 ## Hardware
 
@@ -24,12 +24,19 @@ bash scripts/download_model.sh ~/models/DeepSeek-V4.1-Flash-1017-EXL3-2.75bpw-DG
 
 # 3) The launcher comes from the sudoingX recipe (v1.1):
 git clone https://github.com/sudoingX/dgx-spark-deepseek-v41 ~/dgx-spark-deepseek-v41
+git -C ~/dgx-spark-deepseek-v41 checkout cc59c36
 
-# 4) Fill in the placeholders (hostnames, fabric interface, RDMA devices, paths) and start on the head node:
+# 4) Once per image, on both nodes: build the plugin's JIT kernels BEFORE the first start (building them next to
+#    the loaded weights can run the node out of memory and leave a stale lock that blocks every later start):
+mkdir -p ~/.cache/dsv41-serve && docker run --rm --gpus all -v $HOME/.cache/dsv41-serve:/root/.cache \
+  -e TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions -e MAX_JOBS=4 --entrypoint python3 \
+  ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v4h -c 'from vllm_exl3_moe import tf_experts as t; t._ext()'
+
+# 5) Fill in the placeholders (hostnames, fabric interface, RDMA devices, paths) and start on the head node:
 nano serve/serve_example.sh && bash serve/serve_example.sh
 ```
 
-**About the Engram shards:** DeepSeek-V4.1 reads two n-gram tables (~95 GiB each) unquantized from the base checkpoint.
+**About the Engram shards:** DeepSeek-V4.1 reads two n-gram tables (~95 GiB each) as-is (FP8, not re-quantized) from the base checkpoint.
 They are not re-uploaded here; the script takes them straight from `deepseek-ai/DeepSeek-V4.1-Flash-1017`. Without the
 script it is just two commands into the same folder:
 
@@ -50,31 +57,39 @@ curl http://localhost:8000/v1/chat/completions -H 'Content-Type: application/jso
   "messages": [{"role": "user", "content": "Write a binary search in Python."}]}'
 ```
 
-Sampling as recommended by DeepSeek (temperature 1.0, top_p 1.0). Thinking is on by default; switch it with
-`"chat_template_kwargs": {"thinking": false}` or `"reasoning_effort": "none" | "low" | "high" | "max"`.
+Sampling as recommended by DeepSeek (temperature 1.0, top_p 1.0). Thinking is on by default. The deepseek_v41 reasoning
+parser reads the mode only from `chat_template_kwargs`: `{"thinking": false}` or `{"reasoning_effort": "none" | "low" |
+"high" | "xhigh" | "max"}`; a top-level `reasoning_effort` does not reach the parser.
 
 ## Expected results
 
-Measured on 2× GB10, TP2, GPU clock fixed at 2000 MHz for comparable runs.
+Measured on 2× GB10, TP2, GPU clock locked at 2000 MHz on both nodes, no other clients on the server.
 
-**Quality** (KLD panel of the sudoingX recipe against the unquantized 1017)
+**Quality** (sudoingX KLD panel against the native 1017 run through DeepSeek's reference code)
 
 | | KLD ↓ | top-1 ↑ |
 |---|---|---|
 | this quant (routed experts 2.75 bpw per expert, dense 5 bpw, head 6 bpw) | **0.0201** | **95.96 %** |
-| 0xSero 1017 EXL3 2.7 bpw (as reported, same panel) | 0.0304 | 94.95 % |
+| same with dense/head K4 (0xSero's dense layout) | 0.0225 | — |
+| 0xSero 1017 EXL3 2.7 bpw (as reported, same panel, 95 % CI 0.0268–0.0343) | 0.0304 | 94.95 % |
+
+Same pipeline as 0xSero's quant; the gap is budget (more bits in the target model, smaller drafter) and calibration
+(sudoingX's V4.1-written texts vs native 1017 replies), see the model card.
 
 **Speed**
 
 | | |
 |---|---|
-| decode, 1 stream (T=1.0, DSpark k5) | ~57 tok/s |
-| decode, 3 streams aggregate | ~91 tok/s |
-| time to first token, 16K-token prompt | 9.0 s |
-| prefill, 314K-token prompt | 170 s (1,845 tok/s), needle 3/3 |
+| decode, 1 stream (German prose prompt, thinking off, T=1.0, DSpark k5, mean of 3) | ~57 tok/s |
+| decode, 3 streams aggregate (same prompt) | ~91 tok/s |
+| time to first token, cold 18.5K-token prompt | 9.0 s (~2,060 tok/s) |
+| time to first token, cold 314K-token prompt | 170 s (1,845 tok/s); 3 of 3 needles found (10/50/90 % depth, T=0) |
 | foreground stream next to 1 / 2 long background prefills | ~29 / ~23 tok/s, first token ≤ 3.8 s |
 | KV pool (3.75 GiB per rank) | 989,460 tokens = 3 full 320K requests at once |
-| free memory at the 314K prefill peak | ~4 GiB on the head node |
+| lowest free memory over these runs | ~3.9 GiB head, ~5 GiB worker |
+
+Not measured: code prompts, 4 streams, contexts above 320K. TensorFold numbers for the same model on the same hardware
+(other weights, other engine, including code and 1M context) are in [forum thread 386125](https://forums.developer.nvidia.com/t/386125).
 
 ## What is in the image
 
@@ -84,30 +99,33 @@ The serving image of the [sudoingX recipe](https://github.com/sudoingX/dgx-spark
 | patch | what it does | effect |
 |---|---|---|
 | 0030 | 1017 reference parity: wo_a FP8 activation quant-dequant; tool rounds kept together in the encoder | matches the 1017 reference |
-| 0031 + 0031c | fair scheduling: requests with priority ≥ `VLLM_PREFILL_THROTTLE_MIN_PRIO` count as background; their prefills run only every `VLLM_PREFILL_EVERY_N_STEPS`-th step while a foreground request runs | foreground stream next to a 60K background prefill: 5 → ~29 tok/s |
-| 0032 | the 0030 quant-dequant as one Triton kernel instead of 9 eager kernels, bit-exact | decode +7 %, 16K TTFT −15 % (with a clock change) |
-| 0033 | RoPE cache only up to max-model-len; indexer prefill buffer factor 8 instead of 40 (same results) | +0.66 GiB per rank |
+| 0031 + 0031c | priority-aware prefill throttling: requests with `priority` ≥ `VLLM_PREFILL_THROTTLE_MIN_PRIO` (request field `priority` or header `X-Vllm-Priority`, default 0) count as background; while a foreground request runs, their prefills run only every `VLLM_PREFILL_EVERY_N_STEPS`-th step, capped at `--long-prefill-token-threshold` | foreground stream next to one / two 60K background prefills ~29 / ~23 tok/s, first token ≤ 3.8 s (stock vLLM in an earlier config: ~5 / ~2.6 tok/s); background prefills take longer |
+| 0032 | the 0030 quant-dequant as one Triton kernel instead of 9 eager kernels, bit-exact (`VLLM_DSV41_WOA_QDQ_TRITON=0` = old path) | faster; not measured on its own |
+| 0033 | RoPE cache only up to max-model-len + 2048; indexer prefill buffer factor 8 instead of 40 (no change to the math) | ~0.5 GiB less per rank at model load |
 
 `docker/Dockerfile` rebuilds the image from a locally built recipe image; `patches/` holds the diffs.
 
-**Rule for 0031:** keep `--long-prefill-token-threshold` ≤ `--max-num-batched-tokens` / 4. vLLM stops throttling once a
-request is left waiting after a release step (`prefill_capacity_bound`). If background chunks can fill a whole step, a
-new foreground request starves until the background prefill is done (we measured 150 s).
+**Rule for 0031:** keep `long-prefill-token-threshold × (max-num-seqs − 1) < max-num-batched-tokens` (we use
+max-num-batched-tokens / 4 with 4 seqs). vLLM stops throttling once a request is left waiting after a release step
+(`prefill_capacity_bound`). If background chunks can fill a whole step, a new foreground request starves until the
+background prefill is done (we measured 150 s). Without priorities from your clients everything is foreground.
 
 ## Tips that helped on GB10
 
 - **Remove the kdump crash-kernel reservation** (`crashkernel=` on the kernel command line): +2.1 GiB usable memory per node.
-- **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`**: about +1 GiB headroom at prefill peaks.
-- **Page cache is not reclaimable by CUDA on GB10.** Big copies or uploads next to a running server can starve its
-  allocations: run them in a memory-capped cgroup (`systemd-run -p MemoryHigh=1G …`).
-- **Measure A/B with a fixed clock** (`nvidia-smi -lgc 0,2000` on both nodes), and with no other clients on the server.
+- **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** (together with 0033): ~1.3 GiB more free at the 314K peak.
+- **Don't upload, hash or copy big files on a node that is serving.** GB10 CUDA allocations don't reclaim page cache; an
+  HF upload in a MemoryHigh-capped cgroup still pulled MemAvailable down by ~3.6 GiB and our watchdog had to stop the
+  server. O_DIRECT copies (`dd iflag=direct`) to another machine stayed harmless.
+- **Measure A/B with a fixed clock** (`nvidia-smi -lgc 0,2000` on both nodes) and with no other clients on the server
+  (`Running: 0` in the engine log).
 
-## Things we tried and dropped (measured)
+## Tried, and not tried
 
-- DSpark drafter experts at 3 instead of 2 bpw: +1.9 % acceptance, −1 % steps/s → decode +0.9 %, 3 streams −2.8 %, 1.3 GiB less headroom.
-- Probabilistic drafting at T=1: mean p(top-1) 0.78 (prose) / 0.93 (code); christopher_owen measured −0.8 to −2.9 %.
-- Transparent huge pages `never` / no proactive compaction: almost no compaction happens while serving.
-- A second NCCL rail costs ~1 % decode per step (`Simple` or `^LL128` alike) and buys ~3 % prefill; we keep it.
+- DSpark drafter experts at 3 instead of 2 bpw: +1.9 % tokens per step, −1 % steps/s → decode +0.9 %, 3 streams −2.8 %, 1.3 GiB less headroom. Dropped.
+- Probabilistic drafting: not tried. Mean p(top-1) of the target at T=1 is 0.78 (prose) / 0.93 (code), so there is little to gain; christopher_owen measured −0.8 to −2.9 % on his multi-node setup.
+- THP `never` / proactive compaction off: not A/B-tested; compact_stall rose by only ~120–180 per node over three benches plus a 314K prefill.
+- A second NCCL rail: TTFT 3 % shorter, decode ~1 % slower per step (measured with `Simple`; `^LL128` + cuMem off changed nothing measurable). We keep it.
 
 ## Note on untrusted text
 
@@ -120,4 +138,8 @@ quoted e-mail) into the real special token. If you feed untrusted text, insert a
 Our patches: Apache-2.0 (`LICENSE`). The image contains vLLM (Apache-2.0), the sudoingX recipe and plugin
 (Apache-2.0, see `NOTICE`), exllamav3 kernels (MIT), TensorFold kernels (Apache-2.0) and the NVIDIA CUDA base image of
 `vllm/vllm-openai` (NVIDIA license terms). The weights are a derivative of DeepSeek-V4.1-Flash-1017 (MIT).
-Thanks to sudoingX, turboderp, the TensorFold authors, christopher_owen and the DGX Spark forum.
+Thanks to DeepSeek (model and reference code); sudoingX (recipe, quantization pipeline, KLD panel, calibration data,
+decode kernels, launcher); turboderp (EXL3); ashhart, bertholomus and the TensorFold contributors (RDMA ring, L2 prefetch,
+EXL3 prompt kernels); 0xSero; christopher_owen (DSpark experiments, NCCL `^LL128`); jayleaton (special tokens in user
+text, `NCCL_CUMEM_ENABLE=0`); see_spot_ruminate (X925 clock cap); shayanx45/Elevatormusic (compaction analysis) and the
+DGX Spark forum.
