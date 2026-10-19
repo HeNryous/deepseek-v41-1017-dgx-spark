@@ -98,10 +98,13 @@ Same pipeline as 0xSero's quant; the gap is budget (more bits in the target mode
 | decode, code, 1 stream (suite / bench) | 82.4 / 88.9 tok/s | 92.2 tok/s |
 | prose, aggregate 2 / 3 / 4 streams | 62 / 70 / 79 tok/s | – / 82 / 94 tok/s |
 | code, aggregate 2 / 3 / 4 streams | 108 / 126 / 138 tok/s | – / 124 / 140 tok/s |
-| prefill, cold 8K / 32K | 2,230 / 2,984 tok/s | 2,166 / 2,179 tok/s |
+| prefill, cold 8K / 32K | 2,250 / 2,270 tok/s ¹ | 2,166 / 2,179 tok/s |
 | decode with thinking on, prose / code | 46.1 / 63.0 tok/s | |
 
-Not measured: contexts above 320K (TensorFold goes to 1M).
+¹ Measured cold with a fresh `cache_salt` per request. The suite's own 32K run starts with its 8K prompt and hits the
+prefix cache (it showed 2,984 tok/s); corrected on 19.10. after a reader-style cross-check.
+
+Not measured: contexts above 320K (TensorFold goes to 1M). Long prompts: 314K at 2,066 tok/s (table above).
 
 ## What is in the image
 
