@@ -16,7 +16,7 @@ input, tool calling and DSpark speculative decoding. Every number below was meas
 
 ```bash
 # 1) The serving image (linux/arm64, CUDA 13, ~25 GB unpacked) — on both nodes:
-docker pull ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v4h
+docker pull ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v4i
 
 # 2) Model + the two Engram shards into ONE folder (~402 GB). On the head node, then copy to the worker:
 git clone https://github.com/HeNryous/deepseek-v41-1017-dgx-spark && cd deepseek-v41-1017-dgx-spark
@@ -30,10 +30,10 @@ git -C ~/dgx-spark-deepseek-v41 checkout cc59c36
 #    the loaded weights can run the node out of memory and leave a stale lock that blocks every later start):
 mkdir -p ~/.cache/dsv41-serve && docker run --rm --gpus all -v $HOME/.cache/dsv41-serve:/root/.cache \
   -e TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions -e MAX_JOBS=4 --entrypoint python3 \
-  ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v4h -c 'from vllm_exl3_moe import tf_experts as t; t._ext()'
+  ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v4i -c 'from vllm_exl3_moe import tf_experts as t; t._ext()'
 
-# 5) Fill in the placeholders (hostnames, fabric interface, RDMA devices, paths) and start on the head node:
-nano serve/serve_example.sh && bash serve/serve_example.sh
+# 5) Start on the head node (network devices default to the DGX Spark names; see the script):
+HEAD=<head-host> WORKER=<worker-host> bash serve/serve_example.sh
 ```
 
 **About the Engram shards:** DeepSeek-V4.1 reads two n-gram tables (~95 GiB each) as-is (FP8, not re-quantized) from the base checkpoint.
@@ -82,14 +82,26 @@ Same pipeline as 0xSero's quant; the gap is budget (more bits in the target mode
 |---|---|
 | decode, 1 stream (German prose prompt, thinking off, T=1.0, DSpark k5, mean of 3) | ~57 tok/s |
 | decode, 3 streams aggregate (same prompt) | ~91 tok/s |
-| time to first token, cold 18.5K-token prompt | 9.0 s (~2,060 tok/s) |
-| time to first token, cold 314K-token prompt | 170 s (1,845 tok/s); 3 of 3 needles found (10/50/90 % depth, T=0) |
+| time to first token, cold 18.5K-token prompt | 8.4 s (~2,200 tok/s) |
+| time to first token, cold 314K-token prompt | 152 s (2,066 tok/s); 3 of 3 needles found (10/50/90 % depth, T=0) |
 | foreground stream next to 1 / 2 long background prefills | ~29 / ~23 tok/s, first token ≤ 3.8 s |
 | KV pool (3.75 GiB per rank) | 989,460 tokens = 3 full 320K requests at once |
-| lowest free memory over these runs | ~3.9 GiB head, ~5 GiB worker |
+| lowest free memory over these runs (incl. the 314K prefill) | ~3.1 GiB head, ~4.2 GiB worker (watchdog stops at 1.5) |
 
-Not measured: code prompts, 4 streams, contexts above 320K. TensorFold numbers for the same model on the same hardware
-(other weights, other engine, including code and 1M context) are in [forum thread 386125](https://forums.developer.nvidia.com/t/386125).
+**With Elevatormusic's TensorFold test scripts** (`tests/v41_suite.py` speed group and `tests/v41_bench.py` from
+[their repo](https://github.com/Elevatormusic/DeepSeek-V4.1-Flash-1017-EXL3-TensorFold-2x-DGX-Spark), unchanged, same
+2000 MHz clock; their own TensorFold numbers for comparison, clock not recorded, ~2.4 GHz in their logs):
+
+| | this image | TensorFold (thread 386125) |
+|---|---|---|
+| decode, prose, 1 stream (suite / bench) | 50.6 / 47.5 tok/s | 56.8 tok/s |
+| decode, code, 1 stream (suite / bench) | 82.4 / 88.9 tok/s | 92.2 tok/s |
+| prose, aggregate 2 / 3 / 4 streams | 62 / 70 / 79 tok/s | – / 82 / 94 tok/s |
+| code, aggregate 2 / 3 / 4 streams | 108 / 126 / 138 tok/s | – / 124 / 140 tok/s |
+| prefill, cold 8K / 32K | 2,230 / 2,984 tok/s | 2,166 / 2,179 tok/s |
+| decode with thinking on, prose / code | 46.1 / 63.0 tok/s | |
+
+Not measured: contexts above 320K (TensorFold goes to 1M).
 
 ## What is in the image
 
@@ -102,6 +114,9 @@ The serving image of the [sudoingX recipe](https://github.com/sudoingX/dgx-spark
 | 0031 + 0031c | priority-aware prefill throttling: requests with `priority` ≥ `VLLM_PREFILL_THROTTLE_MIN_PRIO` (request field `priority` or header `X-Vllm-Priority`, default 0) count as background; while a foreground request runs, their prefills run only every `VLLM_PREFILL_EVERY_N_STEPS`-th step, capped at `--long-prefill-token-threshold` | foreground stream next to one / two 60K background prefills ~29 / ~23 tok/s, first token ≤ 3.8 s (stock vLLM in an earlier config: ~5 / ~2.6 tok/s); background prefills take longer |
 | 0032 | the 0030 quant-dequant as one Triton kernel instead of 9 eager kernels, bit-exact (`VLLM_DSV41_WOA_QDQ_TRITON=0` = old path) | faster; not measured on its own |
 | 0033 | RoPE cache only up to max-model-len + 2048; indexer prefill buffer factor 8 instead of 40 (no change to the math) | ~0.5 GiB less per rank at model load |
+| 0034 | backport of vLLM #59894: layer 20 (last KV source) writes its KV for all rows, then runs as the first replay layer on the replay rows only (`VLLM_DSV41_REPLAY_TRIM_CUT=0` = old path) | with 0035/0036: 18.5K TTFT 9.04 → 8.42 s, 314K prefill 171 → 152 s; cold-prefill A/B 5/5 identical texts, corruption test 0 hits |
+| 0035 | dense prompt path without three copies (group-major fp8 quant output fed straight to the GEMM), bit-exact (40/40) | part of the above |
+| 0036 | backport of vLLM #54951 + #61647: indexer prefill rows split over both TP ranks from `VLLM_INDEXER_TP_SHARD_MIN_ROWS` rows on (we use 2048) | part of the above, grows with context |
 
 `docker/Dockerfile` rebuilds the image from a locally built recipe image; `patches/` holds the diffs.
 
@@ -117,6 +132,9 @@ background prefill is done (we measured 150 s). Without priorities from your cli
 - **Don't upload, hash or copy big files on a node that is serving.** GB10 CUDA allocations don't reclaim page cache; an
   HF upload in a MemoryHigh-capped cgroup still pulled MemAvailable down by ~3.6 GiB and our watchdog had to stop the
   server. O_DIRECT copies (`dd iflag=direct`) to another machine stayed harmless.
+- **Pin the RDMA ring's polling thread to an efficiency core** (`EXL3_RDMA_CPU=14`; A725 = cpus 0-4 and 10-14). By default it
+  spins on the last X925 core, which then sets the hottest ACPI sensor: with the pin the hottest sensor ran ~10 °C cooler
+  (75 → 65 °C / 78 → 68 °C) at the same speed.
 - **Measure A/B with a fixed clock** (`nvidia-smi -lgc 0,2000` on both nodes) and with no other clients on the server
   (`Running: 0` in the engine log).
 

@@ -232,10 +232,29 @@ def _qdq_ue8m0_kernel(x_ptr, y_ptr, n_groups, BLOCK_G: _tl.constexpr, GS: _tl.co
     _tl.store(y_ptr + offs, (q.to(_tl.float32) * s[:, None]).to(y_ptr.dtype.element_ty), mask=mask)
 
 
+# Patch 0035 (19.10.2026, draft): prompt chunks (> _QDQ_PROMPT_ROWS rows) quantize the inverse-RoPE kernel's
+# group-major [G, T, D] buffer where it lies instead of a token-major copy of it (the 32-value groups run along D in
+# both layouts: the same values) and hand that layout on, so EXL3's grouped wo_a (vllm_exl3_moe dense.py, patch 0035)
+# reads each head group as one contiguous slab. VLLM_DSV41_WOA_QDQ_GROUP_MAJOR=0 = copy first (patch 0032).
+# VLLM_DSV41_WOA_QDQ_FP16=1 (default off until t_0035_bitgleich.py passed on the box): the kernel stores fp16 directly,
+# which dense.py casts to anyway. Bit-identical as well: every output is e4m3 x 2^k (<= 4 significant bits, exact in
+# bf16), so fp32 -> fp16 rounds the same value the old fp32 -> bf16 -> fp16 chain rounds, with the same RNE.
+_QDQ_PROMPT_ROWS = 144
+_QDQ_GROUP_MAJOR = _os.environ.get("VLLM_DSV41_WOA_QDQ_GROUP_MAJOR", "1") == "1"
+_QDQ_FP16 = _os.environ.get("VLLM_DSV41_WOA_QDQ_FP16", "0") == "1"
+
+
 def _fp8_qdq_ue8m0(x: torch.Tensor, group_size: int = 32) -> torch.Tensor:
     """act_quant(x, 32, "ue8m0", e8m0, inplace=True) of DeepSeek's inference/kernel.py:
     per 32 values amax (min 1e-4), scale = 2**ceil(log2(amax / 448)), e4m3 round trip, back to x.dtype."""
     if _QDQ_TRITON and x.is_cuda and group_size == 32 and x.shape[-1] % 32 == 0:
+        if (_QDQ_GROUP_MAJOR and x.dim() == 3 and x.shape[0] > _QDQ_PROMPT_ROWS
+                and x.transpose(0, 1).is_contiguous()):
+            xt = x.transpose(0, 1)                                    # [G, T, D], contiguous
+            y = torch.empty_like(xt, dtype=torch.float16 if _QDQ_FP16 else xt.dtype)
+            n_groups = xt.numel() // 32
+            _qdq_ue8m0_kernel[(_triton.cdiv(n_groups, 64),)](xt, y, n_groups, BLOCK_G=64, GS=32)
+            return y.transpose(0, 1)                                  # [T, G, D] view, group-major like x
         x = x.contiguous()
         y = torch.empty_like(x)
         n_groups = x.numel() // 32

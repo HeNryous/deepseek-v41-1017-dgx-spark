@@ -1,0 +1,103 @@
+dsv41 patch 0035: prompt path of the EXL3 dense linears without three copies (bit-exact).
+Base: vllm_exl3_moe/dense.py of sudoingX v1.1 and vllm/models/deepseek_v4/nvidia/ops/o_proj.py with our 0030+0032.
+Only rows > 144 (exllamav3 reconstruct range) change; decode graphs and replay batches are untouched. Drops the
+group-major -> token-major copy after the fused quant, the per-group fp16 copies + stack before the GEMM, and the fp32 cat.
+Bit-exact against the old path (torch.equal on real TP2 shapes, 40/40 cases on GB10).
+Switches: VLLM_EXL3_DENSE_PROMPT_NOCOPY=0 and VLLM_DSV41_WOA_QDQ_GROUP_MAJOR=0 restore the old path.
+
+--- a/vllm_exl3_moe/dense.py
++++ b/vllm_exl3_moe/dense.py
+@@ -49,6 +49,23 @@
+ # L2 prefetch points (l2pf.py) that follow a dense module's launch at decode sizes.
+ _L2PF_AFTER = {"attn.wq_b": "attn", "attn.wo_b": "moe"}
+ 
++# dsv41 patch 0035 (19.10.2026, draft): prompt rows (> PROMPT_ROWS, exllamav3's reconstruct range) skip three copies
++# that change no value: wo_a's input is cast to fp16 in one pass straight from the inverse-RoPE kernel's group-major
++# [G, T, in] buffer (each head group then a contiguous [T, in] slab, no per-group .contiguous()), wo_a's group outputs
++# and a merged module's part outputs are converted from fp32 straight into their column blocks of the bf16 result (no
++# torch.stack / torch.cat of fp32). The same exllamav3 calls on the same values, the same fp32 -> bf16 rounding (RNE in
++# copy_ as in .to): bit-identical. Decode graphs and replay batches up to PROMPT_ROWS keep the old code.
++# VLLM_EXL3_DENSE_PROMPT_NOCOPY=0 restores it everywhere.
++PROMPT_ROWS = 144
++
++
++def _prompt_nocopy() -> bool:
++    import os
++    return os.environ.get("VLLM_EXL3_DENSE_PROMPT_NOCOPY", "1") == "1"
++
++
++_PROMPT_NOCOPY = _prompt_nocopy()
++
+ 
+ def _discard_fp8(param, loaded_weight, *args, **kwargs) -> bool:
+     """Weight loader of the Engram wkv's FP8 sink parameters: the EXL3 tensors carry the layer, the FP8 ones are dropped."""
+@@ -293,6 +310,21 @@
+                     if x2.stride(1) != 1 or x2.data_ptr() % 16:  # the kernel reads 4-element vectors, row-major
+                         x2 = x2.contiguous().clone()
+                     return mrow(x2, y).view(t, g_loc, out_f)
++                if _PROMPT_NOCOPY and t > PROMPT_ROWS:
++                    og = o_rot.transpose(0, 1)                 # [G_loc, T, in]
++                    if og.is_contiguous():
++                        # the inverse-RoPE kernel's (or patch 0035's qdq's) group-major buffer: one cast, contiguous
++                        # slabs; .to() returns og itself when it already is fp16 (patch 0035's VLLM_DSV41_WOA_QDQ_FP16)
++                        xg = og.to(torch.float16)
++                        srcs = [xg[i] for i in range(g_loc)]
++                    else:
++                        xs = o_rot.to(torch.float16)
++                        srcs = [xs[:, i].contiguous() for i in range(g_loc)]
++                    out_dtype = torch.bfloat16 if o_rot.dtype == torch.float16 else o_rot.dtype
++                    y = torch.empty((t, g_loc, out_f), dtype=out_dtype, device=o_rot.device)
++                    for i, g_lin in enumerate(lins):
++                        y[:, i].copy_(g_lin.forward(srcs[i], {}, out_dtype=torch.float32))
++                    return y
+                 xs = o_rot.to(torch.float16)
+                 return torch.stack([g_lin.forward(xs[:, i].contiguous(), {}, out_dtype=torch.float32)
+                                     for i, g_lin in enumerate(lins)], 1).to(o_rot.dtype)
+@@ -360,6 +392,15 @@
+             xs = xs.float() / sc
+         xs = xs.to(torch.float16).contiguous()
+         outs = [m.forward(xs, {}, out_dtype=torch.float32) for m in layer._exl3]
++        if _PROMPT_NOCOPY and len(outs) > 1 and sc is None and rows > PROMPT_ROWS:
++            # patch 0035: each part's fp32 output straight into its column block of the result (no fp32 cat)
++            y = torch.empty((rows, sum(o.shape[-1] for o in outs)), dtype=x.dtype, device=x.device)
++            c = 0
++            for o in outs:
++                y[:, c:c + o.shape[-1]].copy_(o)
++                c += o.shape[-1]
++            y = y.reshape(*x.shape[:-1], -1)
++            return y if bias is None else y + bias
+         y = outs[0] if len(outs) == 1 else torch.cat(outs, -1)
+         if sc is not None:
+             y = y * sc
+--- a/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
++++ b/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
+@@ -232,10 +232,29 @@
+     _tl.store(y_ptr + offs, (q.to(_tl.float32) * s[:, None]).to(y_ptr.dtype.element_ty), mask=mask)
+ 
+ 
++# Patch 0035 (19.10.2026, draft): prompt chunks (> _QDQ_PROMPT_ROWS rows) quantize the inverse-RoPE kernel's
++# group-major [G, T, D] buffer where it lies instead of a token-major copy of it (the 32-value groups run along D in
++# both layouts: the same values) and hand that layout on, so EXL3's grouped wo_a (vllm_exl3_moe dense.py, patch 0035)
++# reads each head group as one contiguous slab. VLLM_DSV41_WOA_QDQ_GROUP_MAJOR=0 = copy first (patch 0032).
++# VLLM_DSV41_WOA_QDQ_FP16=1 (default off until t_0035_bitgleich.py passed on the box): the kernel stores fp16 directly,
++# which dense.py casts to anyway. Bit-identical as well: every output is e4m3 x 2^k (<= 4 significant bits, exact in
++# bf16), so fp32 -> fp16 rounds the same value the old fp32 -> bf16 -> fp16 chain rounds, with the same RNE.
++_QDQ_PROMPT_ROWS = 144
++_QDQ_GROUP_MAJOR = _os.environ.get("VLLM_DSV41_WOA_QDQ_GROUP_MAJOR", "1") == "1"
++_QDQ_FP16 = _os.environ.get("VLLM_DSV41_WOA_QDQ_FP16", "0") == "1"
++
++
+ def _fp8_qdq_ue8m0(x: torch.Tensor, group_size: int = 32) -> torch.Tensor:
+     """act_quant(x, 32, "ue8m0", e8m0, inplace=True) of DeepSeek's inference/kernel.py:
+     per 32 values amax (min 1e-4), scale = 2**ceil(log2(amax / 448)), e4m3 round trip, back to x.dtype."""
+     if _QDQ_TRITON and x.is_cuda and group_size == 32 and x.shape[-1] % 32 == 0:
++        if (_QDQ_GROUP_MAJOR and x.dim() == 3 and x.shape[0] > _QDQ_PROMPT_ROWS
++                and x.transpose(0, 1).is_contiguous()):
++            xt = x.transpose(0, 1)                                    # [G, T, D], contiguous
++            y = torch.empty_like(xt, dtype=torch.float16 if _QDQ_FP16 else xt.dtype)
++            n_groups = xt.numel() // 32
++            _qdq_ue8m0_kernel[(_triton.cdiv(n_groups, 64),)](xt, y, n_groups, BLOCK_G=64, GS=32)
++            return y.transpose(0, 1)                                  # [T, G, D] view, group-major like x
+         x = x.contiguous()
+         y = torch.empty_like(x)
+         n_groups = x.numel() // 32
