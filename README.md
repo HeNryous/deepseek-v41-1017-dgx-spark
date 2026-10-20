@@ -294,14 +294,22 @@ from 3.98 to 3.49 tokens per round. At 1.6, JSON keeps 4.05 of 4.11 tokens per r
 - **Routed-expert kernel variants** (deeper pipelining, folded stages; bit-identical): bandwidth-bound, −1 ms at 1 live
   row, ±2 % elsewhere. Not adopted.
 - **Router prefetch depth / x staging (0049):** no flag combination built faster than the default.
-- **Triton verify attention (0022, from the recipe):** in the image, off, not measured on this setup.
+- **Triton verify attention (0022, from the recipe):** in the image, off. Measured on v5: 1 stream ms per round −0.1 %,
+  3–4 streams −2.1 % (geometric mean), and its accumulation order moved the oracle (24 prompts: top-1 99.36 %, truncated
+  KL mean 0.0121, p99 0.20; 8 of 24 greedy continuations identical). Not adopted.
 - **Higher GPU clock:** 2400 MHz saves 2.2 % per decode round (see "Where the time goes"); all our A/B numbers are at
   2000 MHz.
 - **Deep CPU idle states off** (LPI-2/3, aimed at the wake-up latency of NCCL's proxy thread): −0.09 %, no effect.
 - **The RDMA ring over both PCIe functions of the ConnectX port** (`EXL3_RDMA_DEVICES` with two devices; would halve the
   wire time of the logits gather in 0045): not tried.
 - DSpark drafter experts at 3 instead of 2 bpw: +1.9 % tokens per step, −1 % steps/s → decode +0.9 %, 3 streams −2.8 %, 1.3 GiB less headroom. Dropped.
-- Probabilistic drafting: not tried. Mean p(top-1) of the target at T=1 is 0.78 (prose) / 0.93 (code), so there is little to gain; christopher_owen measured −0.8 to −2.9 % on his multi-node setup.
+- **Probabilistic drafting** (`draft_sample_method=probabilistic`, measured on v5 at 2000 MHz): tokens per round at T=1
+  +0.8 % (prose 1.88 vs 1.93 at 1 stream), but the full-vocabulary draft path costs ~1 ms per round: T=1 −2.8 %, T=0
+  −3 %. With block verification on top (`rejection_sample_method=block`): tokens per round +3.95 % at T=1 (code at
+  1 stream 3.70 → 4.05, JSON 3.86 → 4.05, prose unchanged), decode −0.1 % because of the same cost. With greedy drafts,
+  block verification is provably the same as token-wise checking (P(prefix i accepted) = Π p(x_j) either way).
+  Note: in August 2026, probabilistic drafting in an older vLLM build corrupted outputs above ~26.5K context at T > 0;
+  our corruption test (8K–100K at T = 1) would be the gate before using it.
 - THP `never` / proactive compaction off: not A/B-tested; compact_stall rose by only ~120–180 per node over three benches plus a 314K prefill.
 - A second NCCL rail: TTFT 3 % shorter, decode ~1 % slower per step (measured with `Simple`; `^LL128` + cuMem off changed nothing measurable). We keep it.
 
