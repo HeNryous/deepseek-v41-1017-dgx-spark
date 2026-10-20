@@ -16,7 +16,7 @@ input, tool calling and DSpark speculative decoding. Every number below was meas
 
 ```bash
 # 1) The serving image (linux/arm64, CUDA 13, ~25 GB unpacked) — on both nodes:
-docker pull ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v4i
+docker pull ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v5
 
 # 2) Model + the two Engram shards into ONE folder (~402 GB). On the head node, then copy to the worker:
 git clone https://github.com/HeNryous/deepseek-v41-1017-dgx-spark && cd deepseek-v41-1017-dgx-spark
@@ -26,11 +26,15 @@ bash scripts/download_model.sh ~/models/DeepSeek-V4.1-Flash-1017-EXL3-2.75bpw-DG
 git clone https://github.com/sudoingX/dgx-spark-deepseek-v41 ~/dgx-spark-deepseek-v41
 git -C ~/dgx-spark-deepseek-v41 checkout cc59c36
 
-# 4) Once per image, on both nodes: build the plugin's JIT kernels BEFORE the first start (building them next to
-#    the loaded weights can run the node out of memory and leave a stale lock that blocks every later start):
+# 4) Once per image, on both nodes: build the plugin's JIT kernels (TensorFold experts, exl3_mrow, RDMA ring, mHC boundary,
+#    router, routed-expert decode, L2 prefetch) BEFORE the first start (building them next to the loaded weights can run
+#    the node out of memory and leave a stale lock that blocks every later start). serve/serve_example.sh runs the same
+#    before each start; once built, it only loads them. EXL3_SMOE_FLAGS must match the launcher's: like the source hash,
+#    it is part of the module name.
 mkdir -p ~/.cache/dsv41-serve && docker run --rm --gpus all -v $HOME/.cache/dsv41-serve:/root/.cache \
-  -e TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions -e MAX_JOBS=4 --entrypoint python3 \
-  ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v4i -c 'from vllm_exl3_moe import tf_experts as t; t._ext()'
+  -e TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions -e MAX_JOBS=4 -e EXL3_SMOE_FLAGS=-DSMOE_RUNFLAGS=1 \
+  --entrypoint python3 ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v5 \
+  -c 'from vllm_exl3_moe import tf_experts as t, mrow, rdma, mhc, router, smoe, l2pf; t._ext(); mrow.ext(); rdma.ext(); mhc.ext(); router.ext(); smoe.ext(); l2pf.ext()'
 
 # 5) Start on the head node (network devices default to the DGX Spark names; see the script):
 HEAD=<head-host> WORKER=<worker-host> bash serve/serve_example.sh
@@ -63,7 +67,7 @@ parser reads the mode only from `chat_template_kwargs`: `{"thinking": false}` or
 
 ## Expected results
 
-Measured on 2× GB10, TP2, GPU clock locked at 2000 MHz on both nodes, no other clients on the server.
+Measured on 2× GB10, TP2, GPU clock locked on both nodes (2000 MHz unless noted), no other clients on the server.
 
 **Quality** (sudoingX KLD panel against the native 1017 run through DeepSeek's reference code)
 
@@ -76,35 +80,62 @@ Measured on 2× GB10, TP2, GPU clock locked at 2000 MHz on both nodes, no other 
 Same pipeline as 0xSero's quant; the gap is budget (more bits in the target model, smaller drafter) and calibration
 (sudoingX's V4.1-written texts vs native 1017 replies), see the model card.
 
-**Speed**
+**Decode and prefill** with Elevatormusic's TensorFold test scripts (`tests/v41_suite.py` speed group and
+`tests/v41_bench.py` from [their repo](https://github.com/Elevatormusic/DeepSeek-V4.1-Flash-1017-EXL3-TensorFold-2x-DGX-Spark),
+unchanged), image v5 with the switches of `serve/serve_example.sh`. Each cell is the median of three suite runs or two
+bench runs (20.10.). The TensorFold numbers are their own from thread 386125; their clock is not recorded and their logs
+show ~2.4 GHz:
+
+| tok/s, median | v5, 2000 MHz | v5, 2400 MHz | TensorFold, ~2.4 GHz | v5 vs TensorFold |
+|---|---|---|---|---|
+| prose, 1 stream (suite) | 54.6 | 56.6 | 56.8 | −0.4 % at 2400 MHz |
+| code, 1 stream (suite) | 91.5 | 88.9 | 92.2 | −0.8 % at 2000 / −3.6 % at 2400 MHz ¹ |
+| prose, aggregate 2 / 3 / 4 streams (bench) | 71.9 / 85.3 / 94.4 | – ² | – / 82 / 94 | +4.0 / +0.4 % at 2000 MHz |
+| code, aggregate 2 / 3 / 4 streams (bench) | 112.6 / 136.1 / 155.9 | – ² | – / 124 / 140 | +9.8 / +11.4 % at 2000 MHz |
+| prose / code, 1 stream (bench) | 49.4 / 84.8 | – ² | – | |
+| prefill, cold 8K / 32K | 2,203 ³ / 2,270 ⁴ | | 2,166 / 2,179 | +1.7 % at 2000 MHz / – |
+| decode with thinking on, prose / code (suite) | 52.8 / 78.8 | 54.6 / 59.2 | | |
+
+¹ Single-stream code at T = 1 moves by up to ±10 % between runs (the three 2400 MHz runs: 88.4 / 88.9 / 94.4).
+² At 2400 MHz the repeated bench runs heated the GPUs to 76 °C, and our thermal guard (80 °C GPU / 90 °C board sensor)
+capped first one node, then both, to 2000 MHz mid-run; those runs are not a 2400 MHz measurement. One earlier single
+run at 2400 MHz, before the guard engaged, gave prose 83.8 / 98.0 and code 134.4 / 161.6 tok/s at 3 / 4 streams.
+³ Only the first suite run is cold; the later runs read the 8K prompt from the prefix cache. An earlier cold run the
+same morning gave 2,326.
+⁴ The suite's 32K run starts with its 8K prompt and hits the prefix cache; 2,270 tok/s is our cold measurement of 19.10.
+(image v4i, fresh `cache_salt` per request).
+
+The scripts sample at T = 1, so single-stream numbers move by several percent between runs. Our production image of
+19.10. (v4i + 0040–0046, not published) reached 87.7 (prose) and 143.7 (code) tok/s at 4 streams with the same scripts
+at 2000 MHz (single runs). Not measured: contexts above 320K (TensorFold goes to 1M).
+
+**Long context, fairness and memory** (image v4i; the later changes are mainly in decode-time paths, these rows were not
+re-measured)
 
 | | |
 |---|---|
-| decode, 1 stream (German prose prompt, thinking off, T=1.0, DSpark k5, mean of 3) | ~57 tok/s |
-| decode, 3 streams aggregate (same prompt) | ~91 tok/s |
 | time to first token, cold 18.5K-token prompt | 8.4 s (~2,200 tok/s) |
 | time to first token, cold 314K-token prompt | 152 s (2,066 tok/s); 3 of 3 needles found (10/50/90 % depth, T=0) |
 | foreground stream next to 1 / 2 long background prefills | ~29 / ~23 tok/s, first token ≤ 3.8 s |
 | KV pool (3.75 GiB per rank) | 989,460 tokens = 3 full 320K requests at once |
 | lowest free memory over these runs (incl. the 314K prefill) | ~3.1 GiB head, ~4.2 GiB worker (watchdog stops at 1.5) |
 
-**With Elevatormusic's TensorFold test scripts** (`tests/v41_suite.py` speed group and `tests/v41_bench.py` from
-[their repo](https://github.com/Elevatormusic/DeepSeek-V4.1-Flash-1017-EXL3-TensorFold-2x-DGX-Spark), unchanged, same
-2000 MHz clock; their own TensorFold numbers for comparison, clock not recorded, ~2.4 GHz in their logs):
+**What each step brought** (decode tok/s, each A/B in one window, 2000 MHz, T = 1 unless noted, prose / JSON / code
+prompts at 1, 3 and 4 streams). Rows 1–2 against the same image without the new switches (v4i behaviour), row 3
+against row 2, rows 4–6 against rows 2 + 3. v5 runs rows 2–6.
 
-| | this image | TensorFold (thread 386125) |
-|---|---|---|
-| decode, prose, 1 stream (suite / bench) | 50.6 / 47.5 tok/s | 56.8 tok/s |
-| decode, code, 1 stream (suite / bench) | 82.4 / 88.9 tok/s | 92.2 tok/s |
-| prose, aggregate 2 / 3 / 4 streams | 62 / 70 / 79 tok/s | – / 82 / 94 tok/s |
-| code, aggregate 2 / 3 / 4 streams | 108 / 126 / 138 tok/s | – / 124 / 140 tok/s |
-| prefill, cold 8K / 32K | 2,250 / 2,270 tok/s ¹ | 2,166 / 2,179 tok/s |
-| decode with thinking on, prose / code | 46.1 / 63.0 tok/s | |
+| | 1 stream | prose 3 / 4 streams | JSON 3 / 4 | code 3 / 4 | geometric mean |
+|---|---|---|---|---|---|
+| 1. 0045 + 0046 | +1.6 % | – | – | – | +1.0 % |
+| 2. 0045 + 0046 + 0040 (variant B) + 0042 | +1…+2 % | +9.4 / +6.4 % | +3.6 / +2.4 % | −0.6 / +1.2 % | +4.0 % |
+| 3. recipe switches `VLLM_MOE_GATE_FIRST`, `VLLM_EXL3_MOE_SMOE_SHARED` | T=0: prose −1.5, code +4.6, JSON +9.5 % ¹ | – | – | – | +2.6 % |
+| 4. 0042b ring kernel from 9 rows | T=0: prose −0.2, code −2.1 % ¹ | +1.6 / +6.6 % | +5.1 / +3.4 % | +5.0 / +7.7 % | +2.35 % |
+| 5. 0042b ring from 9 rows + 0047 (same window as row 4) | T=0: prose +5.1, code −1.9 % ¹ | −0.3 / +9.3 % | +3.4 / +3.3 % | +3.7 / +5.0 % | +2.01 % |
+| 6. 0048 + 0050 | 0048 alone: +0.2…+0.8 % | +0.0 / +4.6 % | +1.3 / −0.1 % | +1.7 / +3.9 % | +1.86 % |
 
-¹ Measured cold with a fresh `cache_salt` per request. The suite's own 32K run starts with its 8K prompt and hits the
-prefix cache (it showed 2,984 tok/s); corrected on 19.10. after a reader-style cross-check.
-
-Not measured: contexts above 320K (TensorFold goes to 1M). Long prompts: 314K at 2,066 tok/s (table above).
+¹ These switches change the rounding order, so T = 0 produces a different text; our reading is that these cells
+measure the other text, not a change in speed. "–": not recorded for that run. Corruption test (30K and 100K
+contexts): 0 hits after steps 2 and 3 and for the v5 configuration as a whole.
 
 ## What is in the image
 
@@ -113,6 +144,7 @@ The serving image of the [sudoingX recipe](https://github.com/sudoingX/dgx-spark
 
 | patch | what it does | effect |
 |---|---|---|
+| 0022 | from the recipe's `patches/experimental/`, unchanged: DSpark verify rows through the plugin's Triton sparse attention (`VLLM_DSV41_TRITON_VERIFY=1`) | off; not measured here |
 | 0030 | 1017 reference parity: wo_a FP8 activation quant-dequant; tool rounds kept together in the encoder | matches the 1017 reference |
 | 0031 + 0031c | priority-aware prefill throttling: requests with `priority` ≥ `VLLM_PREFILL_THROTTLE_MIN_PRIO` (request field `priority` or header `X-Vllm-Priority`, default 0) count as background; while a foreground request runs, their prefills run only every `VLLM_PREFILL_EVERY_N_STEPS`-th step, capped at `--long-prefill-token-threshold` | foreground stream next to one / two 60K background prefills ~29 / ~23 tok/s, first token ≤ 3.8 s (stock vLLM in an earlier config: ~5 / ~2.6 tok/s); background prefills take longer |
 | 0032 | the 0030 quant-dequant as one Triton kernel instead of 9 eager kernels, bit-exact (`VLLM_DSV41_WOA_QDQ_TRITON=0` = old path) | faster; not measured on its own |
@@ -120,13 +152,105 @@ The serving image of the [sudoingX recipe](https://github.com/sudoingX/dgx-spark
 | 0034 | backport of vLLM #59894: layer 20 (last KV source) writes its KV for all rows, then runs as the first replay layer on the replay rows only (`VLLM_DSV41_REPLAY_TRIM_CUT=0` = old path) | with 0035/0036: 18.5K TTFT 9.04 → 8.42 s, 314K prefill 171 → 152 s; cold-prefill A/B 5/5 identical texts, corruption test 0 hits |
 | 0035 | dense prompt path without three copies (group-major fp8 quant output fed straight to the GEMM), bit-exact (40/40) | part of the above |
 | 0036 | backport of vLLM #54951 + #61647: indexer prefill rows split over both TP ranks from `VLLM_INDEXER_TP_SHARD_MIN_ROWS` rows on (we use 2048) | part of the above, grows with context |
+| 0040 | configuration only ([patches/0040](patches/0040-dsv41-dynamic-sd-config.md)): vLLM's dynamic speculation `num_speculative_tokens_per_batch_size [[1,2,5],[3,4,4]]`, DSpark k = 5 at 1–2 streams, k = 4 at 3–4 streams (at most 20 verify rows) | see steps 2 and 4–5 above |
+| 0041 | joint DSpark depth choice for all requests of a step (`confb:` / `confr:` policy strings, `cal=1`, `ctx=`), live via the depth file | off by default; did not beat the stock rule `conf` (see "Tried") |
+| 0042 / 0042b | `exl3_mrow` for 17–32 verify rows (`VLLM_EXL3_MROW_MAX_ROWS=32`) instead of exllamav3's GEMM. 0042b, which is in the image, rewrites the 17–32-row kernel (`EXL3_MROW32_VARIANT`, default `ring`); `EXL3_MROW32_MIN_ROWS=9` sends 9–16 rows to it as well | dense time per round at 18 / 24 rows: 20.7 / 21.0 ms before, 18.4 / 19.6 with 0042, 13.2 / 13.7 with 0042b (micro-benchmark); ring from 9 rows: step 4 |
+| 0043 | prompt-lookup drafts layered on DSpark (Triton suffix match; replaces drafts only where its measured acceptance beats the confidence head), `lookup=` | off by default; +0.6…+4.4 % on copy-heavy prompts at T=1, −1…−3 % elsewhere |
+| 0045 | the decode round's TP all-gathers (DSpark Markov pairs, Engram rows, logits) over the plugin's RDMA ring instead of NCCL (`EXL3_RDMA_AG=1`, `EXL3_RDMA_AG_MAX_KB=3072`); a pure copy, bit-exact | step 1 (with 0046) |
+| 0046 | a row limit of its own for the LM head on `exl3_mrow` (`VLLM_EXL3_HEAD_MROW=1 EXL3_HEAD_MROW_MAX_ROWS=8`): 1 stream on mrow, from 2 streams on exllamav3 as before | head pass at 1 / 6 rows 1,113 / 1,160 → 994 / 1,052 µs (micro-benchmark) |
+| 0047 | adaptive verify window with two regimes: for steps with ≤ `VLLM_DSV41_AK_MAX_REQS` requests the scheduler sets k from the requests' accepted drafts (EMA + `VLLM_DSV41_AK_MARGIN`); requests whose EMA reaches `VLLM_DSV41_AK_HI` keep the full window (`VLLM_DSV41_ADAPTIVE_K=1`) | step 5: prose at 1 and 4 streams up, code and JSON at 3–4 streams 1–3 % below step 4 |
+| 0048 | mHC sublayer boundary (post + input collapse + RMSNorm) in one launch, bit-identical to the two TileLang kernels (`VLLM_DSV41_MHC_FUSED_POST=2`) | 6.4 → 3.6 µs per boundary in the decode graph; T=0 texts identical (8/8); step 6 |
+| 0049 | router GEMV prefetch depth and x staging as build flags (`EXL3_ROUTER_FLAGS`) | no faster build found; we run the default (= as before) |
+| 0050 | mHC overlap path up to 24 rows (`VLLM_DSV41_MHC_OVERLAP_MAX_TOKENS=24`), so 4-stream windows (20 rows) take it too | step 6 (4-stream cells) |
+| recipe switches | `VLLM_MOE_GATE_FIRST=1` (recipe patch 0018: the router GEMM before the shared-expert fork) and `VLLM_EXL3_MOE_SMOE_SHARED=1` (the shared expert inside the routed-expert kernel as one more pick per token, instead of its own launches) | step 3 |
 
-`docker/Dockerfile` rebuilds the image from a locally built recipe image; `patches/` holds the diffs.
+All new switches are off by default; without them the image behaves like v4i. `serve/serve_example.sh` sets the ones we
+use. `docker/Dockerfile` rebuilds the image from a locally built recipe image; `patches/` holds the diffs, each with
+what, why, measurements and switches in its header.
 
 **Rule for 0031:** keep `long-prefill-token-threshold × (max-num-seqs − 1) < max-num-batched-tokens` (we use
 max-num-batched-tokens / 4 with 4 seqs). vLLM stops throttling once a request is left waiting after a release step
 (`prefill_capacity_bound`). If background chunks can fill a whole step, a new foreground request starves until the
-background prefill is done (we measured 150 s). Without priorities from your clients everything is foreground.
+background prefill is done (we measured 150 s). Without priorities from your clients everything is foreground. Since
+19.10. we also start vLLM with `--scheduling-policy priority`, so its waiting queue is ordered by the same `priority`
+field (lower first).
+
+## Where the time goes
+
+**How we A/B.** All variants of a comparison in one window at a locked clock (2000 MHz unless noted), no other clients
+(`Running: 0`), T = 1 with a fixed seed, prose / code / JSON prompts at 1, 3 and 4 streams. Variants that need a restart
+run one after the other, live-switchable ones (depth policy) interleaved as A/B/…/B/A. Gates are written down before the
+run (no cell below −1.5 %, 1 stream not worse on average; ranking by the geometric mean over all cells), then a
+corruption test on the winner. Single-stream cells at T = 1 move by several percent between runs because a different
+sample writes a different text; for those we compare tokens per round or use T = 0.
+
+**Round cost by verify depth** (all requests at the same fixed depth, short context, ms per decode round, before
+0040–0050):
+
+| streams | depth 0 | depth 5 | per live row ¹ |
+|---|---|---|---|
+| 1 | 32.3 | 48.1 | 3.2 |
+| 2 | 44.5 | 70.3 | 2.6 |
+| 3 | 59.1 | 94.6 | 2.4 |
+| 4 | 68.8 | 109.2 | 2.0 |
+
+¹ (depth 5 − depth 0) / (5 × streams).
+
+A fit over all cells gives ~9.6 ms of fixed cost per request even at depth 0 (+1.6 ms at 32K context): each request
+pays for its whole verify window (k + 1 rows through the dense layers and attention; rows past the depth only skip the
+routed experts) and for its drafter rows, while a live row next to other streams is cheap. That is what 0040 (fewer
+drafts per stream at 3–4 streams) and 0047 (narrower windows for requests that accept little) act on, and why verifying
+fewer drafts when more streams run did not help (0041, see "Tried").
+
+**Profile, 1 stream** (38.9 ms per round, before 0045–0050; kernel time per group, the groups overlap): MoE + router
+25.3 ms · dense 11.8 · mHC / norm / Engram 5.4 · attention + indexer 4.9 · DSpark drafter 3.6 · communication 2.4 (of
+which NCCL, 10 calls: 0.51) · sampler 1.6 · idle / host 0.4. The round is GPU-bound.
+
+- **Routed experts** are bandwidth-bound: the expert kernels stream at ~225 GB/s, and their 24.2 ms of kernel time
+  overlap to ~15.4 ms of wall time per round. By live rows 1 / 2 / 3 / 4 / 6 / 12 / 20 the routed MoE costs 9.1 / 12.1 /
+  15.4 / 19.4 / 25.5 / 47.7 / 78.8 ms per round (micro-benchmark); deeper pipelining or folded stages changed this by
+  −1 ms at 1 row and by ±2 % elsewhere.
+- **Dense layers above 16 verify rows** (micro-benchmark, one rank, the 43 dense layers incl. the drafter, ms per round):
+
+  | rows | 16 | 18 | 20 | 24 |
+  |---|---|---|---|---|
+  | exllamav3 GEMM above 16 rows (before 0042) | 15.1 | 20.7 | – | 21.0 |
+  | 0042 | 15.0 | 18.4 | – | 19.6 |
+  | 0042b `ring` (separate run, in which 0042 measured 14.8 / 18.2 / 18.4 / 19.0) | 14.8 (12.7 through ring) | 13.2 | 13.3 | 13.7 |
+
+  Ring from 9 rows on was measured twice in the serve: +2.7 % and +2.35 % geometric mean, most 2–4-stream cells
+  between +3 and +8 % (step 4 is the second run); ring for 17–32 rows only: +0.2 %.
+- **mHC boundaries** (80 per round): two TileLang kernels on the main stream at each overlapped boundary; 0048 does the
+  same work in one launch with the same bits (6.4 → 3.6 µs per boundary in the decode graph). At 4 streams (20 rows)
+  the overlap path was not taken (its bound was 16 rows) and mHC cost 3.35 ms per round on the main stream; 0050 raises
+  the bound to 24.
+- **Sampler phase** (1.6 ms): mostly bytes, the K6 LM head (248 MB per rank) takes ~1.1 ms; by our estimate, fusing the
+  small kernels around it would save ≤ 0.1 ms.
+
+**GPU clock** (against 2000 MHz): 2200 / 2300 / 2400 MHz shorten a decode round by 1.1 / 2.0 / 2.2 % and the time to
+first token of an 18.5K prompt by 9 / 11 / 12 %. At 2400 MHz the GPU peaked at 76 °C (hottest ACPI sensor 83 °C) at a
+median GPU power of 59 W (47 W at 2200 MHz). Deep CPU idle states off (LPI-2/3): −0.09 %, no effect.
+
+**Per round against TensorFold** (greedy, kit_bench set b; TensorFold from Elevatormusic's run logs of 18.10., ~2.4 GHz;
+ours from a probe on 17.10. with the image before 0040–0050):
+
+| | tokens per round, TensorFold / this setup | ms per round, TensorFold / this setup |
+|---|---|---|
+| code | 4.34 / 4.51 | 43.9 / 46.6 |
+| prose | 1.92 / 2.13 | 33.4 / 40.5 |
+| structured | 5.88 / 5.98 | 42.2 / 45.6 |
+
+More of our drafts are accepted, but TensorFold's rounds are cheaper; the clock explains at most ~2 % of that. Our
+reading, not measured directly: TensorFold's rounds are flat and sized to the drafts it verifies, while our fixed window
+carries rows past the accepted depth.
+
+**Window width.** A fixed narrower window at one stream (k = 4 / 3 / 2 instead of 5) decoded prose +1.3 / +4.0 / +5.7 %
+faster (T = 0) at the same 2.0 tokens per round, while code lost 3 / 7 / 18 % and JSON 6 / 9 / 19 %. 0047 sizes the
+window per step from each request's accepted drafts. With one regime (the window always follows the average) prose
+gained 7.7 % at 1 stream (T = 0), but code lost 3.8 % (T = 0) and JSON 10.6 % (T = 1). With a threshold of 2.0
+accepted drafts, above which a request keeps the full window, code and JSON held at T = 0, but JSON at T = 1 still fell
+from 3.98 to 3.49 tokens per round. At 1.6, JSON keeps 4.05 of 4.11 tokens per round and prose gains 5.1 % at 1 stream
+(T = 0) and 9.3 % at 4 streams (step 5).
 
 ## Tips that helped on GB10
 
@@ -143,6 +267,39 @@ background prefill is done (we measured 150 s). Without priorities from your cli
 
 ## Tried, and not tried
 
+- **Batch-aware depth à la TensorFold (0041 `confb`), confidence calibration for T > 0 (`cal=1`) and prompt-lookup drafts
+  (0043): all in the image, all off by default, none beat the stock per-request rule** (measured with
+  Elevatormusic-style prompts at T=1, 1/3/4 streams, 4 runs per cell, interleaved A/B/C/D-D/C/B/A at 2000 MHz):
+
+  | vs the stock depth rule `conf` | 1 stream | 3 / 4 streams prose | 3 / 4 streams code | copy-heavy prompts |
+  |---|---|---|---|---|
+  | `confb` (one table of total rows, extrapolated from 1 stream) | ±0.2 % | −1.9 / −2.3 % | −1.9 / −3.0 % | – |
+  | `confb` + `cal=1` | −0.5…−1.0 % | −2.0 / −5.4 % | −2.1 / −2.0 % | – |
+  | + prompt lookup (`lookup=3,8,0.5`) | −1.5…−3.4 % | −1.7 / −3.7 % | −5.1 / −6.5 % | +0.6…+4.4 % (vs. without) |
+
+  Why: with a fixed verify window (k+1 rows per request, rows past the depth only skip the routed experts) live rows are
+  *cheap* next to other streams, and every request pays a fixed cost for its whole window (see "Where the time goes").
+  TensorFold's rule "verify fewer drafts when more streams run" fits its variable-size rounds, not this window;
+  calibrating the confidence head for T=1 also made rounds shallower and lost. Prompt lookup is capped by the window: at
+  T=1 DSpark already reaches 5.4–5.7 of the maximum 6 tokens per round on code edits and JSON rewrites, and the extra
+  search/apply per step costs 1–3 % elsewhere.
+- **Fewer drafts at 3–4 streams without 0042:** 0040 variant A (k = 4 at 3 and k = 3 at 4 streams, never above 16 rows):
+  prose 3 / 4 streams +8.1 / +7.8 %, but code at 4 streams −5.3 %. **0042 alone** (k = 5 everywhere, 18 / 24 rows on
+  `exl3_mrow`): prose 3 / 4 streams +3.9 / +2.5 %, below our gate.
+- **0047 with one regime, or with a threshold of 2.0:** lost code and JSON (see "Window width"). We use 1.6.
+- **A narrower 0047 window for prose** (margin 0.5 instead of 1.0, or additionally a 1-draft floor): prose at 1 stream
+  T=0 +2.4 %, but code at T=1 fell from 3.70 to 3.57 tokens per round and the geometric mean moved only +0.1 / +0.7 %.
+  We keep margin 1.0.
+- **Ring kernel for 17–32 rows only:** +0.2 % (geometric mean). From 9 rows on it pays (step 4).
+- **Routed-expert kernel variants** (deeper pipelining, folded stages; bit-identical): bandwidth-bound, −1 ms at 1 live
+  row, ±2 % elsewhere. Not adopted.
+- **Router prefetch depth / x staging (0049):** no flag combination built faster than the default.
+- **Triton verify attention (0022, from the recipe):** in the image, off, not measured on this setup.
+- **Higher GPU clock:** 2400 MHz saves 2.2 % per decode round (see "Where the time goes"); all our A/B numbers are at
+  2000 MHz.
+- **Deep CPU idle states off** (LPI-2/3, aimed at the wake-up latency of NCCL's proxy thread): −0.09 %, no effect.
+- **The RDMA ring over both PCIe functions of the ConnectX port** (`EXL3_RDMA_DEVICES` with two devices; would halve the
+  wire time of the logits gather in 0045): not tried.
 - DSpark drafter experts at 3 instead of 2 bpw: +1.9 % tokens per step, −1 % steps/s → decode +0.9 %, 3 streams −2.8 %, 1.3 GiB less headroom. Dropped.
 - Probabilistic drafting: not tried. Mean p(top-1) of the target at T=1 is 0.78 (prose) / 0.93 (code), so there is little to gain; christopher_owen measured −0.8 to −2.9 % on his multi-node setup.
 - THP `never` / proactive compaction off: not A/B-tested; compact_stall rose by only ~120–180 per node over three benches plus a 314K prefill.
@@ -160,7 +317,10 @@ Our patches: Apache-2.0 (`LICENSE`). The image contains vLLM (Apache-2.0), the s
 (Apache-2.0, see `NOTICE`), exllamav3 kernels (MIT), TensorFold kernels (Apache-2.0) and the NVIDIA CUDA base image of
 `vllm/vllm-openai` (NVIDIA license terms). The weights are a derivative of DeepSeek-V4.1-Flash-1017 (MIT).
 Thanks to DeepSeek (model and reference code); sudoingX (recipe, quantization pipeline, KLD panel, calibration data,
-decode kernels, launcher); turboderp (EXL3); ashhart, bertholomus and the TensorFold contributors (RDMA ring, L2 prefetch,
-EXL3 prompt kernels); 0xSero; christopher_owen (DSpark experiments, NCCL `^LL128`); jayleaton (special tokens in user
-text, `NCCL_CUMEM_ENABLE=0`); see_spot_ruminate (X925 clock cap); shayanx45/Elevatormusic (compaction analysis) and the
-DGX Spark forum.
+decode kernels, launcher, the experimental patch 0022 and the MoE switches we turn on); turboderp (EXL3); ashhart,
+bertholomus and the TensorFold contributors (RDMA ring and its use for decode gathers, L2 prefetch, EXL3 prompt kernels;
+bertholomus's TensorFold multi-stream depth rule is the idea behind 0041, Apache-2.0); 0xSero; christopher_owen (DSpark
+experiments, NCCL `^LL128`, measurement method); Elevatormusic (TensorFold test scripts and run logs used above);
+coolbho3k (the idea of layering prompt lookup on DSpark; 0043 is an independent implementation, no code taken);
+jayleaton (special tokens in user text, `NCCL_CUMEM_ENABLE=0`); see_spot_ruminate (X925 clock cap);
+shayanx45/Elevatormusic (compaction analysis) and the DGX Spark forum.

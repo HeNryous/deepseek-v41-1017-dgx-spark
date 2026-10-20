@@ -43,7 +43,9 @@ logger = init_logger(__name__)
 # the multi-matrix modules (fused wq_a + wkv, the shared expert's gate + up, wo_a's head groups) and, since the kernel
 # streams weights with TMA bulk copies, the single matrices too (wq_b, wo_b, the shared down: 1.13-1.31x exllamav3 at
 # m=4-6, tests/tune_mrow.py). Prefill sizes stay on exllamav3.
-MROW_MAX_ROWS = 16
+# dsv41 patch 0042 (draft): VLLM_EXL3_MROW_MAX_ROWS=32 runs 17..32 rows (3-4-stream verify windows) on exl3_mrow's
+# second plan (two m16 tiles, csrc/exl3_mrow.cu) instead of exllamav3's GEMM + casts; 16 = before.
+MROW_MAX_ROWS = 32 if __import__('os').environ.get('VLLM_EXL3_MROW_MAX_ROWS', '16') == '32' else 16
 
 
 # L2 prefetch points (l2pf.py) that follow a dense module's launch at decode sizes.

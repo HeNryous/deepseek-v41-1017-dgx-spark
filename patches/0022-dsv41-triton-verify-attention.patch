@@ -1,0 +1,101 @@
+From the sudoingX recipe (github.com/sudoingX/dgx-spark-deepseek-v41, cc59c36, patches/experimental/), unchanged below.
+Applied in this image but off (VLLM_DSV41_TRITON_VERIFY unset); not measured on this setup.
+
+Ours (dsv41 recipe), Apache-2.0, against vLLM main 6e517b15 + patches 0001-0021.
+VLLM_DSV41_TRITON_VERIFY=1 (default off): on SM12x (GB10), DeepseekV4FlashInferSM120Attention sends its decode-form calls
+(where the target's DSpark verify rows land; the drafter's too) and, in _forward_prefill, the chunks made only of short
+queries to the EXL3 plugin's Triton sparse attention. (The first version hooked _forward_prefill alone and never ran:
+LOG Oct 11 14:45.) Prefill-path rule:
+prefill chunks made only of short queries (DSpark verify rows, up to _FLAT_MAX_Q = 8 tokens a request; V4.1 files
+them under prefill) to the EXL3 plugin's Triton sparse attention (vllm_exl3_moe/sparse_attn.py) instead of
+flashinfer_trtllm_batch_decode_sparse_mla_dsv4. FlashInfer's SM120 planner routes these 6-row calls by its calibrated
+decode/prefill crossover to prefill_mg_dual, ~49 us a layer in 38 layers; forcing its decode kernel measured slower
+(lever fidec, LOG Oct 11 13:32). The Triton kernel reads the same fp8_ds_mla pages (584 B records), per-token SWA and
+compressed indices and lengths, the sink and the scale, and writes the same [T, H, 512] output (rope part rotated).
+Rows past a request's DSpark depth (vLLM's is_padding, patch 0010) skip their attention (zeros; live rows keep their
+bits, and causal attention means no live row reads a dead one). Rounding class (another accumulation order): judged on
+the oracle's noise bars. The short-query test reads the host-side query_start_loc, so it is fixed at capture.
+Test: patches/exl3_moe/tests/test_sparse_attn_gpu.py (reference); scripts/bench/sparse_attn_vs_flashinfer.py (GB10).
+
+diff --git a/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py b/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py
+--- a/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py
++++ b/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py
+@@ -80,6 +80,10 @@
+ # instead of the multi-row kernel (patch 0020)
+ _FLAT_VERIFY = os.environ.get("VLLM_DSV41_FLAT_VERIFY", "0") == "1"
+ _FLAT_MAX_Q = 8
++# VLLM_DSV41_TRITON_VERIFY=1 (patch 0022): on SM12x, prefill chunks made only of short queries (verify rows, up to
++# _FLAT_MAX_Q tokens a request) go to the EXL3 plugin's Triton sparse attention (vllm_exl3_moe/sparse_attn.py) instead
++# of FlashInfer, whose GB10 calibration sends them to its multi-row prefill kernel (~49 us a layer at 6 rows)
++_TRITON_VERIFY = os.environ.get("VLLM_DSV41_TRITON_VERIFY", "0") == "1"
+ 
+ 
+ def _pad_to_supported_q_heads(num_heads: int) -> int:
+@@ -871,6 +875,31 @@
+             raise RuntimeError(
+                 "Compressed sparse MLA decode requires compressed sparse indices."
+             )
++        if _TRITON_VERIFY:
++            # decode-form calls (DSpark verify rows of the target, the drafter's rows): FlashInfer's planner sends the
++            # verify calls to prefill_mg_dual by its crossover; ours reads the same pages, indices, lengths and sink.
++            # Dead verify rows (vLLM's is_padding, patch 0010; only the target's forward sets it) skip their attention.
++            from vllm.forward_context import get_forward_context
++            from vllm_exl3_moe.sparse_attn import sparse_attention
++
++            t = q.shape[0]
++            sparse_attention(
++                q,
++                output,
++                self.scale,
++                self.attn_sink,
++                swa_cache,
++                swa_indices.reshape(t, -1),
++                swa_lens.reshape(-1),
++                swa_cache.shape[1],
++                extra_cache,
++                extra_sparse_indices.reshape(t, -1) if extra_sparse_indices is not None else None,
++                extra_sparse_lengths.reshape(-1) if extra_sparse_lengths is not None else None,
++                extra_cache.shape[1] if extra_cache is not None else 0,
++                pad=getattr(get_forward_context(), "is_padding", None),
++                pad_off=0,
++            )
++            return
+         flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+             query=q,
+             swa_kv_cache=swa_cache,
+@@ -986,6 +1015,35 @@
+                 raise RuntimeError(
+                     "Compressed sparse MLA prefill requires compressed sparse indices."
+                 )
++            if _TRITON_VERIFY:
++                # host-side lengths (capture-safe): every request of the chunk a short query
++                lens_cpu = query_start_loc_cpu[
++                    num_decodes + chunk_start : num_decodes + chunk_end + 1
++                ]
++                if int((lens_cpu[1:] - lens_cpu[:-1]).max()) <= _FLAT_MAX_Q:
++                    from vllm.forward_context import get_forward_context
++                    from vllm_exl3_moe.sparse_attn import sparse_attention
++
++                    # DSpark depth policy (patch 0010): rows past a request's depth are vLLM padding rows; their
++                    # attention is skipped (zeros), the live rows keep their bits
++                    pad = getattr(get_forward_context(), "is_padding", None)
++                    sparse_attention(
++                        q_chunk,
++                        output[query_start:query_end],
++                        self.scale,
++                        self.attn_sink,
++                        swa_kv_paged,
++                        swa_indices_chunk,
++                        swa_lens_chunk,
++                        swa_kv_paged.shape[1],
++                        extra_kv_paged,
++                        extra_sparse_indices_chunk,
++                        extra_sparse_lengths_chunk,
++                        extra_kv_paged.shape[1] if extra_kv_paged is not None else 0,
++                        pad=pad,
++                        pad_off=num_decode_tokens + int(query_start),
++                    )
++                    continue
+             flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+                 query=q_chunk,
+                 swa_kv_cache=swa_kv_paged,

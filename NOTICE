@@ -2,8 +2,10 @@ deepseek-v41-1017-dgx-spark
 Copyright 2026 HeNryous
 
 Our patches (patches/, docker/files/) are licensed under the Apache License, Version 2.0 (LICENSE). The files in
-docker/files/ are vLLM source files (Apache-2.0, github.com/vllm-project/vllm) with our changes; the published image
-is built on the sudoingX dgx-spark-deepseek-v41 serving image, whose NOTICE follows unchanged:
+docker/files/ are vLLM source files (Apache-2.0, github.com/vllm-project/vllm) and files of the recipe's vllm_exl3_moe
+plugin (Apache-2.0, see below; csrc/exl3_rdma.cu and rdma.py adapt TensorFold's one-hop gather, csrc/exl3_mrow.cu uses
+the trellis decode adapted from exllamav3 in the base image's csrc/exl3_common.cuh), each with our changes as listed in
+patches/; the published image is built on the sudoingX dgx-spark-deepseek-v41 serving image, whose NOTICE follows unchanged:
 
 ----------------------------------------------------------------------------------------------------------
 dgx-spark-deepseek-v41

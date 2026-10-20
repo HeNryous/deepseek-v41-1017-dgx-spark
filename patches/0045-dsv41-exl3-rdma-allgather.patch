@@ -1,0 +1,310 @@
+dsv41 patch 0045 (19.10.2026): the TP all-gathers of a decode round over the plugin's RDMA ring instead of NCCL.
+Base: the recipe's plugin vllm_exl3_moe (cc59c36): rdma.py and csrc/exl3_rdma.cu as in the image.
+Why: rdma.py moves only CudaCommunicator.all_reduce to the ring, so each decode round still made ~10 NCCL calls: the
+DSpark drafter's Markov pairs (5 per round, [R, 2] fp32, in the drafter graph), the Engram rows of layers 1 and 14
+([R, 12, 256] bf16, in the target graph) and the logits (eager, [R, 64640] bf16: 776 KB at 6 rows, 3.1 MB at 24).
+Back to back NCCL takes 35.9 us per call against 14.6 us on the ring ([6, 5120] in a graph, recipe FINDINGS.md no. 11).
+Inside a graph each NCCL call also goes through a host node and NCCL's proxy thread, which waits on a condition
+variable whenever no NCCL op is pending (NCCL src/proxy.cc), i.e. between these calls. TensorFold sends every decode
+gather up to 4.25 MB over RDMA.
+How: exl3_rdma.cu: stage_kernel templated on the copy unit (uint4 for the all-reduce = the old code; uint32_t for
+gathers whose rows are not a multiple of 16 bytes, e.g. one Markov pair = 8 bytes); a new gather_kernel (waits on the
+flags like sum_kernel, both flag modes, then copies all ranks as [outer][world][inner] = torch.cat along dim) and the
+binding all_gather(h, x, out, outer). Ring, sequence counter, proxy and slots are shared: all-reduces and all-gathers
+use one sequence, and both ranks issue them in the same order (same model code; none of the redirected gathers runs on
+a side stream). rdma.py: EXL3_RDMA_AG=1 also patches CudaCommunicator.all_gather; the path depends only on dtype, shape
+and dim (equal on all ranks), misalignment is fixed locally with a copy. Slot size = max(all-reduce, all-gather limit);
+the all-reduce limit stays EXL3_RDMA_AR_MAX_KB (prefill all-reduces stay on NCCL). Gathers above the limit (prefill
+Engram, vision) and other groups stay on NCCL; if a rank fails to set up the ring, both ranks fall back to NCCL.
+Exact: a pure copy, the same bytes as NCCL all_gather + movedim/reshape on both ranks.
+Measured (GB10, 2000 MHz): two-node test passed (bits against NCCL for all decode shapes, a round graph with
+interleaved all-reduces, 200 repetitions, both flag modes, latency after pauses). Serve with 0046 against the same image
+without switches: 1 stream +1.6 %, geometric mean over all T = 1 cells (prose / code / JSON, 1 / 3 / 4 streams) +1.0 %.
+Switch: EXL3_RDMA_AG=1 (default 0 = previous behaviour), EXL3_RDMA_AG_MAX_KB (default 256: Markov pairs and Engram rows;
+3072: also the logits up to 24 rows, which we use). Pinned host memory per rank: 3 MB at 256 KB, 36 MB at 3072 KB.
+JIT: new source hash; build it before the first start: python3 -c 'from vllm_exl3_moe import rdma; rdma.ext()'.
+
+--- a/vllm_exl3_moe/csrc/exl3_rdma.cu	2026-10-19 16:23:57.982428147 +0200
++++ b/vllm_exl3_moe/csrc/exl3_rdma.cu	2026-10-19 16:24:55.370550078 +0200
+@@ -13,6 +13,13 @@
+ // RC queue pair places writes in order and the rings are registered without relaxed ordering, so a flag lands after its
+ // data; tests/rdma_ar_2node.py checks every sum of a long run (STRESS=N, both flag-write modes).
+ //
++// All-gather (dsv41 patch 0045, `all_gather`, rdma.py EXL3_RDMA_AG=1): the same ring, sequence and flags, with the
++// summing kernel replaced by a copying one: the slots of every rank go out in rank order as the concatenation along
++// one dim (x seen as [outer, inner bytes], out as [outer, world, inner bytes]), the bytes NCCL's all-gather plus vLLM's
++// movedim would give, for any dtype. All-reduces and all-gathers share the one sequence: every rank issues them in the
++// same order (they are the same model code), so a slot means the same call on every rank. 16-byte copies when the
++// inner bytes and both pointers allow it, else 4-byte ones (the decision is local: the wire carries bytes).
++//
+ // Adapted from TensorFold's one-hop gather (github.com/bertholomus/TensorFold, branch deepseek-v41-tp2,
+ // src/tensorfold/cuda/rdma_gather.cu, v5; Copyright 2026 TensorFold contributors; Apache License 2.0, MIT for its
+ // parts written before TensorFold 0.6.0; see NOTICE.tensorfold): its rings, flags, doorbell, proxy, queue-pair setup and
+@@ -122,8 +129,10 @@
+ 
+ // Each block: wait until the slot's last writes are done, copy its share of the tensor in; the last block to finish
+ // (a counter) publishes the size and the doorbell. One system fence a block after a barrier (as NCCL publishes its
+-// proxy FIFO), the size written before that release.
+-__global__ void __launch_bounds__(STAGE_THREADS) stage_kernel(const uint4* __restrict__ src, int n16, char* send_ring,
++// proxy FIFO), the size written before that release. T: the copy unit (uint4 for the all-reduce, as before; the
++// all-gather also uses uint32_t when its rows are not 16-byte multiples); n16 counts units of T.
++template <typename T>
++__global__ void __launch_bounds__(STAGE_THREADS) stage_kernel(const T* __restrict__ src, int n16, char* send_ring,
+                                                                uint64_t* sizes, uint64_t* doorbell, const uint64_t* sent,
+                                                                uint64_t* seq, int slots, uint64_t max_bytes,
+                                                                const uint64_t* abort_word, unsigned* staged) {
+@@ -136,12 +145,12 @@
+             for (uint32_t i = 1; load_sys(sent + slot) + slots < q; ++i)
+                 if ((i & 1023) == 0 && load_sys(abort_word)) break;
+         s_seq = q;
+-        if (blockIdx.x == 0) store_relaxed_sys(sizes + slot, (uint64_t)n16 * 16);
++        if (blockIdx.x == 0) store_relaxed_sys(sizes + slot, (uint64_t)n16 * sizeof(T));
+     }
+     __syncthreads();
+     const uint64_t q = s_seq;
+     const int slot = (int)(q % slots);
+-    uint4* dst = reinterpret_cast<uint4*>(send_ring + (size_t)slot * max_bytes);
++    T* dst = reinterpret_cast<T*>(send_ring + (size_t)slot * max_bytes);
+     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n16; i += gridDim.x * blockDim.x) dst[i] = src[i];
+     __syncthreads();
+     if (threadIdx.x == 0) {
+@@ -203,6 +212,43 @@
+     }
+ }
+ 
++// dsv41 patch 0045: wait for every peer's flag at this sequence (the sum's wait, both flag modes), then copy every
++// rank's n units (this rank's from `own`) to out as [outer][world][inner]: rank p's unit k = (i, j) with i = k / inner
++// lands at (i * world + p) * inner + j. A copy, so out holds the same bits on every rank and the same bytes as NCCL's
++// all-gather followed by movedim(0, dim).
++template <typename T>
++__global__ void __launch_bounds__(SUM_THREADS) gather_kernel(const T* __restrict__ own, T* __restrict__ out, int n,
++                                                              int inner, const char* recv_ring, const uint64_t* flags,
++                                                              const uint64_t* seq, int rank, int world, int slots,
++                                                              uint64_t max_bytes, const uint64_t* abort_word,
++                                                              const uint64_t* rflags, int nd) {
++    const uint64_t q = *seq;
++    const int slot = (int)(q % slots);
++    if (rflags == nullptr) {
++        if (threadIdx.x < world && threadIdx.x != rank)
++            for (uint32_t i = 1; load_sys(flags + (size_t)slot * world + threadIdx.x) < q; ++i)
++                if ((i & 1023) == 0 && load_sys(abort_word)) break;
++    } else if (threadIdx.x < world * nd && (int)threadIdx.x / nd != rank) {
++        const uint64_t* f = rflags + ((size_t)slot * world + threadIdx.x / nd) * nd + threadIdx.x % nd;
++        for (uint32_t i = 1; load_sys(f) < q; ++i)
++            if ((i & 1023) == 0 && load_sys(abort_word)) break;
++    }
++    __syncthreads();
++    const int total = n * world;
++    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < total; e += gridDim.x * blockDim.x) {
++        const int p = e / n, k = e - p * n;
++        const int i = k / inner, j = k - i * inner;
++        T v;
++        if (p == rank) {
++            v = own[k];
++        } else {
++            const T* in = reinterpret_cast<const T*>(recv_ring + ((size_t)slot * world + p) * max_bytes);
++            v = __ldcv(in + k);
++        }
++        out[((size_t)i * world + p) * inner + j] = v;
++    }
++}
++
+ void fail(Ring& g, const std::string& what) {
+     if (!g.failed.exchange(1)) snprintf(g.why, sizeof(g.why), "%s", what.c_str());
+     __atomic_store_n(g.abort_word, (uint64_t)1, __ATOMIC_RELEASE);      // the GPU's waits give up
+@@ -554,7 +600,7 @@
+     const int n16 = (int)(n / 8);
+     auto stream = c10::cuda::getCurrentCUDAStream();
+     const int sblocks = std::max(1, std::min(16, (n16 + 1023) / 1024));
+-    stage_kernel<<<sblocks, STAGE_THREADS, 0, stream>>>(reinterpret_cast<const uint4*>(x.data_ptr()), n16,
++    stage_kernel<uint4><<<sblocks, STAGE_THREADS, 0, stream>>>(reinterpret_cast<const uint4*>(x.data_ptr()), n16,
+                                                         dev(g.send_ring), dev(g.sizes), dev(g.doorbell), dev(g.sent),
+                                                         g.seq, g.slots, g.max_bytes, dev(g.abort_word), g.staged);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+@@ -567,6 +613,50 @@
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
++// dsv41 patch 0045
++template <typename T>
++void launch_gather(Ring& g, const at::Tensor& x, at::Tensor& out, int64_t bytes, int64_t inner_bytes) {
++    const int n = (int)(bytes / (int64_t)sizeof(T)), inner = (int)(inner_bytes / (int64_t)sizeof(T));
++    auto stream = c10::cuda::getCurrentCUDAStream();
++    const int sblocks = std::max(1, std::min(16, (n + 1023) / 1024));
++    stage_kernel<T><<<sblocks, STAGE_THREADS, 0, stream>>>(reinterpret_cast<const T*>(x.data_ptr()), n,
++                                                           dev(g.send_ring), dev(g.sizes), dev(g.doorbell),
++                                                           dev(g.sent), g.seq, g.slots, g.max_bytes,
++                                                           dev(g.abort_word), g.staged);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++    const int blocks = std::max(1, std::min(48, (n * g.world + SUM_THREADS - 1) / SUM_THREADS));
++    gather_kernel<T><<<blocks, SUM_THREADS, 0, stream>>>(reinterpret_cast<const T*>(x.data_ptr()),
++                                                         reinterpret_cast<T*>(out.data_ptr()), n, inner,
++                                                         dev(g.recv_ring), dev(g.flags), g.seq, g.rank, g.world,
++                                                         g.slots, g.max_bytes, dev(g.abort_word),
++                                                         g.flagw ? dev(g.rflags) : nullptr, (int)g.nics.size());
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++// out = every rank's x concatenated in rank order along a dim, on the current stream: x is seen as [outer, inner]
++// (inner = the bytes of x from that dim on), out as [outer, world, inner]. Any dtype (a byte copy); contiguous
++// tensors of one dtype, the inner bytes a multiple of 4, 4-byte aligned (16-byte units when inner and both pointers
++// allow), at most max_bytes a rank.
++void all_gather(int64_t h, const at::Tensor& x, at::Tensor out, int64_t outer) {
++    Ring& g = get(h);
++    TORCH_CHECK(x.is_cuda() && out.is_cuda() && x.is_contiguous() && out.is_contiguous() &&
++                    x.scalar_type() == out.scalar_type(), "rdma all-gather: contiguous CUDA tensors of one dtype");
++    const int64_t bytes = x.numel() * (int64_t)x.element_size();
++    TORCH_CHECK(out.numel() == x.numel() * g.world, "rdma all-gather: out must hold world x the elements of x");
++    TORCH_CHECK(bytes > 0 && (uint64_t)bytes <= g.max_bytes, "rdma all-gather: ", bytes, " bytes (at most ",
++                g.max_bytes, ")");
++    TORCH_CHECK(outer > 0 && bytes % outer == 0 && (bytes / outer) % 4 == 0,
++                "rdma all-gather: the inner bytes (", bytes, " / ", outer, ") must be a multiple of 4");
++    const int64_t inner_bytes = bytes / outer;
++    const uintptr_t px = reinterpret_cast<uintptr_t>(x.data_ptr()), po = reinterpret_cast<uintptr_t>(out.data_ptr());
++    TORCH_CHECK(px % 4 == 0 && po % 4 == 0, "rdma all-gather: 4-byte aligned tensors");
++    if (g.failed.load()) TORCH_CHECK(false, "rdma all-gather: ", g.why);
++    if (inner_bytes % 16 == 0 && px % 16 == 0 && po % 16 == 0)
++        launch_gather<uint4>(g, x, out, bytes, inner_bytes);
++    else
++        launch_gather<uint32_t>(g, x, out, bytes, inner_bytes);
++}
++
+ }  // namespace
+ 
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+@@ -579,4 +669,5 @@
+     m.def("abort", &abort_all);
+     m.def("max_bytes", &max_bytes);
+     m.def("all_reduce", &all_reduce);
++    m.def("all_gather", &all_gather);
+ }
+--- a/vllm_exl3_moe/rdma.py	2026-10-19 16:23:57.978009469 +0200
++++ b/vllm_exl3_moe/rdma.py	2026-10-19 16:25:42.350759408 +0200
+@@ -15,10 +15,22 @@
+ polls, so no receiving thread is on the path (csrc/exl3_rdma.cu, P2 stage 0; default off until tested on both nodes).
+ The setup is collective: the ranks exchange their queue pairs over the group's CPU group on the first eligible
+ all-reduce outside a graph capture, and if any rank cannot open RDMA, every rank stays on NCCL.
++
++dsv41 patch 0045, EXL3_RDMA_AG=1 (default off; the same on every rank): vLLM's TP all-gathers of up to
++EXL3_RDMA_AG_MAX_KB (256) a rank also go over the ring (csrc/exl3_rdma.cu all_gather: the same staging, writes and
++flags, a copying kernel instead of the sum), any dtype, any dim, the bytes NCCL plus vLLM's movedim give. In decode
++these are the drafter's Markov (value, index) pairs (5 a round, nvidia/dspark.py draft_argmax_local), the Engram rows
++(common/engram.py Engram.embed) and, with EXL3_RDMA_AG_MAX_KB >= 3200, the verify logits ([rows, vocab / 2] bf16,
++LogitsProcessor._gather_logits; 776 KB at 6 rows, 3.1 MB at 24). Without it each of them is an NCCL call: in a CUDA
++graph a host node plus NCCL's proxy thread, which sleeps on a condition variable whenever no NCCL op is pending (all
++decode all-reduces run on the ring), so each wakes from an idle core. The path depends on dtype, shape and dim only
++(the same on every rank); misaligned inputs are copied first (a local decision). The ring's slots grow to
++max(EXL3_RDMA_AR_MAX_KB, EXL3_RDMA_AG_MAX_KB); the all-reduce threshold stays EXL3_RDMA_AR_MAX_KB.
+ """
+ 
+ from __future__ import annotations
+ 
++import math
+ import os
+ 
+ import torch
+@@ -30,13 +42,17 @@
+ MAX_BYTES = int(os.environ.get("EXL3_RDMA_AR_MAX_KB") or 256) * 1024
+ SLOTS = int(os.environ.get("EXL3_RDMA_AR_SLOTS") or 4)
+ FLAGW = os.environ.get("EXL3_RDMA_FLAGW", "0") == "1"
++# dsv41 patch 0045: all-gathers over the ring
++AG = os.environ.get("EXL3_RDMA_AG", "0") == "1"
++AG_MAX_BYTES = int(os.environ.get("EXL3_RDMA_AG_MAX_KB") or 256) * 1024
++RING_BYTES = -(-max(MAX_BYTES, AG_MAX_BYTES if AG else 0) // 64) * 64    # slot size (a multiple of 64)
+ 
+ _ext = None
+ _rings: dict[str, "RdmaAllReduce | None"] = {}      # communicator unique_name -> ring (None: NCCL for good)
+ 
+ 
+ def enabled() -> bool:
+-    return os.environ.get("EXL3_RDMA_AR", "0") == "1"
++    return os.environ.get("EXL3_RDMA_AR", "0") == "1" or AG
+ 
+ 
+ def ext():
+@@ -66,7 +82,7 @@
+         try:
+             if not devices:
+                 raise ValueError("no RDMA device named (EXL3_RDMA_DEVICES / NCCL_IB_HCA)")
+-            self.h = e.create(rank, world, MAX_BYTES, SLOTS, devices, gid, cpu, int(FLAGW))
++            self.h = e.create(rank, world, RING_BYTES, SLOTS, devices, gid, cpu, int(FLAGW))
+             info = e.local_info(self.h)
+         except Exception as exc:  # noqa: BLE001  (every rank refuses together)
+             error = f"{type(exc).__name__}: {exc}"
+@@ -89,8 +105,9 @@
+         e.start(self.h)
+         import atexit
+         atexit.register(e.stop, self.h)
+-        logger.info("EXL3 RDMA all-reduce: rank %d of %d on %s, gid %d, proxy on cpu %d, up to %d KB",
+-                    rank, world, ",".join(devices), gid, cpu, MAX_BYTES // 1024)
++        logger.info("EXL3 RDMA all-reduce: rank %d of %d on %s, gid %d, proxy on cpu %d, up to %d KB "
++                    "(slots %d KB, all-gathers %s)", rank, world, ",".join(devices), gid, cpu, MAX_BYTES // 1024,
++                    RING_BYTES // 1024, f"up to {AG_MAX_BYTES // 1024} KB" if AG else "off")
+ 
+     @staticmethod
+     def fits(x: torch.Tensor) -> bool:
+@@ -104,6 +121,30 @@
+         ext().all_reduce(self.h, x, out)
+         return out
+ 
++    # dsv41 patch 0045
++    @staticmethod
++    def fits_gather(x: torch.Tensor, dim: int) -> bool:
++        # dtype, shape and dim only: every rank takes the same path
++        if not (AG and x.is_cuda and x.dim() > 0 and x.numel() > 0):
++            return False
++        if dim < 0:
++            dim += x.dim()
++        nbytes = x.numel() * x.element_size()
++        outer = math.prod(x.shape[:dim])
++        return nbytes <= AG_MAX_BYTES and (nbytes // outer) % 4 == 0
++
++    def all_gather(self, x: torch.Tensor, dim: int) -> torch.Tensor:
++        """torch.cat of every rank's x along dim, in rank order (what CudaCommunicator.all_gather returns)."""
++        if dim < 0:
++            dim += x.dim()
++        if not x.is_contiguous() or x.data_ptr() % 16:
++            x = x.contiguous().clone()
++        shape = list(x.shape)
++        shape[dim] *= self.world
++        out = torch.empty(shape, dtype=x.dtype, device=x.device)
++        ext().all_gather(self.h, x, out, math.prod(x.shape[:dim]))
++        return out
++
+ 
+ def ring_for(comm) -> RdmaAllReduce | None:
+     """The ring of a vLLM device communicator (built on its first eligible call), or None (NCCL)."""
+@@ -125,7 +166,8 @@
+ 
+ 
+ def install() -> None:
+-    """Route vLLM's CUDA communicator all-reduce through the ring for the tensors it fits."""
++    """Route vLLM's CUDA communicator all-reduce (EXL3_RDMA_AR) and all-gather (EXL3_RDMA_AG, 0045) through the
++    ring for the tensors it fits."""
+     if not enabled():
+         return
+     from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
+@@ -141,5 +183,21 @@
+         return orig(self, input_)
+ 
+     all_reduce._exl3_rdma = True
+-    CudaCommunicator.all_reduce = all_reduce
+-    logger.info("EXL3 RDMA all-reduce: vLLM's TP all-reduce routed for bf16 tensors up to %d KB", MAX_BYTES // 1024)
++    if os.environ.get("EXL3_RDMA_AR", "0") == "1":
++        CudaCommunicator.all_reduce = all_reduce
++        logger.info("EXL3 RDMA all-reduce: vLLM's TP all-reduce routed for bf16 tensors up to %d KB",
++                    MAX_BYTES // 1024)
++    if AG and not getattr(CudaCommunicator.all_gather, "_exl3_rdma", False):
++        orig_ag = CudaCommunicator.all_gather
++
++        def all_gather(self, input_, dim=-1):
++            if RdmaAllReduce.fits_gather(input_, dim):
++                r = ring_for(self)
++                if r is not None:
++                    return r.all_gather(input_, dim)
++            return orig_ag(self, input_, dim)
++
++        all_gather._exl3_rdma = True
++        CudaCommunicator.all_gather = all_gather
++        logger.info("EXL3 RDMA all-gather (0045): vLLM's TP all-gather routed for tensors up to %d KB",
++                    AG_MAX_BYTES // 1024)

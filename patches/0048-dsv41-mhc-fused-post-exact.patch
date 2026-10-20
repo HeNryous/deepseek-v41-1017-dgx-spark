@@ -1,0 +1,291 @@
+dsv41 patch 0048 (20.10.2026): mHC sublayer boundary in one launch with TileLang's bits (vllm_exl3_moe plugin only).
+At every overlapped mHC boundary (patch 0014's side stream, <= 16 rows in FULL graphs) the main stream runs two
+one-block-per-token TileLang kernels: mhc_post_tilelang (16.4 us mean at 6 rows on GB10) and
+mhc_pre_big_fuse_with_norm in split mode "input" (15.4 us), 66 of the 80 boundaries a round, both on the critical path
+(profile of 19.10.2026, 1 stream: 2.1 ms of a 38.9 ms round). Patch 0021's chunked kernel already fuses them, but adds the
+RMSNorm's sum of squares in another order (rounding class) and normalizes in a serial last-block tail.
+post_collapse_exact: one block a token, 128 threads, every load of the token in flight at once; thread (q, h) owns
+the columns b * 1024 + h * 512 + q * 8 + [0, 8) of each 1024-column block, which is TileLang thread q's slot half h in
+the generated "input" kernel (64 collapse threads, hidden_block 1024). So every rounding is TileLang's: the post as
+v = c * d; v = v + a * b (same C form, so nvcc contracts the same FMAs), bf16 rounding, the collapse from the rounded
+streams in stream order, the per-slot fma chain of squares over the blocks, the slot order 0, 8, 1, 9, ..., 7, 15,
+the 64-thread butterfly (q ^ 32 first, as tl::AllReduce), rsqrtf(sum / H + eps) with IEEE division (neither side is
+built with fast math), and (v * rsqrt) * w. The post's outputs stay in registers for the collapse and the RMSNorm.
+Bit-equal to the two TileLang kernels by test (GPU test against the real TileLang kernels: residual_out and layer_input
+as int16 views, 1..16 and 24 rows, special values, graph replay); -DMHCX_TREE=1 (EXL3_MHC_FLAGS) builds the other butterfly
+order should the installed tl::AllReduce differ. vLLM side unchanged: patch 0021's hook in ops/mhc.py calls
+vllm_exl3_moe.mhc.post_collapse, which now dispatches by mode.
+Switch: VLLM_DSV41_MHC_FUSED_POST = 0 (default: the TileLang pair, unchanged), 1 (0021's kernel), 2 (this kernel).
+Read at import; needs a serve restart. H 5120 (V4.1-Flash) or 7168; other sizes keep the TileLang pair.
+Measured (20.10.2026, GB10, 2000 MHz): bit test passed; one boundary in the decode graph 6.4 -> 3.6 us; T = 0 texts
+identical to the TileLang pair (8/8); serve, VLLM_DSV41_MHC_FUSED_POST=2 against 0: geometric mean over all T = 1
+cells +0.99 %. We run it with 2.
+
+--- a/vllm_exl3_moe/mhc.py
++++ b/vllm_exl3_moe/mhc.py
+@@ -5,6 +5,10 @@
+ mhc_pre_big_fuse_with_norm in split mode "input"), ~12 + ~9 us at a 6-token verify step, 80 boundaries a round on
+ GB10. post_collapse returns (residual_out, layer_input) like vLLM's fused all-reduce + mHC hook, so patch 0021 can use
+ it where that hook (TP=4 NVLink only) is unavailable; the mix statistics still run on vLLM's side stream.
++
++VLLM_DSV41_MHC_FUSED_POST: 0 off (default, TileLang pair), 1 the chunked kernel (rounding class: its RMSNorm sum of
++squares is added in another order), 2 post_collapse_exact (patch 0048): one block a token in TileLang's thread layout,
++the same FMAs and the same sum-of-squares order, so both outputs keep TileLang's bits (H 5120 or 7168).
+ """
+ 
+ from __future__ import annotations
+@@ -13,7 +17,9 @@
+ 
+ import torch
+ 
+-ENABLED = os.environ.get("VLLM_DSV41_MHC_FUSED_POST", "0") == "1"
++MODE = os.environ.get("VLLM_DSV41_MHC_FUSED_POST", "0")
++ENABLED = MODE in ("1", "2")
++EXACT = MODE == "2"
+ MAX_TOKENS = 256
+ _ext = None
+ _scratch: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
+@@ -29,6 +35,8 @@
+ 
+ def supported(x: torch.Tensor, residual: torch.Tensor) -> bool:
+     n = x.shape[0]
++    if EXACT and residual.dim() == 3 and residual.shape[2] not in (5120, 7168):
++        return False
+     return (0 < n <= MAX_TOKENS and residual.dim() == 3 and residual.shape[1] == 4 and residual.shape[2] % 256 == 0
+             and residual.shape[2] <= 16384 and x.dtype == torch.bfloat16 and residual.dtype == torch.bfloat16)
+ 
+@@ -39,6 +47,14 @@
+     pre-mix), norm_weight [H] bf16 -> (residual_out [n, 4, H], layer_input [n, H]) bf16."""
+     n, hc, h = residual.shape
+     dev = x.device
++    if EXACT:
++        residual_out = torch.empty_like(residual)
++        layer_input = torch.empty((n, h), dtype=torch.bfloat16, device=dev)
++        w = norm_weight if norm_weight.dtype == torch.bfloat16 else norm_weight.to(torch.bfloat16)
++        ext().post_collapse_exact(x.reshape(n, h).contiguous(), residual.contiguous(),
++                                  comb.reshape(n, hc, hc).contiguous(), post.reshape(n, hc).contiguous(),
++                                  pre.reshape(n, hc).contiguous(), w.contiguous(), residual_out, layer_input, float(eps))
++        return residual_out, layer_input
+     if dev not in _scratch:       # persistent: the counters must survive (and stay zero between) graph replays
+         _scratch[dev] = (torch.empty((MAX_TOKENS, 64), dtype=torch.float32, device=dev),
+                          torch.zeros((MAX_TOKENS,), dtype=torch.int32, device=dev))
+--- a/vllm_exl3_moe/csrc/exl3_mhc.cu
++++ b/vllm_exl3_moe/csrc/exl3_mhc.cu
+@@ -12,6 +12,16 @@
+ // partial sum of squares; the last block of a token (one counter a token, reset by that block, so graph replays start
+ // clean) adds the partials in chunk order and normalizes the token's row. The sum of squares is added in a different
+ // order than TileLang's (per position, then a tree), so rsqrt can differ in its last bits: rounding class.
++//
++// post_collapse_exact (dsv41 patch 0048, VLLM_DSV41_MHC_FUSED_POST=2): the same fusion with TileLang's bits. One block
++// a token, 128 threads; thread (q, h) with q in [0, 64), h in {0, 1} owns the columns b * 1024 + h * 512 + q * 8 + [0, 8)
++// of every 1024-column block b: exactly TileLang thread q's slots 8h..8h+7 in mhc_pre_big_fuse_with_norm (split mode
++// "input", hidden_block 1024, 64 collapse threads; generated code read from the serve image's TileLang cache). So the
++// sum of squares is TileLang's: per slot an fma chain over the blocks in order, per q the slots added in the order
++// 0, 8, 1, 9, ..., 7, 15 (h = 0 and h = 1 of a q are adjacent lanes), then the butterfly over q with xor 32, 16, 8, 4,
++// 2, 1; rsqrt(sum / H + eps) and (v * rsqrt) * w as TileLang writes them. The post and the collapse are written in the
++// same C form as TileLang's generated code (v = c * d; v = v + a * b; ...), so nvcc contracts them to the same FMAs.
++// The post's output stays in registers for the collapse and the RMSNorm (no second pass over memory, no atomics).
+ #include <torch/extension.h>
+ #include <c10/cuda/CUDAStream.h>
+ #include <c10/cuda/CUDAGuard.h>
+@@ -138,6 +148,158 @@
+ #endif
+ }
+ 
++// ---- post_collapse_exact (patch 0048) ---------------------------------------------------------------------------------
++constexpr int XT = 128;         // threads a block (one block a token)
++constexpr int XB = 1024;        // TileLang's hidden_block: gcd(1024, H)
++
++__device__ __forceinline__ void unpack8(const uint4& a, float (&f)[8])
++{
++    const __nv_bfloat162* p = reinterpret_cast<const __nv_bfloat162*>(&a);
++    #pragma unroll
++    for (int i = 0; i < 4; ++i) { f[2 * i] = __low2float(p[i]); f[2 * i + 1] = __high2float(p[i]); }
++}
++
++template <int NB>
++__global__ void __launch_bounds__(XT) post_collapse_exact_kernel(
++    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ residual, const float* __restrict__ comb,
++    const float* __restrict__ post, const float* __restrict__ pre, const __nv_bfloat16* __restrict__ norm_w,
++    __nv_bfloat16* __restrict__ residual_out, __nv_bfloat16* __restrict__ layer_input, float eps)
++{
++    constexpr int H = NB * XB;
++    const int t = blockIdx.x;
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int q = warp * 16 + (lane >> 1), h = lane & 1;   // TileLang collapse thread q, slot half h
++    __shared__ float red[2][64];
++
++    // the RMSNorm weights do not depend on earlier kernels: read them before the PDL wait
++    uint4 wv[NB];
++    #pragma unroll
++    for (int b = 0; b < NB; ++b) wv[b] = *reinterpret_cast<const uint4*>(norm_w + b * XB + h * 512 + q * 8);
++#if __CUDA_ARCH__ >= 900
++    asm volatile("griddepcontrol.wait;\n" ::: "memory");
++#endif
++    float cm[HC][HC], pm[HC], qm[HC];
++    #pragma unroll
++    for (int i = 0; i < HC; ++i)
++    {
++        pm[i] = post[t * HC + i];
++        qm[i] = pre[t * HC + i];
++        #pragma unroll
++        for (int o = 0; o < HC; ++o) cm[i][o] = comb[(t * HC + i) * HC + o];
++    }
++    // every load of the token's columns in flight at once
++    uint4 xa[NB], ra[NB][HC];
++    #pragma unroll
++    for (int b = 0; b < NB; ++b)
++    {
++        const int c = b * XB + h * 512 + q * 8;
++        xa[b] = *reinterpret_cast<const uint4*>(x + (size_t) t * H + c);
++        #pragma unroll
++        for (int i = 0; i < HC; ++i) ra[b][i] = *reinterpret_cast<const uint4*>(residual + ((size_t) t * HC + i) * H + c);
++    }
++    float acc[8];
++    #pragma unroll
++    for (int j = 0; j < 8; ++j) acc[j] = 0.f;
++    uint4 rnd[NB];                              // the collapse rounded to bf16, kept for the RMSNorm
++    #pragma unroll
++    for (int b = 0; b < NB; ++b)
++    {
++        const int c = b * XB + h * 512 + q * 8;
++        float xv[8], rv[HC][8];
++        unpack8(xa[b], xv);
++        #pragma unroll
++        for (int i = 0; i < HC; ++i) unpack8(ra[b][i], rv[i]);
++        float col[8];
++        #pragma unroll
++        for (int j = 0; j < 8; ++j) col[j] = 0.f;
++        #pragma unroll
++        for (int o = 0; o < HC; ++o)
++        {
++            __nv_bfloat16 ob[8];
++            #pragma unroll
++            for (int j = 0; j < 8; ++j)
++            {
++                // mhc_post_tilelang: x_local = c_local[o] * d_local[j]; x_local = x_local + a_local[i * 4 + o] * b_local[i][j]
++                float v = pm[o] * xv[j];
++                #pragma unroll
++                for (int i = 0; i < HC; ++i) v = v + cm[i][o] * rv[i][j];
++                ob[j] = __float2bfloat16_rn(v);
++            }
++            uint4 w;
++            __nv_bfloat162* wp = reinterpret_cast<__nv_bfloat162*>(&w);
++            #pragma unroll
++            for (int k = 0; k < 4; ++k) wp[k] = __halves2bfloat162(ob[2 * k], ob[2 * k + 1]);
++            *reinterpret_cast<uint4*>(residual_out + ((size_t) t * HC + o) * H + c) = w;
++            // pre_big_fuse "input": ol = ol + pre * xl, streams in order, from the stored (rounded) residual
++            #pragma unroll
++            for (int j = 0; j < 8; ++j) col[j] = col[j] + qm[o] * __bfloat162float(ob[j]);
++        }
++        __nv_bfloat16 rb[8];
++        #pragma unroll
++        for (int j = 0; j < 8; ++j)
++        {
++            rb[j] = __float2bfloat16_rn(col[j]);
++            const float r = __bfloat162float(rb[j]);
++            acc[j] = __fmaf_rn(r, r, acc[j]);   // sumsq_per_pos: tl::fma2(value, value, acc), blocks in order
++        }
++        __nv_bfloat162* rp = reinterpret_cast<__nv_bfloat162*>(&rnd[b]);
++        #pragma unroll
++        for (int k = 0; k < 4; ++k) rp[k] = __halves2bfloat162(rb[2 * k], rb[2 * k + 1]);
++    }
++    // TileLang thread q's sum: slots 0, 8, 1, 9, ..., 7, 15 (h = 0 then h = 1), from 0
++    float s = 0.f;
++    #pragma unroll
++    for (int j = 0; j < 8; ++j)
++    {
++        const float other = __shfl_xor_sync(0xffffffffu, acc[j], 1);
++        const float lo = h ? other : acc[j], hi = h ? acc[j] : other;
++        s = s + lo;
++        s = s + hi;
++    }
++    // tl::AllReduce<SumOp, 64> (TileLang 0.1.12 reduce.h): the largest offset first, q ^ 32 through shared memory, then
++    // q ^ 16, 8, 4, 2, 1 (here q ^ 16 crosses our warps, so shared memory too; lane ^ 2k = q ^ k). -DMHCX_TREE=1: the
++    // other plausible tree (warp offsets first, then q ^ 32), kept as a build flag for the bit test should the
++    // installed reduce.h differ.
++#if defined(MHCX_TREE) && MHCX_TREE == 1
++    if (h == 0) red[1][q] = s;                 // TileLang's warp first: q ^ 16, 8, 4, 2, 1, then q ^ 32
++    __syncthreads();
++    s = s + red[1][q ^ 16];
++    #pragma unroll
++    for (int off = 16; off >= 2; off >>= 1) s = s + __shfl_xor_sync(0xffffffffu, s, off);
++    if (h == 0) red[0][q] = s;
++    __syncthreads();
++    s = s + red[0][q ^ 32];
++#else
++    if (h == 0) red[0][q] = s;
++    __syncthreads();
++    s = s + red[0][q ^ 32];
++    if (h == 0) red[1][q] = s;
++    __syncthreads();
++    s = s + red[1][q ^ 16];
++    #pragma unroll
++    for (int off = 16; off >= 2; off >>= 1) s = s + __shfl_xor_sync(0xffffffffu, s, off);
++#endif
++    const float scale = rsqrtf(s / (float) H + eps);
++    #pragma unroll
++    for (int b = 0; b < NB; ++b)
++    {
++        const int c = b * XB + h * 512 + q * 8;
++        float v[8], w[8];
++        unpack8(rnd[b], v);
++        unpack8(wv[b], w);
++        uint4 o;
++        __nv_bfloat162* op = reinterpret_cast<__nv_bfloat162*>(&o);
++        #pragma unroll
++        for (int k = 0; k < 4; ++k)
++            op[k] = __floats2bfloat162_rn(__fmul_rn(__fmul_rn(v[2 * k], scale), w[2 * k]),
++                                          __fmul_rn(__fmul_rn(v[2 * k + 1], scale), w[2 * k + 1]));
++        *reinterpret_cast<uint4*>(layer_input + (size_t) t * H + c) = o;
++    }
++#if __CUDA_ARCH__ >= 900
++    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
++#endif
++}
++
+ }  // namespace
+ 
+ // x [n, H] bf16 (the reduced sublayer output), residual [n, 4, H] bf16, comb [n, 4, 4] f32, post [n, 4] f32,
+@@ -174,7 +336,41 @@
+         (float) eps));
+ }
+ 
++// post_collapse with TileLang's bits (patch 0048): same tensors, no scratch; H = 1024 * NB with NB 5 (V4.1-Flash) or 7.
++void post_collapse_exact(torch::Tensor x, torch::Tensor residual, torch::Tensor comb, torch::Tensor post,
++                         torch::Tensor pre, torch::Tensor norm_w, torch::Tensor residual_out, torch::Tensor layer_input,
++                         double eps)
++{
++    const at::cuda::OptionalCUDAGuard guard(x.device());
++    const int n = x.size(0), H = x.size(1);
++    TORCH_CHECK(residual.size(0) == n && residual.size(1) == HC && residual.size(2) == H, "residual must be [n, 4, H]");
++    TORCH_CHECK(H == 5 * XB || H == 7 * XB, "post_collapse_exact: H must be 5120 or 7168");
++    for (auto* tp : {&x, &residual, &norm_w, &residual_out, &layer_input})
++        TORCH_CHECK(tp->is_contiguous() && tp->scalar_type() == at::kBFloat16, "bf16 contiguous tensors");
++    for (auto* tp : {&comb, &post, &pre})
++        TORCH_CHECK(tp->is_contiguous() && tp->scalar_type() == at::kFloat, "fp32 contiguous mixes");
++    TORCH_CHECK(comb.numel() == n * HC * HC && post.numel() == n * HC && pre.numel() == n * HC, "mix shapes");
++    if (n == 0) return;
++    cudaLaunchConfig_t cfg = {};
++    cfg.gridDim = dim3(n);
++    cfg.blockDim = dim3(XT);
++    cfg.stream = at::cuda::getCurrentCUDAStream();
++    cudaLaunchAttribute attr[1];
++    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
++    attr[0].val.programmaticStreamSerializationAllowed = 1;
++    cfg.attrs = attr;
++    cfg.numAttrs = 1;
++    auto* k = H == 5 * XB ? post_collapse_exact_kernel<5> : post_collapse_exact_kernel<7>;
++    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, k,
++        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(residual.data_ptr()),
++        comb.data_ptr<float>(), post.data_ptr<float>(), pre.data_ptr<float>(),
++        reinterpret_cast<const __nv_bfloat16*>(norm_w.data_ptr()), reinterpret_cast<__nv_bfloat16*>(residual_out.data_ptr()),
++        reinterpret_cast<__nv_bfloat16*>(layer_input.data_ptr()), (float) eps));
++}
++
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+ {
+     m.def("post_collapse", &post_collapse, "mHC post + carried-pre collapse + RMSNorm, one launch (decode sizes)");
++    m.def("post_collapse_exact", &post_collapse_exact,
++          "post_collapse with TileLang's bits: one block a token, TileLang's sum-of-squares order (patch 0048)");
+ }

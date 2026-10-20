@@ -1,0 +1,68 @@
+dsv41 patch 0049 (20.10.2026): exl3_router prefetch depth and x staging as build flags (vllm_exl3_moe plugin only).
+Profile of 19.10.2026 (1 stream): the router GEMV ([384, 5120] bf16 gate, one warp an expert) costs 23.6 us a layer past its predecessor
+on the critical path (40 a round, ~0.9 ms), although its gate is in L2 by then (patch 0017's "moe" prefetch fork pulls
+hc_ffn_fn + gate first, ~25 us before the router starts). The kernel keeps PF = 4 16-byte loads in flight a lane (five
+dependent rounds over the 20 chunks of a row) and stages x after the PDL wait one load at a time. ROUTER_PF sets the
+prefetch depth, ROUTER_XS the number of x loads a thread issues before storing them to shared memory. Neither changes
+the arithmetic (each lane still adds its chunks in chunk order, the warp butterfly is unchanged): the logits keep their
+bits, which a GPU benchmark checks (int32 views against the default build) while timing each variant
+with the gate warm in L2 and cold. If warm and cold time alike, the router is latency-bound and the flags help; if the
+in-serve time matches "cold", the gate is not L2-resident at the router and the prefetch order is the lever instead.
+Switch: EXL3_ROUTER_FLAGS="-DROUTER_PF=<n> -DROUTER_XS=<n>" (part of the JIT hash; pre-build before a serve start).
+Defaults (PF 4, XS 1) = the kernel as before.
+Measured (20.10.2026): no flag combination built faster than the default, so we run the default build.
+
+--- a/vllm_exl3_moe/csrc/exl3_router.cu
++++ b/vllm_exl3_moe/csrc/exl3_router.cu
+@@ -34,7 +34,18 @@
+ 
+ constexpr int WARPS = 8;                 // expert rows a block, one warp each
+ constexpr int MAXM = 8;                  // rows (decode sizes; x is staged whole in shared memory)
+-constexpr int PF = 4;                    // 16-byte row loads in flight a lane
++// dsv41 patch 0049: the prefetch depth and the x staging batch are build flags (EXL3_ROUTER_FLAGS="-DROUTER_PF=20
++// -DROUTER_XS=8"; the JIT hash includes the flags). Neither changes the arithmetic: every lane still adds its row's
++// 16-byte chunks in chunk order (j = it * 32 + lane, it ascending) and the warp reduces by the same butterfly, so the
++// logits keep their bits; only how many loads are in flight changes. Defaults = the kernel as before.
++#ifndef ROUTER_PF
++#define ROUTER_PF 4
++#endif
++#ifndef ROUTER_XS
++#define ROUTER_XS 1
++#endif
++constexpr int PF = ROUTER_PF;            // 16-byte row loads in flight a lane
++constexpr int XS = ROUTER_XS;            // x staging: 16-byte loads a thread issues before storing them
+ constexpr int MAXN = 384;                // experts the fused top-k handles (a multiple of 32)
+ constexpr int MAXK = 8;                  // top-k
+ 
+@@ -95,9 +106,28 @@
+         pre[i] = j < K8 ? ld_stream(wr + j) : make_uint4(0, 0, 0, 0);
+     }
+     exl3c::griddep_wait();
+-    for (int i = threadIdx.x; i < M * K8; i += blockDim.x) {
+-        const int m = i / K8, j = i - m * K8;
+-        xs[i] = reinterpret_cast<const uint4*>(x + (size_t) m * ldx)[j];
++    if constexpr (XS <= 1) {
++        for (int i = threadIdx.x; i < M * K8; i += blockDim.x) {
++            const int m = i / K8, j = i - m * K8;
++            xs[i] = reinterpret_cast<const uint4*>(x + (size_t) m * ldx)[j];
++        }
++    } else {
++        for (int i0 = threadIdx.x; i0 < M * K8; i0 += XS * blockDim.x) {
++            uint4 v[XS];
++#pragma unroll
++            for (int u = 0; u < XS; ++u) {
++                const int i = i0 + u * blockDim.x;
++                if (i < M * K8) {
++                    const int m = i / K8, j = i - m * K8;
++                    v[u] = reinterpret_cast<const uint4*>(x + (size_t) m * ldx)[j];
++                }
++            }
++#pragma unroll
++            for (int u = 0; u < XS; ++u) {
++                const int i = i0 + u * blockDim.x;
++                if (i < M * K8) xs[i] = v[u];
++            }
++        }
+     }
+     __syncthreads();
+ 

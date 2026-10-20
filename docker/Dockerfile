@@ -2,7 +2,13 @@
 # tag dsv41-serve:v4; patch 0030 is part of that build). docker/files/ mirrors site-packages and adds our patches:
 #   0031/0031c fair scheduling · 0032 wo_a quant-dequant as one Triton kernel · 0033 RoPE/indexer memory trims
 #   0034 replay trims layer 20 (vLLM #59894) · 0035 dense prompt path without copies · 0036 indexer rows split over TP
-# The published image ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v4i (= :latest) is exactly this.
+#   0041 joint DSpark depth choice · 0042b exl3_mrow up to 32 rows · 0043 prompt-lookup drafts
+#   0045 decode all-gathers over the RDMA ring · 0046 row limit for the LM head on exl3_mrow · 0047 adaptive verify window
+#   0048 mHC boundary in one launch · 0049 router prefetch build flags · 0050 mHC overlap up to 24 rows
+#   0022 Triton verify attention (from the recipe's patches/experimental/, unchanged)
+# New switches are off by default (0040 is configuration only, see serve/serve_example.sh). exl3_mrow, exl3_rdma,
+# exl3_mhc and exl3_router have new sources: build the plugin's JIT kernels before the first start (README, step 4).
+# The published image ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v5 (= :latest) is exactly this.
 ARG BASE=dsv41-serve:v4
 FROM ${BASE}
 LABEL org.opencontainers.image.source="https://github.com/HeNryous/deepseek-v41-1017-dgx-spark" \

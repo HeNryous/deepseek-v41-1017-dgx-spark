@@ -1,0 +1,44 @@
+dsv41 patch 0046 (19.10.2026): a row limit of its own for the LM head on exl3_mrow.
+Base: the recipe's plugin vllm_exl3_moe (cc59c36): head.py as in the image (independent of 0042/0042b).
+Why: the K6 head ran on exllamav3 at every size (VLLM_EXL3_HEAD_MROW unset). Per head pass (micro-benchmark, one rank,
+5120 x 64640): exllamav3 1112.8 / 1159.7 / 1131.2 / 1129.8 / 1135.6 us, exl3_mrow 993.6 / 1051.9 / 1256.8 / 1303.6 /
+1308.2 us at 1 / 6 / 12 / 15 / 16 rows. The head runs twice per round (verify window, and the DSpark drafter, which
+shares the module), so VLLM_EXL3_HEAD_MROW=1 alone (mrow up to 16 rows) is slower at 2-3 streams.
+How: HEAD_MROW_MAX_ROWS = min(MROW_MAX_ROWS, EXL3_HEAD_MROW_MAX_ROWS); default MROW_MAX_ROWS (unchanged).
+Not bit-identical when on: same weights, but another summation order and bf16 instead of fp32 output, so logits differ
+at rounding level and T = 0 texts can flip at near-ties.
+Expected from the micro-benchmark: ~0.2 ms per round at 1 stream (2 x ~0.11 ms), nothing from 2 streams on. Measured in
+the serve only together with 0045 (1 stream +1.6 %, see there).
+Switch: VLLM_EXL3_HEAD_MROW=1 EXL3_HEAD_MROW_MAX_ROWS=8: at 1 stream verify (6 rows) and drafter (5 rows) on exl3_mrow,
+from 2 streams on exllamav3 as before. Default: the head stays on exllamav3.
+
+--- a/vllm_exl3_moe/head.py	2026-10-19 16:43:51.027800798 +0200
++++ b/vllm_exl3_moe/head.py	2026-10-19 16:43:51.065515004 +0200
+@@ -23,6 +23,11 @@
+ from .dense import MROW_MAX_ROWS
+ from .hostcopy import copy_from_host
+ 
++# dsv41 patch 0046: the head's own row cap for exl3_mrow (with VLLM_EXL3_HEAD_MROW=1). mb_dense_rows (19.10.2026, K6
++# head, 5120 x 64640 a rank): mrow 994 / 1052 us at 1 / 6 rows against exl3 1113 / 1160 us, but 1257-1308 us against
++# 1130-1136 us at 12-16 rows; so mrow only up to EXL3_HEAD_MROW_MAX_ROWS rows (default MROW_MAX_ROWS = as before).
++HEAD_MROW_MAX_ROWS = min(MROW_MAX_ROWS, int(os.environ.get("EXL3_HEAD_MROW_MAX_ROWS") or MROW_MAX_ROWS))
++
+ logger = init_logger(__name__)
+ 
+ 
+@@ -121,12 +126,13 @@
+         if os.environ.get("VLLM_EXL3_HEAD_MROW", "0") == "1" and 2 <= self.k <= 6 and d % 128 == 0 and n % 128 == 0:
+             from .mrow import MrowGroup
+             layer._mrow = MrowGroup([(layer.trellis.data, layer.suh.data, layer.svh.data, 0, 0)], self.k)
+-        logger.info("lm_head: EXL3 K%d (%d x %d per rank)%s", self.k, d, n, ", exl3_mrow at decode" if layer._mrow else "")
++        logger.info("lm_head: EXL3 K%d (%d x %d per rank)%s", self.k, d, n,
++                    f", exl3_mrow at <= {HEAD_MROW_MAX_ROWS} rows" if layer._mrow else "")
+ 
+     def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+         rows = x.numel() // x.shape[-1]
+         mrow = getattr(layer, "_mrow", None)
+-        if mrow is not None and 0 < rows <= MROW_MAX_ROWS and x.dtype == torch.bfloat16:
++        if mrow is not None and 0 < rows <= HEAD_MROW_MAX_ROWS and x.dtype == torch.bfloat16:
+             x2 = x.reshape(rows, x.shape[-1]).contiguous()
+             if x2.data_ptr() % 16:
+                 x2 = x2.clone()

@@ -1,0 +1,286 @@
+dsv41 patch 0042 (19.10.2026): exl3_mrow for 17..32 rows (verify windows of 3-4 streams).
+Base: the recipe's plugin vllm_exl3_moe (cc59c36): csrc/exl3_mrow.cu as in the image, dense.py incl. our 0035.
+0042b rewrites the 17..32-row kernel against the same base; apply 0042 or 0042b, not both.
+Why: exl3_mrow takes at most 16 rows. 3 / 4 streams at k = 5 verify 18 / 24 rows, and above 16 rows every dense layer
+ran through exllamav3 (fp16 cast, fp32 output, cat, cast back; wo_a with a copy per head group). Dense time per round
+(micro-benchmark, one rank, 43 layers incl. the drafter): 15.0 ms at 16 rows, 20.7 / 21.0 ms at 18 / 24 rows.
+How: a second work plan g32 per registered group (own k-slices, capped so that 32 input rows plus the epilogue fit the
+opt-in shared memory, ~99 KB on GB10 -> ks <= 1280 at K5; own workspace and counters). The kernel takes "int MT"
+instead of "bool M16" (0: 1-8, 1: 9-16, 2: 17-32 rows); MT=2 runs rows 16-31 as a second m16 tile on the same decoded
+trellis fragments (weights read and decoded once, 8 instead of 4 mma.sync per double k-row).
+Exactness: <= 16 rows take the old plan and kernel path (bit-identical). 17-32 rows are deterministic and row-invariant
+within the 32-row plan but sum in a different fp32 order than the exllamav3 path, so texts under 3-4 streams can
+diverge from some token on (same distribution).
+Measured (GB10, 2000 MHz): GPU test 15/15 (reference, row invariance, graph replay); dense per round 18.4 / 19.6 ms at
+18 / 24 rows. Serve at T = 1 with k = 5 at every batch size: prose 3 / 4 streams +3.9 / +2.5 % decode, below our gate.
+Together with 0040 variant B (k = 4 at 3-4 streams, <= 20 rows), 0045 and 0046: see patches/0040.
+Switch: VLLM_EXL3_MROW_MAX_ROWS=32. Default 16 = previous behaviour (the 32-row plan is registered but not used).
+JIT: the new source has a new hash, so the plugin rebuilds exl3_mrow on first use, i.e. while the model loads. Build it
+before the first start: python3 -c 'from vllm_exl3_moe import mrow; mrow.ext()' (README, quick start step 4).
+
+--- a/vllm_exl3_moe/csrc/exl3_mrow.cu	2026-10-19 13:22:45.331760117 +0200
++++ b/vllm_exl3_moe/csrc/exl3_mrow.cu	2026-10-19 13:24:46.476106609 +0200
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: Apache-2.0
+-// exl3_mrow: EXL3 linears (mul1 codebook, K = 2..6) at decode sizes (1..16 rows), several linears per launch.
++// exl3_mrow: EXL3 linears (mul1 codebook, K = 2..6) at decode sizes (1..32 rows), several linears per launch.
++// dsv41 patch 0042 (draft 19.10.2026, NOT COMPILED): rows 17..32 run as two m16 tiles that share every decoded
++// trellis fragment (the weights are read and decoded once for all rows), on a second work plan g32 whose k-slices
++// are capped so the 32-row input slice fits in shared memory. Rows <= 16 keep the old plan and kernel unchanged
++// (same bits). Before: the serve's 3-4-stream verify windows (18 / 24 rows) fell back to exllamav3's GEMM.
+ //
+ // One work item = one problem (linear) x one 128-column output block x one k-slice. Eight consumer warps (one 16-column
+ // tile each) transform the item's slice of the input (bf16 -> * suh -> 128-wide Hadamard -> fp16 in shared memory),
+@@ -38,7 +42,8 @@
+ constexpr int WARPS = 8;         // consumer warps, one 16-column tile each
+ constexpr int CONSUMER_THREADS = WARPS * 32;
+ constexpr int THREADS = CONSUMER_THREADS + 32;   // + the producer warp
+-constexpr int MAX_M = 16;
++constexpr int MAX_M = 16;        // rows of the original plan (Handle::g)
++constexpr int MAX_M32 = 32;      // dsv41 0042: rows of the second plan (Handle::g32), two m16 tiles
+ constexpr int MAX_P = 8;
+ #ifndef MROW_MAX_KS
+ #define MROW_MAX_KS 2048
+@@ -115,8 +120,9 @@
+     cp_async_arrive_noinc(smem_u32(bar));
+ }
+ 
+-// M16: 9..16 rows (two 8-row halves of the m16 fragment); otherwise 1..8 rows, the upper half of A is zero registers
+-template <int K, bool M16>
++// MT = 1: 9..16 rows (two 8-row halves of the m16 fragment); MT = 0: 1..8 rows, the upper half of A is zero
++// registers; MT = 2 (dsv41 0042): 17..32 rows, a second m16 tile (rows 16..31) on the same decoded B fragments
++template <int K, int MT>
+ __global__ void __launch_bounds__(THREADS, MROW_MINB) mrow_kernel
+ (
+     const __nv_bfloat16* __restrict__ x, int x_stride,
+@@ -124,7 +130,7 @@
+     int m, float* __restrict__ ws, int* __restrict__ ctr, const __grid_constant__ Group g
+ )
+ {
+-    constexpr int RX = M16 ? 16 : 8;     // input rows held in shared memory
++    constexpr int RX = MT == 0 ? 8 : 16 * MT;     // input rows held in shared memory
+     constexpr int TB = 32 * K;           // bytes per 16x16 trellis tile
+     constexpr int SB = WARPS * TB;       // bytes per stage: the item's 8 tiles of one k-row, contiguous in the trellis
+     extern __shared__ __align__(16) unsigned char smem[];
+@@ -260,8 +266,12 @@
+     const LaneDq<K> cfg(lane);
+     float c0[4] = {0.f, 0.f, 0.f, 0.f};
+     float c1[4] = {0.f, 0.f, 0.f, 0.f};
++    float c2[4] = {0.f, 0.f, 0.f, 0.f};      // MT == 2: rows 16..31, columns as c0
++    float c3[4] = {0.f, 0.f, 0.f, 0.f};      // MT == 2: rows 16..31, columns as c1
+     const uint32_t* xr0 = reinterpret_cast<const uint32_t*>(sx + gq * sxw);
+     const uint32_t* xr1 = reinterpret_cast<const uint32_t*>(sx + (gq + 8) * sxw);
++    const uint32_t* xr2 = reinterpret_cast<const uint32_t*>(sx + (gq + (MT == 2 ? 16 : 0)) * sxw);
++    const uint32_t* xr3 = reinterpret_cast<const uint32_t*>(sx + (gq + (MT == 2 ? 24 : 0)) * sxw);
+     const unsigned char* wtile = ring + warp * TB;
+     #pragma unroll 1
+     for (int kk = 0; kk < kts; kk += 2)
+@@ -276,7 +286,7 @@
+         uint32_t a[4], b[4];
+         a[0] = xr0[kk * 8 + tq];     a[2] = xr0[kk * 8 + tq + 4];
+         b[0] = xr0[kk * 8 + 8 + tq]; b[2] = xr0[kk * 8 + 8 + tq + 4];
+-        if constexpr (M16)
++        if constexpr (MT >= 1)
+         {
+             a[1] = xr1[kk * 8 + tq];     a[3] = xr1[kk * 8 + tq + 4];
+             b[1] = xr1[kk * 8 + 8 + tq]; b[3] = xr1[kk * 8 + 8 + tq + 4];
+@@ -286,6 +296,20 @@
+         mma16816(c1, a, f1);
+         mma16816(c0, b, e0);
+         mma16816(c1, b, e1);
++        if constexpr (MT == 2)
++        {
++            // rows 16..31: the same B fragments (decoded once), A from the second half of the shared input,
++            // accumulated in the same k order as rows 0..15 (a row's bits do not depend on the other rows)
++            uint32_t a2[4], b2[4];
++            a2[0] = xr2[kk * 8 + tq];     a2[2] = xr2[kk * 8 + tq + 4];
++            b2[0] = xr2[kk * 8 + 8 + tq]; b2[2] = xr2[kk * 8 + 8 + tq + 4];
++            a2[1] = xr3[kk * 8 + tq];     a2[3] = xr3[kk * 8 + tq + 4];
++            b2[1] = xr3[kk * 8 + 8 + tq]; b2[3] = xr3[kk * 8 + 8 + tq + 4];
++            mma16816(c2, a2, f0);
++            mma16816(c3, a2, f1);
++            mma16816(c2, b2, e0);
++            mma16816(c3, b2, e1);
++        }
+         __syncwarp();                    // every lane has read both stages before they are handed back
+         if (lane == 0) { mbar_arrive(&empty[s0]); mbar_arrive(&empty[s1]); }
+     }
+@@ -295,11 +319,18 @@
+     const int col = warp * 16 + 2 * tq;
+     sy[gq * NB + col] = c0[0];     sy[gq * NB + col + 1] = c0[1];
+     sy[gq * NB + col + 8] = c1[0]; sy[gq * NB + col + 9] = c1[1];
+-    if constexpr (M16)
++    if constexpr (MT >= 1)
+     {
+         sy[(gq + 8) * NB + col] = c0[2];     sy[(gq + 8) * NB + col + 1] = c0[3];
+         sy[(gq + 8) * NB + col + 8] = c1[2]; sy[(gq + 8) * NB + col + 9] = c1[3];
+     }
++    if constexpr (MT == 2)
++    {
++        sy[(gq + 16) * NB + col] = c2[0];     sy[(gq + 16) * NB + col + 1] = c2[1];
++        sy[(gq + 16) * NB + col + 8] = c3[0]; sy[(gq + 16) * NB + col + 9] = c3[1];
++        sy[(gq + 24) * NB + col] = c2[2];     sy[(gq + 24) * NB + col + 1] = c2[3];
++        sy[(gq + 24) * NB + col + 8] = c3[2]; sy[(gq + 24) * NB + col + 9] = c3[3];
++    }
+     consumer_sync();
+ 
+     const int oc = n0 + lane * 4;
+@@ -360,6 +391,9 @@
+     Group g;
+     int K;
+     at::Tensor ws, ctr;
++    Group g32;                      // dsv41 0042: the 17..32-row plan (own k-slices, workspace, counters)
++    at::Tensor ws32, ctr32;
++    bool has32 = false;
+     std::vector<at::Tensor> keep;   // keep the weights alive while registered
+ };
+ 
+@@ -369,32 +403,32 @@
+     return r;
+ }
+ 
+-int pick_ks(int k, int n_blocks, int want_items)
++int pick_ks(int k, int n_blocks, int want_items, int max_ks = MAX_KS)
+ {
+     int best = 128;
+-    for (int ks = 128; ks <= std::min(k, MAX_KS); ks += 128)
++    for (int ks = 128; ks <= std::min(k, max_ks); ks += 128)
+     {
+         if (k % ks) continue;
+         if ((long long) n_blocks * (k / ks) >= want_items) best = ks;   // largest slice that still fills the GPU
+     }
+     if ((long long) n_blocks * (k / best) < want_items)                  // nothing fills it: the most slices we can
+-        for (int ks = 128; ks <= std::min(k, MAX_KS); ks += 128)
++        for (int ks = 128; ks <= std::min(k, max_ks); ks += 128)
+             if (k % ks == 0) { best = ks; break; }
+     return best;
+ }
+ 
+-template <int K, bool M16>
++template <int K, int MT>
+ void launch(const Group& g, const __nv_bfloat16* xp, int xs, __nv_bfloat16* op, int os, int m, float* ws, int* ctr,
+             cudaStream_t stream)
+ {
+-    const int smem = smem_bytes(K, M16 ? 16 : 8, g.ks_max);
++    const int smem = smem_bytes(K, MT == 0 ? 8 : 16 * MT, g.ks_max);
+     static int smem_set = 48 * 1024;      // dynamic shared memory past 48 KB needs the opt-in, once per size
+     if (smem > smem_set)
+     {
+-        C10_CUDA_CHECK(cudaFuncSetAttribute(mrow_kernel<K, M16>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
++        C10_CUDA_CHECK(cudaFuncSetAttribute(mrow_kernel<K, MT>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+         smem_set = smem;
+     }
+-    launch_k(mrow_kernel<K, M16>, dim3(g.n_items), dim3(THREADS), smem, stream, xp, xs, op, os, m, ws, ctr, g);
++    launch_k(mrow_kernel<K, MT>, dim3(g.n_items), dim3(THREADS), smem, stream, xp, xs, op, os, m, ws, ctr, g);
+ }
+ 
+ }  // namespace
+@@ -449,6 +483,36 @@
+     auto opts = trellis[0].options();
+     h.ws = at::empty({std::max<long long>(ws_floats, 1)}, opts.dtype(at::kFloat));
+     h.ctr = at::zeros({std::max(ctrs, 1)}, opts.dtype(at::kInt));
++    // dsv41 0042: the 17..32-row plan. Same problems, k-slices capped so 32 input rows + the epilogue fit the device's
++    // opt-in shared memory (GB10 ~99 KB: ks <= 1280 at K5); a slice that fits keeps the <= 16-row choice.
++    {
++        int dev = 0, smax = 0;
++        C10_CUDA_CHECK(cudaGetDevice(&dev));
++        C10_CUDA_CHECK(cudaDeviceGetAttribute(&smax, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
++        int cap = 128;
++        for (int ks = 128; ks <= MAX_KS; ks += 128)
++            if (smem_bytes((int) K, MAX_M32, ks) + 512 <= smax) cap = ks;   // 512: static mbarriers + s_last
++        h.g32 = h.g;
++        long long ws32 = 0;
++        int items32 = 0;
++        for (int i = 0; i < np; ++i)
++        {
++            Problem& q = h.g32.p[i];
++            q.ks = std::min(h.g.p[i].ks, cap);
++            if (q.k % q.ks) q.ks = pick_ks(q.k, q.n_blocks, per, cap);
++            q.n_slices = q.k / q.ks;
++            q.item_start = items32;
++            items32 += q.n_blocks * q.n_slices;
++            q.ws_off = ws32;
++            if (q.n_slices > 1) ws32 += (long long) q.n_slices * MAX_M32 * q.n;
++        }
++        h.g32.n_items = items32;
++        h.g32.ks_max = 0;
++        for (int i = 0; i < np; ++i) h.g32.ks_max = std::max(h.g32.ks_max, h.g32.p[i].ks);
++        h.has32 = smem_bytes((int) K, MAX_M32, h.g32.ks_max) + 512 <= smax;
++        h.ws32 = at::empty({std::max<long long>(ws32, 1)}, opts.dtype(at::kFloat));
++        h.ctr32 = at::zeros({std::max(ctrs, 1)}, opts.dtype(at::kInt));
++    }
+     registry().push_back(h);
+     return (int64_t) registry().size() - 1;
+ }
+@@ -468,14 +532,15 @@
+     TORCH_CHECK((x.dim() == 2 || x.dim() == 3) && out.dim() == 2 && x.stride(-1) == 1 && out.stride(1) == 1,
+                 "exl3_mrow: x [m, *] or [m, problems, *] with unit last stride, out row-major [m, *]");
+     const int m = (int) x.size(0);
+-    TORCH_CHECK(m >= 1 && m <= MAX_M && out.size(0) == m, "exl3_mrow: 1..16 rows");
++    const bool m32 = m > MAX_M;                                   // dsv41 0042: the 17..32-row plan
++    TORCH_CHECK(m >= 1 && m <= (h.has32 ? MAX_M32 : MAX_M) && out.size(0) == m, "exl3_mrow: 1..16 rows (1..32 with plan g32)");
+     TORCH_CHECK(x.stride(0) % 4 == 0 && out.stride(0) % 4 == 0, "exl3_mrow: row strides must be multiples of 4");
+     TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 8 == 0 && reinterpret_cast<uintptr_t>(out.data_ptr()) % 8 == 0,
+                 "exl3_mrow: x and out must be 8-byte aligned (4-element vector loads and stores)");
+     // 3-D x: problem i reads x[:, i, :] wherever that sits (any row / problem strides), e.g. wo_a's groups straight from
+     // the inverse-RoPE kernel's [G, T, D] buffer seen as [T, G, D], instead of a copy to [T, G * D] first. The
+     // descriptor goes to the kernel by value, so a per-call copy with these offsets also holds under graph capture.
+-    Group g = h.g;
++    Group g = m32 ? h.g32 : h.g;
+     if (x.dim() == 3)
+     {
+         TORCH_CHECK(x.size(1) == h.g.n_problems && x.stride(1) % 4 == 0 && x.stride(1) * (h.g.n_problems - 1) < (1LL << 31),
+@@ -484,7 +549,7 @@
+         {
+             TORCH_CHECK(h.g.p[i].x_col == i * h.g.p[0].k, "exl3_mrow: 3-D x needs problem i registered at column i * k");
+             TORCH_CHECK(h.g.p[i].k <= x.size(2), "exl3_mrow: input narrower than problem ", i);
+-            g.p[i].x_col = (int) (i * x.stride(1));
++            g.p[i].x_col = (int) (i * x.stride(1));     // same offsets in either plan
+         }
+     }
+     for (int i = 0; i < h.g.n_problems; ++i)
+@@ -496,18 +561,23 @@
+     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();   // c10, not ATen/cuda: the image lacks cusparse.h
+     auto xp = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>());
+     auto op = reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>());
+-    float* ws = h.ws.data_ptr<float>();
+-    int* ctr = h.ctr.data_ptr<int>();
++    float* ws = (m32 ? h.ws32 : h.ws).data_ptr<float>();
++    int* ctr = (m32 ? h.ctr32 : h.ctr).data_ptr<int>();
+     const int xs = (int) x.stride(0), os = (int) out.stride(0);
+-    const bool m16 = m > 8;
++    const int mt = m32 ? 2 : (m > 8 ? 1 : 0);
++#define MROW_LAUNCH(KK) \
++    (mt == 2 ? launch<KK, 2>(g, xp, xs, op, os, m, ws, ctr, stream) \
++     : mt == 1 ? launch<KK, 1>(g, xp, xs, op, os, m, ws, ctr, stream) \
++               : launch<KK, 0>(g, xp, xs, op, os, m, ws, ctr, stream))
+     switch (h.K)
+     {
+-        case 2: m16 ? launch<2, true>(g, xp, xs, op, os, m, ws, ctr, stream) : launch<2, false>(g, xp, xs, op, os, m, ws, ctr, stream); break;
+-        case 3: m16 ? launch<3, true>(g, xp, xs, op, os, m, ws, ctr, stream) : launch<3, false>(g, xp, xs, op, os, m, ws, ctr, stream); break;
+-        case 4: m16 ? launch<4, true>(g, xp, xs, op, os, m, ws, ctr, stream) : launch<4, false>(g, xp, xs, op, os, m, ws, ctr, stream); break;
+-        case 5: m16 ? launch<5, true>(g, xp, xs, op, os, m, ws, ctr, stream) : launch<5, false>(g, xp, xs, op, os, m, ws, ctr, stream); break;
+-        case 6: m16 ? launch<6, true>(g, xp, xs, op, os, m, ws, ctr, stream) : launch<6, false>(g, xp, xs, op, os, m, ws, ctr, stream); break;
++        case 2: MROW_LAUNCH(2); break;
++        case 3: MROW_LAUNCH(3); break;
++        case 4: MROW_LAUNCH(4); break;
++        case 5: MROW_LAUNCH(5); break;
++        case 6: MROW_LAUNCH(6); break;
+     }
++#undef MROW_LAUNCH
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
+--- a/vllm_exl3_moe/dense.py	2026-10-19 13:22:45.334586619 +0200
++++ b/vllm_exl3_moe/dense.py	2026-10-19 13:23:42.048516515 +0200
+@@ -43,7 +43,9 @@
+ # the multi-matrix modules (fused wq_a + wkv, the shared expert's gate + up, wo_a's head groups) and, since the kernel
+ # streams weights with TMA bulk copies, the single matrices too (wq_b, wo_b, the shared down: 1.13-1.31x exllamav3 at
+ # m=4-6, tests/tune_mrow.py). Prefill sizes stay on exllamav3.
+-MROW_MAX_ROWS = 16
++# dsv41 patch 0042 (draft): VLLM_EXL3_MROW_MAX_ROWS=32 runs 17..32 rows (3-4-stream verify windows) on exl3_mrow's
++# second plan (two m16 tiles, csrc/exl3_mrow.cu) instead of exllamav3's GEMM + casts; 16 = before.
++MROW_MAX_ROWS = 32 if __import__('os').environ.get('VLLM_EXL3_MROW_MAX_ROWS', '16') == '32' else 16
+ 
+ 
+ # L2 prefetch points (l2pf.py) that follow a dense module's launch at decode sizes.

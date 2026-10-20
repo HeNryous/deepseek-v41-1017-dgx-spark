@@ -1,0 +1,145 @@
+dsv41 patch 0047 v2 (19./20.10.2026): adaptive verify window with two regimes. The scheduler sets the next step's
+draft count from the requests' recent acceptance, within the dynamic speculation schedule (0040).
+Base: vllm/v1/core/sched/scheduler.py incl. our 0031c; vllm/v1/worker/gpu/cudagraph_utils.py as in the image.
+Why: at one stream a narrower window (k = 4 / 3 / 2 instead of 5) decoded prose +1.3 / +4.0 / +5.7 % faster at T = 0
+(+1.1 / +4.3 / +5.1 % at T = 1) with the same 2.0 tokens per round, i.e. the unused window rows cost ~5 %; code lost
+3 / 7 / 18 % and JSON 6 / 9 / 19 %, they need the depth.
+How: with a dynamic speculation schedule, k = min(schedule[n], max over the step's decode requests of
+ceil(EMA(accepted drafts) + margin)), at least K_MIN; a request without history (new, or in a prefill chunk) asks for
+the full schedule. A round that accepted every draft of its window counts one extra (it might have taken more).
+Two regimes (v2): a request whose EMA is at least AK_HI (code, JSON: ~3 accepted drafts a round, in bursts) keeps the
+full schedule; below it (prose: ~1) the window follows the EMA. Only for steps with at most MAX_REQS requests; CUDA
+graphs for the extra widths are captured for those batch sizes only (cudagraph_utils.py). The verify step itself is
+unchanged: as with the stock schedule, only the number of drafts varies.
+Measured (GB10, 2000 MHz, decode tok/s against the same setup without the switch; logic tests 9/9 and 7/7):
+- one regime (v1), margin 1.0: prose 1 stream T = 0 +7.7 %, 2 streams +10.4 %, 4 streams (MAX_REQS 4) +6.0 %, but code
+  T = 0 -3.8 % and JSON T = 1 -10.6 %: after a few weak rounds the window shrank for requests that need the depth.
+- AK_HI 2.0, margin 1.0, up to 2 requests: prose 1 stream T = 0 +7.6 % (38.49 -> 36.74 ms per round), 2 streams
+  +10.4 %, code and JSON T = 0 +-0.2 %, but JSON at T = 1 dropped from 3.98 to 3.49 tokens per round (its EMA falls
+  below 2.0 at T = 1).
+- AK_HI 1.6, margin 1.0, up to 4 requests, on top of 0042b's ring kernel from 9 rows, against the production without
+  both (ring alone in brackets): prose 1 stream T = 0 +5.1 % (-0.2), prose 3 / 4 streams -0.3 / +9.3 % (+1.6 / +6.6),
+  JSON T = 1 1 stream 4.05 against 4.11 tokens per round, JSON 3 / 4 streams +3.4 / +3.3 % (+5.1 / +3.4), code 3 / 4
+  streams +3.7 / +5.0 % (+5.0 / +7.7), geometric mean +2.01 % (+2.35 %). So it helps prose at 1 and 4 streams and
+  costs code and JSON at 3-4 streams 1-3 % in this run; we run it for the single-stream prose case.
+Switch: VLLM_DSV41_ADAPTIVE_K=1 (default 0 = off), VLLM_DSV41_AK_MARGIN (default 1.5; we use 1.0), VLLM_DSV41_AK_HI
+(default 99 = one regime; we use 1.6), VLLM_DSV41_AK_MAX_REQS (default 2; we use 4), VLLM_DSV41_AK_MIN (2),
+VLLM_DSV41_AK_ALPHA (weight of the newest round in the EMA, 0.3). Needs num_speculative_tokens_per_batch_size in the
+speculative config; without it nothing changes.
+
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -4,7 +4,21 @@
+ # dsv41 fairness (18.10.2026): long_prefill_token_threshold + DP-style prefill deferral only for requests with
+ # priority >= this (e.g. interactive 0, subagents 5, background jobs 10); 0 = all requests.
+ _DSV41_THROTTLE_MIN_PRIO = int(_dsv41_os.environ.get("VLLM_PREFILL_THROTTLE_MIN_PRIO", "0"))
++# dsv41 patch 0047 (19.10.2026): adaptive verify window. With a dynamic speculation schedule, the next step's draft
++# count k becomes min(schedule[n], max over the step's decode requests of ceil(EMA(accepted drafts) + margin)), at least
++# K_MIN; requests without history (new, prefill) ask for the full schedule. A round that accepted every draft of its
++# window counts one extra (it might have taken more). Only for steps with at most MAX_REQS requests; graphs for the
++# extra widths are captured for those batch sizes only (cudagraph_utils.py). Off by default.
++_DSV41_AK = _dsv41_os.environ.get("VLLM_DSV41_ADAPTIVE_K", "0") == "1"
++_DSV41_AK_MIN = int(_dsv41_os.environ.get("VLLM_DSV41_AK_MIN", "2"))
++_DSV41_AK_MAX_REQS = int(_dsv41_os.environ.get("VLLM_DSV41_AK_MAX_REQS", "2"))
++_DSV41_AK_MARGIN = float(_dsv41_os.environ.get("VLLM_DSV41_AK_MARGIN", "1.5"))
++_DSV41_AK_ALPHA = float(_dsv41_os.environ.get("VLLM_DSV41_AK_ALPHA", "0.3"))
++# two regimes: a request whose EMA is at least AK_HI (code, JSON: ~3 accepted drafts a round, bursty) keeps the full
++# schedule; below it (prose: ~1) the window follows the EMA. Default 99 = one regime (window always follows the EMA).
++_DSV41_AK_HI = float(_dsv41_os.environ.get("VLLM_DSV41_AK_HI", "99"))
+ import itertools
++import math
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -1481,6 +1495,10 @@
+             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
+                 len(num_scheduled_tokens)
+             ]
++            if _DSV41_AK and len(num_scheduled_tokens) <= _DSV41_AK_MAX_REQS:
++                num_spec_tokens_to_schedule = self._dsv41_adaptive_k(
++                    num_scheduled_tokens, num_spec_tokens_to_schedule
++                )
+ 
+         scheduled_encoder_input_stats = None
+         if (
+@@ -2004,6 +2022,19 @@
+             structured_output_request_ids, bitmask, num_acceptable_drafts
+         )
+ 
++    def _dsv41_adaptive_k(self, num_scheduled_tokens, cap: int) -> int:
++        """0047: the next step's draft count from the decode requests' accepted-draft EMA."""
++        want = _DSV41_AK_MIN
++        for req_id in num_scheduled_tokens:
++            request = self.requests.get(req_id)
++            ema = getattr(request, "_dsv41_ak_ema", None) if request is not None else None
++            if ema is None or request.is_prefill_chunk or ema >= _DSV41_AK_HI:
++                return cap
++            want = max(want, math.ceil(ema + _DSV41_AK_MARGIN))
++            if want >= cap:
++                return cap
++        return max(min(cap, want), min(_DSV41_AK_MIN, cap))
++
+     def update_from_output(
+         self,
+         scheduler_output: SchedulerOutput,
+@@ -2098,6 +2129,13 @@
+                 num_sampled = self.num_sampled_tokens_per_step
+                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
+                 num_rejected = num_draft_tokens - num_accepted
++                if _DSV41_AK and not output_is_stale:
++                    x = num_accepted + (1 if num_accepted >= num_draft_tokens else 0)
++                    ema = getattr(request, "_dsv41_ak_ema", None)
++                    request._dsv41_ak_ema = (
++                        float(x) if ema is None
++                        else (1.0 - _DSV41_AK_ALPHA) * ema + _DSV41_AK_ALPHA * x
++                    )
+                 # Rejections roll back num_computed_tokens (and, under async
+                 # scheduling, num_output_placeholders, which covers the spec
+                 # tokens). A stale rejection count predates the preemption
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import gc
++import os
+ import itertools
+ from collections import defaultdict
+ from collections.abc import Callable, Iterable
+@@ -278,6 +279,8 @@
+         # draft tokens. The scheduler might use a smaller number so we need
+         # to capture graphs for all possible values during decode.
+         speculative_config = self.vllm_config.speculative_config
++        ak_extra_lens: set[int] = set()
++        ak_max_reqs = 0
+         if (
+             speculative_config
+             and speculative_config.uses_dynamic_speculative_decoding()
+@@ -299,6 +302,18 @@
+                     for num_spec in dense_schedule[1:]
+                 }
+             )
++            # dsv41 patch 0047: the adaptive verify window (scheduler) uses widths K_MIN..schedule[n] for steps with
++            # at most AK_MAX_REQS requests; capture those widths for those batch sizes only
++            if os.environ.get("VLLM_DSV41_ADAPTIVE_K", "0") == "1":
++                ak_min = int(os.environ.get("VLLM_DSV41_AK_MIN", "2"))
++                ak_max_reqs = int(os.environ.get("VLLM_DSV41_AK_MAX_REQS", "2"))
++                ak_top = max(dense_schedule[1 : ak_max_reqs + 1] or [0])
++                ak_lens = {
++                    k + num_new_sampled_tokens_per_step
++                    for k in range(max(ak_min, 0), ak_top + 1)
++                }
++                ak_extra_lens = ak_lens - set(decode_query_lens)
++                decode_query_lens = sorted(set(decode_query_lens) | ak_extra_lens)
+         else:
+             decode_query_lens = [self.decode_query_len]
+ 
+@@ -332,6 +347,8 @@
+                         or rounded_num_reqs > self.max_num_reqs
+                     ):
+                         continue
++                    if decode_query_len in ak_extra_lens and rounded_num_reqs > ak_max_reqs:
++                        continue
+ 
+                     desc = BatchExecutionDescriptor(
+                         cg_mode=decode_mode,

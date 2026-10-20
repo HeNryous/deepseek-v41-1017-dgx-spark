@@ -2,9 +2,23 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os as _dsv41_os
 # dsv41 fairness (18.10.2026): long_prefill_token_threshold + DP-style prefill deferral only for requests with
-# priority >= this (proxy: Rene/Hermes 0, subagent 5, hindsight/transcript/prefix-warm 10); 0 = all requests.
+# priority >= this (e.g. interactive 0, subagents 5, background jobs 10); 0 = all requests.
 _DSV41_THROTTLE_MIN_PRIO = int(_dsv41_os.environ.get("VLLM_PREFILL_THROTTLE_MIN_PRIO", "0"))
+# dsv41 patch 0047 (19.10.2026): adaptive verify window. With a dynamic speculation schedule, the next step's draft
+# count k becomes min(schedule[n], max over the step's decode requests of ceil(EMA(accepted drafts) + margin)), at least
+# K_MIN; requests without history (new, prefill) ask for the full schedule. A round that accepted every draft of its
+# window counts one extra (it might have taken more). Only for steps with at most MAX_REQS requests; graphs for the
+# extra widths are captured for those batch sizes only (cudagraph_utils.py). Off by default.
+_DSV41_AK = _dsv41_os.environ.get("VLLM_DSV41_ADAPTIVE_K", "0") == "1"
+_DSV41_AK_MIN = int(_dsv41_os.environ.get("VLLM_DSV41_AK_MIN", "2"))
+_DSV41_AK_MAX_REQS = int(_dsv41_os.environ.get("VLLM_DSV41_AK_MAX_REQS", "2"))
+_DSV41_AK_MARGIN = float(_dsv41_os.environ.get("VLLM_DSV41_AK_MARGIN", "1.5"))
+_DSV41_AK_ALPHA = float(_dsv41_os.environ.get("VLLM_DSV41_AK_ALPHA", "0.3"))
+# two regimes: a request whose EMA is at least AK_HI (code, JSON: ~3 accepted drafts a round, bursty) keeps the full
+# schedule; below it (prose: ~1) the window follows the EMA. Default 99 = one regime (window always follows the EMA).
+_DSV41_AK_HI = float(_dsv41_os.environ.get("VLLM_DSV41_AK_HI", "99"))
 import itertools
+import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -1481,6 +1495,10 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
             ]
+            if _DSV41_AK and len(num_scheduled_tokens) <= _DSV41_AK_MAX_REQS:
+                num_spec_tokens_to_schedule = self._dsv41_adaptive_k(
+                    num_scheduled_tokens, num_spec_tokens_to_schedule
+                )
 
         scheduled_encoder_input_stats = None
         if (
@@ -2004,6 +2022,19 @@ class Scheduler(SchedulerInterface):
             structured_output_request_ids, bitmask, num_acceptable_drafts
         )
 
+    def _dsv41_adaptive_k(self, num_scheduled_tokens, cap: int) -> int:
+        """0047: the next step's draft count from the decode requests' accepted-draft EMA."""
+        want = _DSV41_AK_MIN
+        for req_id in num_scheduled_tokens:
+            request = self.requests.get(req_id)
+            ema = getattr(request, "_dsv41_ak_ema", None) if request is not None else None
+            if ema is None or request.is_prefill_chunk or ema >= _DSV41_AK_HI:
+                return cap
+            want = max(want, math.ceil(ema + _DSV41_AK_MARGIN))
+            if want >= cap:
+                return cap
+        return max(min(cap, want), min(_DSV41_AK_MIN, cap))
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -2098,6 +2129,13 @@ class Scheduler(SchedulerInterface):
                 num_sampled = self.num_sampled_tokens_per_step
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
                 num_rejected = num_draft_tokens - num_accepted
+                if _DSV41_AK and not output_is_stale:
+                    x = num_accepted + (1 if num_accepted >= num_draft_tokens else 0)
+                    ema = getattr(request, "_dsv41_ak_ema", None)
+                    request._dsv41_ak_ema = (
+                        float(x) if ema is None
+                        else (1.0 - _DSV41_AK_ALPHA) * ema + _DSV41_AK_ALPHA * x
+                    )
                 # Rejections roll back num_computed_tokens (and, under async
                 # scheduling, num_output_placeholders, which covers the spec
                 # tokens). A stale rejection count predates the preemption

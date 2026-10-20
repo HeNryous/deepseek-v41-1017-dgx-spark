@@ -5,7 +5,7 @@
  # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +import os as _dsv41_os
 +# dsv41 fairness (18.10.2026): long_prefill_token_threshold + DP-style prefill deferral only for requests with
-+# priority >= this (proxy: Rene/Hermes 0, subagent 5, hindsight/transcript/prefix-warm 10); 0 = all requests.
++# priority >= this (e.g. interactive 0, subagents 5, background jobs 10); 0 = all requests.
 +_DSV41_THROTTLE_MIN_PRIO = int(_dsv41_os.environ.get("VLLM_PREFILL_THROTTLE_MIN_PRIO", "0"))
  import itertools
  import time
