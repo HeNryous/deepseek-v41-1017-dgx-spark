@@ -1,0 +1,113 @@
+dsv41 patch 0056 (20.10.2026): CRC-32 for every block of vLLM's file-system KV offload tier.
+Base: vllm/v1/kv_offload/tiering/fs/io.py of image v5.
+Why: vLLM's OffloadingConnector with TieringOffloadingSpec (CPU tier + fs tier: O_DIRECT, atomic rename, hash-named
+block files that survive restarts) loads every block file it finds; a torn or corrupted file would come back as KV
+without notice.
+How: a CRC-32 sidecar "<block>.crc" (8 hex digits) is written BEFORE its block, so no block file is ever visible without
+one; a load verifies every block it read and, on a mismatch or a missing/unreadable sidecar, deletes block + sidecar and
+fails from that block on (the tier marks the rest a miss and they are recomputed). Covers the C (fs_io_C) and the Python
+path.
+Tested offline: round trip, a flipped byte is detected and the block deleted (the load stops at that block), a missing
+sidecar counts as invalid. Live test still to run (cold 60K prompt -> restart -> reload from SSD -> corrupted block ->
+restart -> CRC miss); it needs patch 0058 next to expandable_segments.
+Switch: VLLM_DSV41_KV_CRC=1 (default off).
+
+--- a/vllm/v1/kv_offload/tiering/fs/io.py
++++ b/vllm/v1/kv_offload/tiering/fs/io.py
+@@ -7,6 +7,7 @@
+ import os
+ import random
+ import threading
++import zlib
+ 
+ try:
+     from vllm.fs_io_C import (  # pyright: ignore[reportMissingImports]
+@@ -25,6 +26,54 @@
+ # O_DIRECT is Linux-specific and not available on macOS
+ O_DIRECT = getattr(os, "O_DIRECT", 0)
+ 
++# Patch 0056 (VLLM_DSV41_KV_CRC=1, default off): a CRC-32 sidecar "<block>.crc" (8 hex digits) is written BEFORE its
++# block, so no block file is ever visible without one; a load verifies every block it read and, on a mismatch or a
++# missing/unreadable sidecar, deletes block + sidecar and fails from that block on (the tier marks the rest a miss and
++# they are recomputed). Covers the C (fs_io_C) and the Python path. Files are small next to the blocks.
++_DSV41_CRC = os.environ.get("VLLM_DSV41_KV_CRC", "0") == "1"
++
++
++def _crc_path(path: str) -> str:
++    return path + ".crc"
++
++
++def _write_crcs(paths: list[str], view: memoryview, offsets: list[int], block_size: int) -> None:
++    flat = view.cast("B")
++    for path, offset in zip(paths, offsets):
++        cpath = _crc_path(path)
++        if os.path.exists(path) and os.path.exists(cpath):
++            continue
++        crc = zlib.crc32(flat[offset : offset + block_size]) & 0xFFFFFFFF
++        _ensure_dirs(cpath)
++        tmp = cpath + _get_tmp_suffix()
++        with open(tmp, "w") as f:
++            f.write(f"{crc:08x}")
++        os.replace(tmp, cpath)
++
++
++def _verify_crcs(paths: list[str], view: memoryview, offsets: list[int], block_size: int) -> None:
++    """Raise OSError (with num_succeeded) at the first block whose CRC does not match; that block is removed."""
++    flat = view.cast("B")
++    for i, (path, offset) in enumerate(zip(paths, offsets)):
++        try:
++            with open(_crc_path(path)) as f:
++                want = int(f.read().strip(), 16)
++        except (OSError, ValueError):
++            want = None
++        got = zlib.crc32(flat[offset : offset + block_size]) & 0xFFFFFFFF
++        if want != got:
++            for q in (path, _crc_path(path)):
++                with contextlib.suppress(OSError):
++                    os.remove(q)
++            logger.warning(
++                "KV offload block %s failed its CRC check (stored %s, read %08x); removed, recomputing",
++                path, "missing" if want is None else f"{want:08x}", got,
++            )
++            exc = OSError(f"CRC mismatch: {path}")
++            exc.num_succeeded = i  # type: ignore[attr-defined]
++            raise exc
++
++
+ # Thread-local storage for unique temporary file suffixes
+ _thread_local = threading.local()
+ 
+@@ -176,6 +225,8 @@
+     to dest_paths[i] via a temp-file rename.  Raises on first error.
+     """
+     _validate_offsets(view, offsets, block_size)
++    if _DSV41_CRC:
++        _write_crcs(paths, view, offsets, block_size)   # patch 0056: sidecar first
+ 
+     if _HAS_FSIO_C:
+         view_B = view.cast("B")
+@@ -202,7 +253,24 @@
+     blocks loaded before the failing one, so the tier can keep them.
+     """
+     _validate_offsets(view, offsets, block_size)
++    try:
++        _batch_load_block_raw(paths, view, offsets, block_size, use_o_direct)
++    except OSError as exc:
++        if _DSV41_CRC:   # patch 0056: the blocks loaded before the failure must pass their CRC too
++            k = getattr(exc, "num_succeeded", 0)
++            _verify_crcs(paths[:k], view, offsets[:k], block_size)
++        raise
++    if _DSV41_CRC:
++        _verify_crcs(paths, view, offsets, block_size)
++
+ 
++def _batch_load_block_raw(
++    paths: list[str],
++    view: memoryview,
++    offsets: list[int],
++    block_size: int,
++    use_o_direct: bool = True,
++) -> None:
+     if _HAS_FSIO_C:
+         view_B = view.cast("B")
+         view_slices = [view_B[x : x + block_size] for x in offsets]

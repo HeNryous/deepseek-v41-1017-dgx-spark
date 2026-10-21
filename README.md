@@ -16,7 +16,7 @@ input, tool calling and DSpark speculative decoding. Every number below was meas
 
 ```bash
 # 1) The serving image (linux/arm64, CUDA 13, ~25 GB unpacked) — on both nodes:
-docker pull ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v5
+docker pull ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v12
 
 # 2) Model + the two Engram shards into ONE folder (~402 GB). On the head node, then copy to the worker:
 git clone https://github.com/HeNryous/deepseek-v41-1017-dgx-spark && cd deepseek-v41-1017-dgx-spark
@@ -33,7 +33,7 @@ git -C ~/dgx-spark-deepseek-v41 checkout cc59c36
 #    it is part of the module name.
 mkdir -p ~/.cache/dsv41-serve && docker run --rm --gpus all -v $HOME/.cache/dsv41-serve:/root/.cache \
   -e TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions -e MAX_JOBS=4 -e EXL3_SMOE_FLAGS=-DSMOE_RUNFLAGS=1 \
-  --entrypoint python3 ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v5 \
+  --entrypoint python3 ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v12 \
   -c 'from vllm_exl3_moe import tf_experts as t, mrow, rdma, mhc, router, smoe, l2pf; t._ext(); mrow.ext(); rdma.ext(); mhc.ext(); router.ext(); smoe.ext(); l2pf.ext()'
 
 # 5) Start on the head node (network devices default to the DGX Spark names; see the script):
@@ -109,6 +109,10 @@ The scripts sample at T = 1, so single-stream numbers move by several percent be
 19.10. (v4i + 0040–0046, not published) reached 87.7 (prose) and 143.7 (code) tok/s at 4 streams with the same scripts
 at 2000 MHz (single runs). Not measured: contexts above 320K (TensorFold goes to 1M).
 
+Image v12 (21.10.) = v5 + patches 0051–0061, of which only the KV page layout (0057 + 0060) is switched on. Each of
+them was A/B-tested against the image before it (cost per decode round within ±0.5 %), so the decode rows above stand
+for v12 as well. v6–v11 were internal builds and are not published.
+
 **Long context, fairness and memory** (image v4i; the later changes are mainly in decode-time paths, these rows were not
 re-measured)
 
@@ -117,8 +121,28 @@ re-measured)
 | time to first token, cold 18.5K-token prompt | 8.4 s (~2,200 tok/s) |
 | time to first token, cold 314K-token prompt | 152 s (2,066 tok/s); 3 of 3 needles found (10/50/90 % depth, T=0) |
 | foreground stream next to 1 / 2 long background prefills | ~29 / ~23 tok/s, first token ≤ 3.8 s |
-| KV pool (3.75 GiB per rank) | 989,460 tokens = 3 full 320K requests at once |
+| KV pool (3.75 GiB per rank), image v12 with 0057 + 0060 | 1,531,258 tokens = 4.67 full 320K requests at once (v5: 989,460) |
 | lowest free memory over these runs (incl. the 314K prefill) | ~3.1 GiB head, ~4.2 GiB worker (watchdog stops at 1.5) |
+
+**KV cache capacity** (image v12, patches 0057–0061; 3.75 GiB KV pool per rank, A/B in one window per step, 2000 MHz)
+
+| | v5 | + 0057 paired pages | **+ 0060 three pages (in use)** | 0057 + 0059 NVFP4 records | 0060 + 0061 NVFP4 compressed only |
+|---|---|---|---|---|---|
+| KV pool, max-model-len 320K (tokens) | 989,460 | 1,346,928 | **1,531,258** | 2,013,868 | 1,837,489 |
+| bytes per token, charged for a max-length request | 4,069 | 2,989 | 2,630 | 1,999 | 2,191 |
+| bytes per token, live (250K-token prompt, `kv_cache_usage_perc`) | 3,267 | 2,187 | 1,827 | 1,574 | 1,522 |
+| cost per verify round, geometric mean | – | −0.3 % | −0.5 % | −0.9 % | −0.7 % (tok/s −2.8 %) |
+| KV-KLD against FP8 records, KL / top-1 ¹ | – | format unchanged | format unchanged | 0.028 / 95.0 % | 0.0146 / 96.6 % |
+| adopted | | yes (v8) | **yes (v12)** | no (KLD) | no (KLD, tok/s) |
+
+Charged per token (v5): 1,800 B data (1,462.5 B fp8_ds_mla records of the four KV-source layers + 337.5 B FP8 indexer
+keys), 1,440 B allocator padding and 829 B sliding-window admission reserve. vLLM packs all KV groups into one block pool
+whose stride is the widest group's page sum (138,240 B per 128 tokens for the ratio-2 group); the ratio-1 group paid that
+stride for 46,080 B of data. 0057 pairs its pages, 0060 takes three, which is exactly the stride: no padding left. 0057
+and 0060: T=0 texts identical 8/8, needles at 250K 6/6, corruption test (8K–100K, 4 each) 0 hits.
+
+¹ Teacher-forced prompt logprobs over 44K positions (top-5). Two identical requests with FP8 records already differ by
+KL ~0.008 / top-1 ~97.5 % from position 128 on (bit-identical before), so that is the floor of this measurement.
 
 **What each step brought** (decode tok/s, each A/B in one window, 2000 MHz, T = 1 unless noted, prose / JSON / code
 prompts at 1, 3 and 4 streams). Rows 1–2 against the same image without the new switches (v4i behaviour), row 3
@@ -162,6 +186,16 @@ The serving image of the [sudoingX recipe](https://github.com/sudoingX/dgx-spark
 | 0048 | mHC sublayer boundary (post + input collapse + RMSNorm) in one launch, bit-identical to the two TileLang kernels (`VLLM_DSV41_MHC_FUSED_POST=2`) | 6.4 → 3.6 µs per boundary in the decode graph; T=0 texts identical (8/8); step 6 |
 | 0049 | router GEMV prefetch depth and x staging as build flags (`EXL3_ROUTER_FLAGS`) | no faster build found; we run the default (= as before) |
 | 0050 | mHC overlap path up to 24 rows (`VLLM_DSV41_MHC_OVERLAP_MAX_TOKENS=24`), so 4-stream windows (20 rows) take it too | step 6 (4-stream cells) |
+| 0051 | the indexer's `weights_proj` GEMV (hidden → 32 heads, 56–61 µs on GB10) no longer makes the main stream wait right after the fused QKV GEMM: the join moves to the first read, and with short contexts, where every candidate is selected and the weights are never read, the GEMV is skipped (`VLLM_DSV41_INDEXER_DEFER=1`); bit-identical | off; measured only on top of 0054 (+0.2 % geometric mean, within noise) |
+| 0053 | KV cache backed by the GB10 display reservation (1,792 MiB per node, DRM dumb buffer + `cuMemHostRegister`) with pinned ordinary memory behind it (`VLLM_DSV41_DISPLAY_KV_MIB`) | off: KV pool +47 %, but ~1 GB less free memory under load and +1.5 % per round (see "Tried") |
+| 0054 | token embedding (631 MiB per rank) and the DSpark Markov cache (505 MiB) in the display reservation, copied bit-exact (`VLLM_DSV41_DISPLAY_TENSORS=1`) | off: decode −1.7 % (geometric mean), 64K code −6.7 % |
+| 0055 | draft mode per request from the 0047 regime: requests that plan the full window draft probabilistically, the others greedy with a one-hot draft distribution, so their verification stays exact (`VLLM_DSV41_HYBRID_DRAFT=1`) | off: +0.75 % at T=1 (code at 1 stream +5.0 %), but prose at 1 stream −1.6 % |
+| 0056 | CRC-32 sidecar for every block of vLLM's file-system KV offload tier, checked after each load; a bad block is deleted and recomputed (`VLLM_DSV41_KV_CRC=1`) | off; offline test passed, live window still to run |
+| 0057 | paired KV pages: the ratio-1 compressed-KV group takes 128-token blocks made of two 64-state kernel pages and stops paying the ratio-2 group's block stride (`VLLM_DSV41_KV_PAIR=1`; `VLLM_DSV41_KV_SWA_FILL=1` fills the sliding-window groups up to the stride) | KV pool 989,460 → 1,346,928 tokens (+36 %), live 3,267 → 2,187 B per token, cost per round −0.3 %, T=0 identical 8/8, corruption test 0 hits |
+| 0058 | vLLM's OffloadingConnector next to `expandable_segments:True` (`VLLM_DSV41_OFFLOAD_EXPANDABLE_OK=1`) | needed for 0056; live window still to run |
+| 0059 | NVFP4 KV records on GB10: FlashInfer's 384 B SM120 record (e2m1 with an e4m3 scale per 16, RoPE in BF16) for the window and the compressed KV, written with FlashInfer's own quantize-append; SWA indices padded to 512 for DSpark's 192-wide non-causal verify (`VLLM_DSV41_KV_NVFP4=1`) | off: KV pool +49.5 %, but KV-KLD 0.028 / top-1 95.0 % against FP8 records (see "KV cache capacity") |
+| 0060 | three 64-state kernel pages per manager block for the ratio-1 KV group: 3 × 46,080 B = the ratio-2 block stride, no padding left (`VLLM_DSV41_KV_PAIR=3`, on top of 0057) | **in use:** KV pool 1,346,928 → 1,531,258 tokens (+13.7 %), live 2,187 → 1,827 B per token, cost per round −0.5 %, T=0 identical 8/8, corruption test 0 hits |
+| 0061 | FP8 sliding window + NVFP4 compressed KV (as vLLM's SM100 format does): two FlashInfer calls with `return_lse`, merged in Triton (base-2 LSE, sink in the merge) (`VLLM_DSV41_KV_NVFP4=2`) | off: KV pool 1,837,489 with 0060, but KV-KLD 0.0146 / top-1 96.6 % and tok/s −2.8 % (fewer drafts accepted) |
 | recipe switches | `VLLM_MOE_GATE_FIRST=1` (recipe patch 0018: the router GEMM before the shared-expert fork) and `VLLM_EXL3_MOE_SMOE_SHARED=1` (the shared expert inside the routed-expert kernel as one more pick per token, instead of its own launches) | step 3 |
 
 All new switches are off by default; without them the image behaves like v4i. `serve/serve_example.sh` sets the ones we
@@ -312,6 +346,22 @@ from 3.98 to 3.49 tokens per round. At 1.6, JSON keeps 4.05 of 4.11 tokens per r
   our corruption test (8K–100K at T = 1) would be the gate before using it.
 - THP `never` / proactive compaction off: not A/B-tested; compact_stall rose by only ~120–180 per node over three benches plus a 314K prefill.
 - A second NCCL rail: TTFT 3 % shorter, decode ~1 % slower per step (measured with `Simple`; `^LL128` + cuMem off changed nothing measurable). We keep it.
+- **The display reservation as memory (0053, 0054).** GB10 reserves 1,792 MiB per node for the display; with
+  `nvidia_drm modeset=1` a DRM dumb buffer maps it and `cuMemHostRegister` makes it device-addressable (the technique of
+  Gilesco's patch 0072, Apache-2.0, which 0rand's fork uses). A probe read it at 162 GB/s (ordinary memory 244), scattered 584 B KV records at 12 GB/s (79). KV cache
+  fully in the display region (1,792 MiB): decode −0.5…+0.3 % at 1 stream, prefill −1.2 %. KV cache over display +
+  pinned ordinary memory (0053, same 3.75 GiB of ordinary memory): pool 1,346,928 → 1,975,467 tokens, T=0 identical,
+  corruption test 0 hits, but the lowest free memory under load fell from 3,011 to 2,013 MiB on the head node and the
+  cost per round rose 1.5 % (multi-stream cells +1.1…+7.1 %). Embedding + Markov cache in the display region (0054, so
+  the KV pool can grow by 1 GiB): decode −1.7 %, 64K code −6.7 %. Not adopted.
+- **Hybrid drafting (0055)**, probabilistic drafts only for requests that plan the full window, greedy for the rest:
+  +0.75 % at T=1 overall and +5 % for code at 1 stream, but prose at 1 stream −1.6 %. Not adopted.
+- **1M context:** max-model-len 1,048,576 starts (pool 1,664,407 tokens with 0057), but the indexers' shared K gather
+  buffer (max-model-len × `VLLM_INDEXER_PREFILL_BUFFER_FACTOR` × 132 B) and the longer RoPE cache leave the head node
+  with 1.3–1.9 GiB free under the first long prompts, below our 1.5 GiB watchdog, also with buffer factor 2 instead of 8.
+  We stay at 320K.
+- **NVFP4 KV (0059, 0061):** see "KV cache capacity". Keeping the sliding window in FP8 halves the KLD of NVFP4
+  everywhere, but the rest is still above the run-to-run floor and costs accepted drafts.
 
 ## Note on untrusted text
 
@@ -330,5 +380,6 @@ bertholomus and the TensorFold contributors (RDMA ring and its use for decode ga
 bertholomus's TensorFold multi-stream depth rule is the idea behind 0041, Apache-2.0); 0xSero; christopher_owen (DSpark
 experiments, NCCL `^LL128`, measurement method); Elevatormusic (TensorFold test scripts and run logs used above);
 coolbho3k (the idea of layering prompt lookup on DSpark; 0043 is an independent implementation, no code taken);
-jayleaton (special tokens in user text, `NCCL_CUMEM_ENABLE=0`); see_spot_ruminate (X925 clock cap);
+jayleaton (special tokens in user text, `NCCL_CUMEM_ENABLE=0`); Gilesco and 0rand (display reservation as device memory,
+the question that led to 0057); siertum (pointer to DeepSeek's DeepInfer KV formats); see_spot_ruminate (X925 clock cap);
 shayanx45/Elevatormusic (compaction analysis) and the DGX Spark forum.

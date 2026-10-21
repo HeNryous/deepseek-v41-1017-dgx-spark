@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepseekV4 MLA Attention Layer"""
 
+import dataclasses
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -77,9 +78,38 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
     get_kv_quant_mode,
+    paired_kernel_spec,
+)
+from vllm.models.deepseek_v41.common.ops.nvfp4_fi_cache import (  # patch 0059
+    FP8_SWA_PAGE_ALIGNMENT,
+    KV_NVFP4 as _DSV41_KV_NVFP4,
+    KV_NVFP4_SWA as _DSV41_KV_NVFP4_SWA,
+    NVFP4_RECORD_BYTES,
+    nvfp4_append,
+    nvfp4_rope_insert,
+    prebuild as _nvfp4_prebuild,
 )
 
 logger = init_logger(__name__)
+
+
+def _dsv41_check_pair(spec: MLAAttentionSpec) -> MLAAttentionSpec:
+    """patch 0057: a paired page must be exactly two kernel pages (each with its own alignment padding), so a manager
+    block splits into two half-stride kernel blocks laid out like an unpaired block. Alignment padding of the whole
+    paired page can differ from two padded kernel pages (e.g. 128 x 132 B = 16,896 B is already 512-aligned while a
+    64-state page pads 8,448 -> 8,704 B), so the paired page is set to exactly ratio kernel pages."""
+    if spec.storage_block_size is None:
+        return spec
+    ratio, rest = divmod(spec.block_size, spec.storage_block_size)
+    kernel = paired_kernel_spec(spec)
+    if not rest and spec.page_size_bytes != ratio * kernel.page_size_bytes:
+        spec = dataclasses.replace(spec, page_size_padded=ratio * kernel.page_size_bytes)
+    if rest or spec.page_size_bytes != ratio * kernel.page_size_bytes:
+        raise ValueError(
+            f"VLLM_DSV41_KV_PAIR: page of {spec.page_size_bytes} B is not "
+            f"{ratio} x {kernel.page_size_bytes} B kernel pages."
+        )
+    return spec
 
 
 def _replace_layer_index(prefix: str, layer_id: int) -> str:
@@ -98,6 +128,27 @@ def _indexer_k_cache_head_dim(index_head_dim: int, use_fp4_kv: bool) -> int:
     # NOTE(yifan): FP8 indexer cache uses the same layout as V3.2:
     # head_dim bytes = 128 fp8 + 4 fp32 scale = 132.
     return index_head_dim + index_head_dim // 128 * 4
+
+
+# VLLM_DSV41_INDEXER_DEFER=1 (patch 0051, default off): the indexer's weights_proj (bf16 GEMV, hidden -> 32 heads)
+# ran on an aux stream next to fused_wqa_wkv, and the default stream joined it right after that GEMM, although its
+# result is first read by fused_indexer_q_rope_quant much later (cuBLAS runs it with 2 CTAs, ~56-61 us on GB10; the
+# join cost 50-105 us in each of the 8 indexer layers per decode round). With the switch the join moves to the
+# read, and in the short-context case, where forward() selects every candidate and never reads the weights, the
+# GEMV is not launched at all (TensorFold skips it there too). Same kernels, same inputs: bit-identical.
+_DSV41_INDEXER_DEFER = __import__("os").environ.get("VLLM_DSV41_INDEXER_DEFER", "0") == "1"
+# patch 0057 (VLLM_DSV41_KV_PAIR=1, default off): the ratio-1 compressed-KV and indexer pages (layer 20's; layers
+# 24/28/32/36 read its indexer cache) take 128-token manager blocks made of two 64-state kernel pages. Both compressed
+# groups then cover 128 tokens per block, so the shared block stride stops charging the ratio-1 group the ratio-2
+# group's width (138,240 B a block for 46,080 B of pages per 64 tokens). Kernels keep 64-state pages;
+# vllm/v1/kv_cache_interface.py views each manager block as two half-stride kernel blocks and the runner expands the
+# block table.
+_DSV41_KV_PAIR = __import__("os").environ.get("VLLM_DSV41_KV_PAIR", "0") == "1"
+# patch 0060 (VLLM_DSV41_KV_PAIR=3): three 64-state kernel pages per manager block (192 tokens) instead of two. The
+# ratio-1 group then holds 3 x 46,080 B = 138,240 B a block with fp8_ds_mla records (3 x 33,280 B = 99,840 B with
+# patch 0059's NVFP4 records), exactly the ratio-2 group's block stride: no padding left in either compressed group.
+_DSV41_KV_PAGES = 3 if __import__("os").environ.get("VLLM_DSV41_KV_PAIR", "0") == "3" else 2
+_DSV41_KV_PAIR = _DSV41_KV_PAIR or _DSV41_KV_PAGES == 3
 
 
 @triton.jit
@@ -510,16 +561,39 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.packed_kv_cache_dtype,
         )
         self.kv_mxfp8 = _use_v41_mxfp8_kv_record()
-        self.swa_bytes_per_token = 528 if self.kv_mxfp8 else 584
+        # patch 0059: FlashInfer's 384-byte NVFP4 record for the sliding-window and compressed caches on SM12x
+        self.kv_nvfp4 = (
+            _DSV41_KV_NVFP4_SWA and not self.kv_mxfp8 and self.kv_cache_dtype == "fp8_ds_mla"
+        )
+        # patch 0061 (VLLM_DSV41_KV_NVFP4=2): only the compressed cache in the NVFP4 record, the sliding window stays
+        # fp8_ds_mla; attention runs the two as separate FlashInfer calls merged by LSE (nvfp4_fi_cache.split_sparse_mla)
+        self.kv_nvfp4_comp = (
+            _DSV41_KV_NVFP4 and not self.kv_mxfp8 and self.kv_cache_dtype == "fp8_ds_mla"
+        )
+        self.swa_bytes_per_token = (
+            NVFP4_RECORD_BYTES if self.kv_nvfp4 else (528 if self.kv_mxfp8 else 584)
+        )
         # nvfp4_ds_mla keeps the MXFP8 sliding-window record and stores the
         # compressed cache as NVFP4 (256 B of e2m1 pairs + 32 e4m3 scales).
         self.compressed_bytes_per_token = (
-            288 if self.kv_cache_dtype == "nvfp4_ds_mla" else self.swa_bytes_per_token
+            288
+            if self.kv_cache_dtype == "nvfp4_ds_mla"
+            else (NVFP4_RECORD_BYTES if self.kv_nvfp4_comp else self.swa_bytes_per_token)
         )
         # One alignment for every page in the block: the block stride is their
         # sum, and 512 satisfies both TMA strides in play (512 for the V4.1
         # fp8 record, 256 for NVFP4).
-        self.kv_page_alignment = 512 if self.kv_mxfp8 else 576
+        self.kv_page_alignment = 512 if (self.kv_mxfp8 or self.kv_nvfp4) else 576
+        # patch 0061: mixed records - the window's FP8 pages keep 576 B alignment, the compressed (and indexer) pages
+        # take 512 B, and the block stride becomes a multiple of both (every block start stays aligned for both)
+        self.kv_comp_page_alignment = 512 if self.kv_nvfp4_comp else self.kv_page_alignment
+        self.kv_block_stride_alignment = (
+            math.lcm(FP8_SWA_PAGE_ALIGNMENT, 512)
+            if self.kv_nvfp4_comp and not self.kv_nvfp4
+            else None
+        )
+        if self.kv_nvfp4_comp:
+            _nvfp4_prebuild()
         if self.kv_cache_dtype == "nvfp4_ds_mla" and not self.kv_mxfp8:
             raise ValueError(
                 "nvfp4_ds_mla needs the V4.1 KV records, which FlashMLA "
@@ -708,18 +782,27 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             # The KV half of _fused_qnorm_rope_kv_insert, bit for bit, without
             # the unused query; same as dspark's _insert_context_kv.
             cache = self.swa_cache_layer.kv_cache
-            torch.ops._C.fused_deepseek_v4_kv_rope_insert(
-                kv,
-                cache,
-                cast(Any, attn_metadata[self.swa_cache_layer.prefix]).slot_mapping,
-                positions,
-                self.rotary_emb.cos_sin_cache,
-                self.swa_cache_layer.block_size,
-                self._flashinfer_fp8_kv_scale
-                if cache.dtype == torch.float8_e4m3fn
-                else None,
-                self.kv_mxfp8,
-            )
+            if self.kv_nvfp4:
+                nvfp4_rope_insert(
+                    kv,
+                    positions,
+                    self.rotary_emb.cos_sin_cache,
+                    cache,
+                    cast(Any, attn_metadata[self.swa_cache_layer.prefix]).slot_mapping,
+                )
+            else:
+                torch.ops._C.fused_deepseek_v4_kv_rope_insert(
+                    kv,
+                    cache,
+                    cast(Any, attn_metadata[self.swa_cache_layer.prefix]).slot_mapping,
+                    positions,
+                    self.rotary_emb.cos_sin_cache,
+                    self.swa_cache_layer.block_size,
+                    self._flashinfer_fp8_kv_scale
+                    if cache.dtype == torch.float8_e4m3fn
+                    else None,
+                    self.kv_mxfp8,
+                )
         if self.compressor is not None:
             latent = self.compressor(kv_score, positions)
             self.compressor.insert_cache(latent, positions, self.rotary_emb)
@@ -980,7 +1063,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 weights, _ = indexer.weights_proj(hidden_states)
                 return weights
 
-            aux_fns[1] = indexer_weights_proj
+            # patch 0051: forward() takes the short-context path and never reads the weights
+            if not (_DSV41_INDEXER_DEFER and indexer.takes_short_path()):
+                aux_fns[1] = indexer_weights_proj
+
+        enable = hidden_states.shape[0] <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD
+        deferred = None
+        if _DSV41_INDEXER_DEFER and aux_fns[1] is not None and aux_streams is not None and enable:
+            from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+            if not BreakableCUDAGraphCapture.is_active():
+                deferred, aux_fns[1] = aux_fns[1], None
 
         qr_kv, (kv_score, indexer_weights) = execute_in_parallel(
             lambda: self._fused_wqa_wkv_gemm(hidden_states),
@@ -988,9 +1081,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.ln_events[0],
             self.ln_events[1:3],
             aux_streams,
-            enable=hidden_states.shape[0]
-            <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
+            enable=enable,
         )
+        if deferred is not None:
+            # patch 0051: the GEMV starts at the same fan-out point (ln_events[0], recorded before fused_wqa_wkv)
+            # on aux stream 1; the indexer joins ln_events[3] right before fused_indexer_q_rope_quant reads it
+            with torch.cuda.stream(aux_streams[1]):
+                self.ln_events[0].wait()
+                indexer_weights = deferred()
+                self.ln_events[3].record()
+            self.indexer.pending_weights_event = self.ln_events[3]
 
         return qr_kv, kv_score, indexer_weights
 
@@ -1066,6 +1166,28 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         cache_dtype = swa_kv_cache.dtype
 
         # kv is unchanged; attention reads kv solely via swa_kv_cache.
+        if self.kv_nvfp4:
+            # patch 0059: Q RoPE in place and the roped KV rows into a BF16 scratch with the plain-row op (identity
+            # slots), then FlashInfer's NVFP4 quantize-append by the real slots. Q stays unpadded; the SM120
+            # attention pads it to the kernel's head count (_prepare_query).
+            assert not self.accepts_unnormed_unroped_query
+            n = kv.shape[0]
+            if n == 0:
+                return q
+            roped = torch.empty((1, n, self.head_dim), dtype=torch.bfloat16, device=kv.device)
+            torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
+                q,
+                kv,
+                roped,
+                torch.arange(n, dtype=torch.int64, device=kv.device),
+                positions,
+                cos_sin_cache,
+                self.eps,
+                n,
+                False,
+            )
+            nvfp4_append(roped.view(n, self.head_dim), swa_metadata.slot_mapping, swa_kv_cache)
+            return q
         if cache_dtype == torch.uint8:
             # fp8_ds_mla UE8M0 paged path. Horizontally fused:
             #   Q side: GPT-J RoPE, zero-filling the padding head slots; the
@@ -1161,6 +1283,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         spec_block_size = vllm_config.cache_config.block_size * max(
             1, self.compress_ratio
         )
+        # patch 0057: ratio-1 pages pair up into a 128-token manager block
+        pair = _DSV41_KV_PAIR and self.compress_ratio == 1 and uses_fp8_ds_mla_layout
+        if pair:
+            spec_block_size *= _DSV41_KV_PAGES  # patch 0060: 2 or 3 kernel pages
         try:
             is_sm120_or_sm121 = current_platform.is_device_capability_family(
                 120
@@ -1170,28 +1296,32 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
         if is_sm120_or_sm121:
             states_per_page = spec_block_size // max(1, self.compress_ratio)
-            if states_per_page != 64:
+            if states_per_page != (64 * _DSV41_KV_PAGES if pair else 64):
                 raise ValueError(
                     f"SM120/SM121 requires 64 states per page for compressed-KV "
                     f"spec, but got {states_per_page} (block_size={spec_block_size}, "
                     f"compress_ratio={self.compress_ratio})."
                 )
 
-        return MLAAttentionSpec(
+        return _dsv41_check_pair(MLAAttentionSpec(
             block_size=spec_block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=torch.uint8 if uses_fp8_ds_mla_layout else self.kv_cache_torch_dtype,
             tokens_per_state=self.compress_ratio,
             cache_dtype_str=self.kv_cache_dtype,
-            alignment=self.kv_page_alignment if uses_fp8_ds_mla_layout else 512,
+            alignment=self.kv_comp_page_alignment if uses_fp8_ds_mla_layout else 512,  # patch 0061
             model_version="deepseek_v4",
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
             # Packed record width; head_size stays semantic (512).
             state_content_bytes=(
                 self.compressed_bytes_per_token if uses_fp8_ds_mla_layout else None
             ),
-        )
+            # patch 0057: kernels and views keep 64-state pages
+            storage_block_size=spec_block_size // _DSV41_KV_PAGES if pair else None,
+            # patch 0061: block stride a multiple of the FP8 window's and the NVFP4 pages' alignment
+            block_stride_alignment=self.kv_block_stride_alignment,
+        ))
 
     def _compressed_kv_cache(self) -> torch.Tensor:
         """The compressed-KV cache tensor of this layer's kv source (own
@@ -1245,9 +1375,22 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
             "nvfp4_ds_mla",
         )
         page_alignment = (
-            576 if uses_fp8_ds_mla_layout and not _use_v41_mxfp8_kv_record() else 512
+            576
+            if uses_fp8_ds_mla_layout
+            and not _use_v41_mxfp8_kv_record()
+            and not _DSV41_KV_NVFP4
+            else 512
         )
         spec_block_size = self.cache_config.block_size * max(1, self.compress_ratio)
+        # patch 0057: ratio-1 indexer pages pair up like the compressed-KV page they share blocks with
+        pair = _DSV41_KV_PAIR and self.compress_ratio == 1 and uses_fp8_ds_mla_layout
+        if pair:
+            if self.sparse_logits or self.rocm_mxfp4:
+                raise ValueError(
+                    "VLLM_DSV41_KV_PAIR needs the FP8 indexer cache without "
+                    "indexer_sparse_logits (half-block strides are not 512B-aligned)."
+                )
+            spec_block_size *= _DSV41_KV_PAGES  # patch 0060: 2 or 3 kernel pages
         try:
             is_sm120_or_sm121 = current_platform.is_device_capability_family(
                 120
@@ -1257,15 +1400,16 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
 
         if is_sm120_or_sm121:
             states_per_page = spec_block_size // max(1, self.compress_ratio)
-            if states_per_page != 64:
+            if states_per_page != (64 * _DSV41_KV_PAGES if pair else 64):
                 raise ValueError(
                     f"SM120/SM121 requires 64 states per page for indexer "
                     f"spec, but got {states_per_page} (block_size={spec_block_size}, "
                     f"compress_ratio={self.compress_ratio})."
                 )
 
-        return MLAAttentionSpec(
+        return _dsv41_check_pair(MLAAttentionSpec(
             block_size=spec_block_size,
+            storage_block_size=spec_block_size // _DSV41_KV_PAGES if pair else None,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
@@ -1282,9 +1426,12 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
             block_stride_alignment=(
                 math.lcm(512, page_alignment)
                 if self.sparse_logits and not self.rocm_mxfp4
+                # patch 0061: same stride alignment as the compressed page it shares blocks with
+                else math.lcm(FP8_SWA_PAGE_ALIGNMENT, 512)
+                if _DSV41_KV_NVFP4 and not _DSV41_KV_NVFP4_SWA and uses_fp8_ds_mla_layout
                 else None
             ),
-        )
+        ))
 
     def forward(self): ...
 
@@ -1527,17 +1674,8 @@ class DeepseekV4Indexer(nn.Module):
         attn_metadata = get_forward_context().attn_metadata
         if isinstance(attn_metadata, dict):
             indexer_metadata = cast(Any, attn_metadata[self.k_cache.prefix])
-            from vllm.v1.worker.gpu.short_ctx import capture_bound
-
-            # Eager: the batch's own length decides. Capturing: only a short-context
-            # twin (vllm/v1/worker/gpu/short_ctx.py) whose bound allows it.
-            capturing = torch.cuda.is_current_stream_capturing()
-            bound = capture_bound() if capturing else None
-            if (
-                not capturing
-                and indexer_metadata.max_seq_len // self.compress_ratio
-                <= self.topk_tokens
-            ) or (bound is not None and bound // self.compress_ratio <= self.topk_tokens):
+            if self.takes_short_path():
+                self._join_pending_weights()  # patch 0051: normally nothing is pending here
                 # candidates num smaller than topk, every candidate is selected
                 # but we still need to build k cache
                 if self.owns_k:
@@ -1563,7 +1701,32 @@ class DeepseekV4Indexer(nn.Module):
             # (skip_k_cache_insert=True).
             self._produce_k(latent, positions, rotary_emb)
 
+        self._join_pending_weights()  # patch 0051
         return self.forward_q(qr, qr_scale, indexer_weights, positions, rotary_emb)
+
+    def takes_short_path(self) -> bool:
+        """True when forward() selects every candidate (short context) and so never reads the indexer weights.
+        Eager: the batch's own length decides. Capturing: only a short-context twin
+        (vllm/v1/worker/gpu/short_ctx.py) whose bound allows it."""
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return False
+        indexer_metadata = cast(Any, attn_metadata[self.k_cache.prefix])
+        from vllm.v1.worker.gpu.short_ctx import capture_bound
+
+        capturing = torch.cuda.is_current_stream_capturing()
+        bound = capture_bound() if capturing else None
+        return (
+            not capturing
+            and indexer_metadata.max_seq_len // self.compress_ratio <= self.topk_tokens
+        ) or (bound is not None and bound // self.compress_ratio <= self.topk_tokens)
+
+    def _join_pending_weights(self) -> None:
+        # patch 0051: the weights_proj GEMV ran on an aux stream; join it before its result is read
+        ev = getattr(self, "pending_weights_event", None)
+        if ev is not None:
+            ev.wait()
+            self.pending_weights_event = None
 
     def _wq_b_proj(
         self,

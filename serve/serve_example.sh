@@ -13,11 +13,11 @@ AK_MAX_REQS=${AK_MAX_REQS:-4}
 RECIPE=${RECIPE:-$HOME/dgx-spark-deepseek-v41}      # git clone https://github.com/sudoingX/dgx-spark-deepseek-v41
 export HEAD=${HEAD:?set HEAD=<head node hostname>} WORKER=${WORKER:?set WORKER=<worker node hostname>}
 export FAB_IF=${FAB_IF:-enp1s0f0np0} FAB_HCA=${FAB_HCA:-rocep1s0f0}   # fabric netdev and its RoCE device (DGX Spark names)
-export IMAGE=ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v5
+export IMAGE=ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v12
 export MODEL_DIR=$HOME/models/DeepSeek-V4.1-Flash-1017-EXL3-2.75bpw-DGX-Spark   # incl. the two 1017 Engram shards (scripts/download_model.sh)
 export SERVED=DeepSeek-V4.1-Flash-1017-EXL3-Spark-TP2
 export TEXT_ONLY=0 MAX_LEN=327680 MAX_SEQS=4 MAX_BATCH=4096 UTIL=0.86
-export KV_BYTES=4026531840                       # 3.75 GiB per rank -> 989,460 tokens; UTIL then only gates the startup check
+export KV_BYTES=4026531840                       # 3.75 GiB per rank -> 1,531,258 tokens with 0057 + 0060 (v5: 989,460); UTIL then only gates the startup check
 # 0040: DSpark k = 5 at 1-2 streams, k = 4 at 3-4 streams (at most 20 verify rows, kept on exl3_mrow by 0042b)
 export SPEC='{"method":"dspark","num_speculative_tokens":5,"num_speculative_tokens_per_batch_size":[[1,2,5],[3,4,4]]}'
 # keep the background long-prefill threshold <= MAX_BATCH / 4, otherwise background prefills can fill a whole step and a
@@ -34,6 +34,8 @@ export EXTRA="--limit-mm-per-prompt '{\"image\":4}' --mm-processor-cache-gb 0 --
 # on through 0042b's ring kernel. Recipe switches: router GEMM before the shared-expert fork, shared expert inside the
 # routed-expert kernel. 0048: mHC boundary in one launch (bit-identical); 0050: mHC overlap path up to 24 rows.
 # 0047: adaptive verify window (needs the 0040 schedule in SPEC), values at the top.
+# 0057 + 0060: the ratio-1 KV group in blocks of three 64-state kernel pages (no allocator padding);
+# VLLM_DSV41_KV_SWA_FILL=1 is part of the measured configuration and has no effect with FP8 records.
 export DOCKER_ENV="NCCL_MIN_NCHANNELS=4 NCCL_MAX_NCHANNELS=4 VLLM_DSPARK_ROUND_MS=33.26,36.33,38.91,42.23,46.03,48.15 \
 VLLM_PREFILL_EVERY_N_STEPS=24 VLLM_PREFILL_THROTTLE_MIN_PRIO=5 VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128 \
 NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0 EXL3_RDMA_DEVICES=rocep1s0f0 NCCL_PROTO=^LL128 NCCL_CUMEM_ENABLE=0 \
@@ -44,7 +46,8 @@ VLLM_EXL3_MROW_MAX_ROWS=32 EXL3_MROW32_VARIANT=ring EXL3_MROW32_MIN_ROWS=9 \
 VLLM_MOE_GATE_FIRST=1 VLLM_EXL3_MOE_SMOE_SHARED=1 \
 VLLM_DSV41_MHC_FUSED_POST=2 VLLM_DSV41_MHC_OVERLAP_MAX_TOKENS=24 \
 VLLM_DSV41_ADAPTIVE_K=1 VLLM_DSV41_AK_MARGIN=$AK_MARGIN VLLM_DSV41_AK_MIN=$AK_MIN VLLM_DSV41_AK_HI=$AK_HI \
-VLLM_DSV41_AK_MAX_REQS=$AK_MAX_REQS"
+VLLM_DSV41_AK_MAX_REQS=$AK_MAX_REQS \
+VLLM_DSV41_KV_PAIR=3 VLLM_DSV41_KV_SWA_FILL=1"
 # The plugin's JIT kernels (TensorFold experts, exl3_mrow, RDMA ring, mHC boundary, router, routed-expert decode, L2
 # prefetch) on both nodes before the model loads; once built for this image, this only loads them. Building them next to
 # the loaded weights can run a node out of memory. EXL3_SMOE_FLAGS is the launcher's (part of the module name).

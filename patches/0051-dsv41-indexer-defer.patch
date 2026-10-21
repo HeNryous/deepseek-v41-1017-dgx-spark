@@ -1,0 +1,123 @@
+dsv41 patch 0051 (20.10.2026): the indexer's weights_proj GEMV off the main stream's critical path.
+Base: vllm/models/deepseek_v41/attention.py of image v5.
+Why: in a profile of the decode round (1 stream) the main stream waited 50-105 us in each of the 8 indexer layers for
+indexer.weights_proj (bf16 GEMV hidden -> 32 heads, cuBLAS with 2 CTAs, 56-61 us on GB10), 0.54 ms a round: the GEMV
+runs on an aux stream next to fused_wqa_wkv, and the default stream joined it right after that GEMM, although its
+result is first read by fused_indexer_q_rope_quant much later. In the short-context case forward() selects every
+candidate and never reads the weights (TensorFold skips the GEMV there too).
+How: the join moves to the read (right before fused_indexer_q_rope_quant); with short contexts the GEMV is not
+launched. Same kernels, same inputs: bit-identical.
+Measured (20.10.2026, GB10, 2000 MHz, image v6): only on top of patch 0054, against 0054 alone: geometric mean +0.2 %
+(-1.50 against -1.70 % relative to neither), inside the run-to-run spread. Not adopted.
+Switch: VLLM_DSV41_INDEXER_DEFER=1 (default 0 = off).
+
+--- a/vllm/models/deepseek_v41/attention.py
++++ b/vllm/models/deepseek_v41/attention.py
+@@ -100,6 +100,15 @@
+     return index_head_dim + index_head_dim // 128 * 4
+ 
+ 
++# VLLM_DSV41_INDEXER_DEFER=1 (patch 0051, default off): the indexer's weights_proj (bf16 GEMV, hidden -> 32 heads)
++# ran on an aux stream next to fused_wqa_wkv, and the default stream joined it right after that GEMM, although its
++# result is first read by fused_indexer_q_rope_quant much later (cuBLAS runs it with 2 CTAs, ~56-61 us on GB10; the
++# join cost 50-105 us in each of the 8 indexer layers per decode round). With the switch the join moves to the
++# read, and in the short-context case, where forward() selects every candidate and never reads the weights, the
++# GEMV is not launched at all (TensorFold skips it there too). Same kernels, same inputs: bit-identical.
++_DSV41_INDEXER_DEFER = __import__("os").environ.get("VLLM_DSV41_INDEXER_DEFER", "0") == "1"
++
++
+ @triton.jit
+ def _fill_short_context_topk_indices(
+     output,
+@@ -980,7 +989,17 @@
+                 weights, _ = indexer.weights_proj(hidden_states)
+                 return weights
+ 
+-            aux_fns[1] = indexer_weights_proj
++            # patch 0051: forward() takes the short-context path and never reads the weights
++            if not (_DSV41_INDEXER_DEFER and indexer.takes_short_path()):
++                aux_fns[1] = indexer_weights_proj
++
++        enable = hidden_states.shape[0] <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD
++        deferred = None
++        if _DSV41_INDEXER_DEFER and aux_fns[1] is not None and aux_streams is not None and enable:
++            from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
++
++            if not BreakableCUDAGraphCapture.is_active():
++                deferred, aux_fns[1] = aux_fns[1], None
+ 
+         qr_kv, (kv_score, indexer_weights) = execute_in_parallel(
+             lambda: self._fused_wqa_wkv_gemm(hidden_states),
+@@ -988,9 +1007,16 @@
+             self.ln_events[0],
+             self.ln_events[1:3],
+             aux_streams,
+-            enable=hidden_states.shape[0]
+-            <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
++            enable=enable,
+         )
++        if deferred is not None:
++            # patch 0051: the GEMV starts at the same fan-out point (ln_events[0], recorded before fused_wqa_wkv)
++            # on aux stream 1; the indexer joins ln_events[3] right before fused_indexer_q_rope_quant reads it
++            with torch.cuda.stream(aux_streams[1]):
++                self.ln_events[0].wait()
++                indexer_weights = deferred()
++                self.ln_events[3].record()
++            self.indexer.pending_weights_event = self.ln_events[3]
+ 
+         return qr_kv, kv_score, indexer_weights
+ 
+@@ -1527,17 +1553,8 @@
+         attn_metadata = get_forward_context().attn_metadata
+         if isinstance(attn_metadata, dict):
+             indexer_metadata = cast(Any, attn_metadata[self.k_cache.prefix])
+-            from vllm.v1.worker.gpu.short_ctx import capture_bound
+-
+-            # Eager: the batch's own length decides. Capturing: only a short-context
+-            # twin (vllm/v1/worker/gpu/short_ctx.py) whose bound allows it.
+-            capturing = torch.cuda.is_current_stream_capturing()
+-            bound = capture_bound() if capturing else None
+-            if (
+-                not capturing
+-                and indexer_metadata.max_seq_len // self.compress_ratio
+-                <= self.topk_tokens
+-            ) or (bound is not None and bound // self.compress_ratio <= self.topk_tokens):
++            if self.takes_short_path():
++                self._join_pending_weights()  # patch 0051: normally nothing is pending here
+                 # candidates num smaller than topk, every candidate is selected
+                 # but we still need to build k cache
+                 if self.owns_k:
+@@ -1563,8 +1580,33 @@
+             # (skip_k_cache_insert=True).
+             self._produce_k(latent, positions, rotary_emb)
+ 
++        self._join_pending_weights()  # patch 0051
+         return self.forward_q(qr, qr_scale, indexer_weights, positions, rotary_emb)
+ 
++    def takes_short_path(self) -> bool:
++        """True when forward() selects every candidate (short context) and so never reads the indexer weights.
++        Eager: the batch's own length decides. Capturing: only a short-context twin
++        (vllm/v1/worker/gpu/short_ctx.py) whose bound allows it."""
++        attn_metadata = get_forward_context().attn_metadata
++        if not isinstance(attn_metadata, dict):
++            return False
++        indexer_metadata = cast(Any, attn_metadata[self.k_cache.prefix])
++        from vllm.v1.worker.gpu.short_ctx import capture_bound
++
++        capturing = torch.cuda.is_current_stream_capturing()
++        bound = capture_bound() if capturing else None
++        return (
++            not capturing
++            and indexer_metadata.max_seq_len // self.compress_ratio <= self.topk_tokens
++        ) or (bound is not None and bound // self.compress_ratio <= self.topk_tokens)
++
++    def _join_pending_weights(self) -> None:
++        # patch 0051: the weights_proj GEMV ran on an aux stream; join it before its result is read
++        ev = getattr(self, "pending_weights_event", None)
++        if ev is not None:
++            ev.wait()
++            self.pending_weights_event = None
++
+     def _wq_b_proj(
+         self,
+         qr: torch.Tensor | QuantizedActivation,

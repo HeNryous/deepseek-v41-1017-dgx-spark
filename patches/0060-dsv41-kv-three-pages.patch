@@ -1,0 +1,110 @@
+dsv41 patch 0060 (20.10.2026): three kernel pages per manager block for the ratio-1 KV group. In use
+(VLLM_DSV41_KV_PAIR=3). Base: the v9 files (0057 + 0059).
+Why: with 0057 the ratio-1 group's paired block (2 x 46,080 = 92,160 B) still sits in the ratio-2 group's 138,240 B
+block stride, so a third of each of its blocks stays empty. Three 64-state pages are 3 x 46,080 = 138,240 B, exactly the
+stride (with 0059's NVFP4 records 3 x 33,280 = 99,840 B, again exactly the stride): no padding left.
+How: VLLM_DSV41_KV_PAIR=3 gives the ratio-1 specs 192-token manager blocks (spec block size x 3, storage_block_size 64)
+on top of 0057's paired-page machinery. vLLM's hybrid allocator takes it generically: the scheduler block is the lcm of
+the group block sizes (384), the hash block their gcd (64), BlockTables expands manager blocks into kernel blocks
+(b * k + j), the views divide by the ratio. One fix in kv_cache_interface.py: _apply_alignment_padding shrank a
+deliberately larger page in replace() (a 192-state NVFP4 indexer page: 25,600 instead of 3 x 8,704 B); it now keeps a
+larger page that is already aligned (no effect with FP8 records or VLLM_DSV41_KV_PAIR=1).
+Per token and node, as charged for a max-length request: 1,800 B data (1,462.5 B fp8_ds_mla + 337.5 B indexer keys)
++ 829 B sliding-window admission reserve = 2,630 B (v5: 4,069 B incl. 1,440 B padding; 0057: 2,989 B).
+Measured (21.10.2026, GB10, 2000 MHz, image v12, 3.75 GiB KV pool per node, against a fresh start of the 0057
+configuration): KV pool 1,346,928 -> 1,531,258 tokens (+13.7 %; offline harness: 1,531,258), bytes per token live
+(250K-token prompt) 2,187 -> 1,827; cost per verify round -0.51 % (geometric mean of 14 cells, worst +1.4 %), tok/s
+-0.03 %; T=0 texts identical 8/8; needles at 250K 6/6; corruption test (8K/30K/50K/100K, 4 each) 0 hits; lowest free
+memory under load 1,992 MiB head / 3,480 MiB worker.
+Switch: VLLM_DSV41_KV_PAIR=3 (1 = 0057's two pages, 0 = off).
+--- a/vllm/models/deepseek_v41/attention.py
++++ b/vllm/models/deepseek_v41/attention.py
+@@ -142,6 +142,11 @@
+ # vllm/v1/kv_cache_interface.py views each manager block as two half-stride kernel blocks and the runner expands the
+ # block table.
+ _DSV41_KV_PAIR = __import__("os").environ.get("VLLM_DSV41_KV_PAIR", "0") == "1"
++# patch 0060 (VLLM_DSV41_KV_PAIR=3): three 64-state kernel pages per manager block (192 tokens) instead of two. The
++# ratio-1 group then holds 3 x 46,080 B = 138,240 B a block with fp8_ds_mla records (3 x 33,280 B = 99,840 B with
++# patch 0059's NVFP4 records), exactly the ratio-2 group's block stride: no padding left in either compressed group.
++_DSV41_KV_PAGES = 3 if __import__("os").environ.get("VLLM_DSV41_KV_PAIR", "0") == "3" else 2
++_DSV41_KV_PAIR = _DSV41_KV_PAIR or _DSV41_KV_PAGES == 3
+ 
+ 
+ @triton.jit
+@@ -1264,7 +1269,7 @@
+         # patch 0057: ratio-1 pages pair up into a 128-token manager block
+         pair = _DSV41_KV_PAIR and self.compress_ratio == 1 and uses_fp8_ds_mla_layout
+         if pair:
+-            spec_block_size *= 2
++            spec_block_size *= _DSV41_KV_PAGES  # patch 0060: 2 or 3 kernel pages
+         try:
+             is_sm120_or_sm121 = current_platform.is_device_capability_family(
+                 120
+@@ -1274,7 +1279,7 @@
+ 
+         if is_sm120_or_sm121:
+             states_per_page = spec_block_size // max(1, self.compress_ratio)
+-            if states_per_page != (128 if pair else 64):
++            if states_per_page != (64 * _DSV41_KV_PAGES if pair else 64):
+                 raise ValueError(
+                     f"SM120/SM121 requires 64 states per page for compressed-KV "
+                     f"spec, but got {states_per_page} (block_size={spec_block_size}, "
+@@ -1296,7 +1301,7 @@
+                 self.compressed_bytes_per_token if uses_fp8_ds_mla_layout else None
+             ),
+             # patch 0057: kernels and views keep 64-state pages
+-            storage_block_size=spec_block_size // 2 if pair else None,
++            storage_block_size=spec_block_size // _DSV41_KV_PAGES if pair else None,
+         ))
+ 
+     def _compressed_kv_cache(self) -> torch.Tensor:
+@@ -1366,7 +1371,7 @@
+                     "VLLM_DSV41_KV_PAIR needs the FP8 indexer cache without "
+                     "indexer_sparse_logits (half-block strides are not 512B-aligned)."
+                 )
+-            spec_block_size *= 2
++            spec_block_size *= _DSV41_KV_PAGES  # patch 0060: 2 or 3 kernel pages
+         try:
+             is_sm120_or_sm121 = current_platform.is_device_capability_family(
+                 120
+@@ -1376,7 +1381,7 @@
+ 
+         if is_sm120_or_sm121:
+             states_per_page = spec_block_size // max(1, self.compress_ratio)
+-            if states_per_page != (128 if pair else 64):
++            if states_per_page != (64 * _DSV41_KV_PAGES if pair else 64):
+                 raise ValueError(
+                     f"SM120/SM121 requires 64 states per page for indexer "
+                     f"spec, but got {states_per_page} (block_size={spec_block_size}, "
+@@ -1385,7 +1390,7 @@
+ 
+         return _dsv41_check_pair(MLAAttentionSpec(
+             block_size=spec_block_size,
+-            storage_block_size=spec_block_size // 2 if pair else None,
++            storage_block_size=spec_block_size // _DSV41_KV_PAGES if pair else None,
+             num_kv_heads=1,
+             head_size=self.head_dim,
+             dtype=self.dtype,
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -665,7 +665,7 @@
+         return merged_spec
+ 
+ 
+-_DSV41_KV_PAIR = os.environ.get("VLLM_DSV41_KV_PAIR", "0") == "1"
++_DSV41_KV_PAIR = os.environ.get("VLLM_DSV41_KV_PAIR", "0") in ("1", "3")  # patch 0060: "3" = three kernel pages
+ 
+ 
+ def is_paired_spec(spec: KVCacheSpec) -> bool:
+@@ -689,6 +689,11 @@
+         return
+     actual_page_size = spec.real_page_size_bytes
+     padded_page_size = round_up(actual_page_size, spec.alignment)
++    # patch 0060: keep a larger page that is already aligned (a 192-state page of patch 0057 is set to exactly three
++    # padded 64-state kernel pages; replace() re-runs __post_init__ and would shrink it to the page's own alignment)
++    explicit = spec.page_size_padded
++    if explicit is not None and explicit > padded_page_size and explicit % spec.alignment == 0:
++        return
+     if padded_page_size != actual_page_size:
+         object.__setattr__(spec, "page_size_padded", padded_page_size)
+ 

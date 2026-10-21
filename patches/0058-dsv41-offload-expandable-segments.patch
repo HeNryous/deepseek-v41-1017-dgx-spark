@@ -1,0 +1,30 @@
+dsv41 patch 0058 (20.10.2026): vLLM's OffloadingConnector next to PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.
+Why: vllm/config/vllm.py _verify_kv_transfer_compat rejects every KV connector when the PyTorch allocator uses
+expandable segments (CUDA VMM can remap a virtual range to other physical pages, which breaks connectors that register
+GPU memory for RDMA once). We run with expandable segments (about 1 GiB more free memory per node in our runs). The
+OffloadingConnector (vLLM's own CPU + file-system KV tier) copies blocks between the GPU cache and
+pinned host buffers by virtual address at copy time, registers only host memory (cudaHostRegister), and the KV cache is
+one allocation held for the engine's lifetime, so the hazard does not apply to it. Without the patch the engine exits
+17 s into the start ("expandable_segments" ValueError).
+Switch: VLLM_DSV41_OFFLOAD_EXPANDABLE_OK=1 (default 0 = check as before), only for kv_connector "OffloadingConnector".
+Not measured live yet: the offload window (cold 60K prompt -> restart -> reload from SSD -> corrupted block -> CRC miss,
+patch 0056) is still to run.
+
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -1223,6 +1223,15 @@
+             or self.kv_transfer_config.kv_connector is None
+         ):
+             return
++        # dsv41 patch 0058 (VLLM_DSV41_OFFLOAD_EXPANDABLE_OK=1, default off): the OffloadingConnector copies KV
++        # blocks between the GPU cache and pinned host buffers by virtual address at copy time and registers no GPU
++        # memory, and the KV cache is one allocation held for the engine's lifetime (never freed, so never remapped).
++        # The stale-registration hazard below does not apply to it.
++        if (
++            os.environ.get("VLLM_DSV41_OFFLOAD_EXPANDABLE_OK", "0") == "1"
++            and self.kv_transfer_config.kv_connector == "OffloadingConnector"
++        ):
++            return
+ 
+         # PyTorch's expandable_segments allocator uses CUDA VMM, which can
+         # remap a virtual address range to different physical pages over the

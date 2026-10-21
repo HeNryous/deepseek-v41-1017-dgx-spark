@@ -1,0 +1,335 @@
+dsv41 patch 0057 (20.10.2026): paired KV pages. The ratio-1 compressed-KV group stops paying the ratio-2 group's block
+stride. Base: the v6 files (vllm/models/deepseek_v41/attention.py incl. our 0051, vllm/v1/worker/utils.py incl. 0053).
+Why: vLLM packs every KV cache group of a model into one shared block pool (packed BLHNC layout), and the block stride is
+the widest group's page sum. On DeepSeek-V4.1-Flash that is the ratio-2 group: 3 compressed-KV pages (layers 2/8/14) + 3
+indexer pages per 128 tokens = 138,240 B. Indexer key caches exist only on the four KV-source layers 2/8/14/20 (24/28/32/36
+read layer 20's). The ratio-1 group (layer 20's compressed KV + indexer page) holds 46,080 B per 64 tokens but paid the
+full stride for every block, so two thirds of each of its blocks stayed empty. Per token and node, as charged for a
+max-length request: 1,462.5 B fp8_ds_mla records (584 B a state) + 337.5 B FP8 indexer keys (132 B a state) = 1,800 B
+data, 1,440 B padding, 829 B sliding-window admission reserve (15 SWA groups x 131 blocks a request) = 4,069 B.
+How: the ratio-1 specs take 128-token manager blocks (block_size 128) made of two 64-state kernel pages
+(storage_block_size 64; the SM12x kernels keep their 64 states per page). create_kv_cache_views views each manager block
+of that group as two kernel blocks of half the stride, with the same per-page layout as an unpaired block (layer offsets
+and strides halved); the GPU runner already expands manager blocks into kernel blocks in the block table and slot mapping
+(BlockTables.blocks_per_kv_block), and every kernel in the path addresses pages through the view's stride(0) (FlashInfer
+SM120 sparse MLA, our Triton verify kernel, DeepGEMM paged MQA logits, rope_quant_insert). Paired and unpaired pages never
+share a group (MLAAttentionSpec.is_uniform_with_collection). A paired block (2 x 46,080 = 92,160 B) fits under the
+ratio-2 stride, which stays 138,240 B, so the ratio-1 group is charged 1,080 instead of 2,160 B per token. A paired page
+must be exactly two kernel pages including their alignment padding; _dsv41_check_pair sets page_size_padded where the
+128-state page aligns differently (the indexer page under patch 0059's 512 B alignment: 16,896 vs 2 x 8,704 B).
+VLLM_DSV41_KV_SWA_FILL fills the sliding-window groups up to the stride (more layers per group, fewer groups, a smaller
+admission reserve a request). With FP8 KV a fourth SWA layer (4 x 37,440 B) does not fit under 138,240 B, so it changes
+nothing; with patch 0059 (NVFP4 records) it does.
+Measured (20.10.2026, GB10, 2000 MHz, image v8, 3.75 GiB KV pool per node, one window; no switches against both):
+KV pool 989,460 -> 1,346,928 tokens (+36.1 %; 29,127 blocks either way); bytes per token live (250K-token prompt,
+kv_cache_usage_perc x pool / prompt tokens) 3,267 -> 2,187 (-33 %); cost per verify round, geometric mean of 14 cells,
+-0.31 % (worst cell +1.2 %), tok/s +0.33 %; T=0 texts identical 8/8; corruption test (8K/30K/50K/100K, 4 each) 0 hits;
+suite prose / code 54.3 / 97.7 -> 54.1 / 98.4 tok/s.
+Switch: VLLM_DSV41_KV_PAIR=1 (default 0 = off), VLLM_DSV41_KV_SWA_FILL=1 (default 0). Raises with indexer_sparse_logits
+or the ROCm MXFP4 indexer (not covered; the alignment code only aligns the full stride).
+
+--- a/vllm/models/deepseek_v41/attention.py
++++ b/vllm/models/deepseek_v41/attention.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """DeepseekV4 MLA Attention Layer"""
+ 
++import dataclasses
+ import math
+ from abc import ABC, abstractmethod
+ from collections.abc import Callable
+@@ -77,11 +78,31 @@
+     KVCacheSpec,
+     MLAAttentionSpec,
+     get_kv_quant_mode,
++    paired_kernel_spec,
+ )
+ 
+ logger = init_logger(__name__)
+ 
+ 
++def _dsv41_check_pair(spec: MLAAttentionSpec) -> MLAAttentionSpec:
++    """patch 0057: a paired page must be exactly two kernel pages (each with its own alignment padding), so a manager
++    block splits into two half-stride kernel blocks laid out like an unpaired block. Alignment padding of the whole
++    paired page can differ from two padded kernel pages (e.g. 128 x 132 B = 16,896 B is already 512-aligned while a
++    64-state page pads 8,448 -> 8,704 B), so the paired page is set to exactly ratio kernel pages."""
++    if spec.storage_block_size is None:
++        return spec
++    ratio, rest = divmod(spec.block_size, spec.storage_block_size)
++    kernel = paired_kernel_spec(spec)
++    if not rest and spec.page_size_bytes != ratio * kernel.page_size_bytes:
++        spec = dataclasses.replace(spec, page_size_padded=ratio * kernel.page_size_bytes)
++    if rest or spec.page_size_bytes != ratio * kernel.page_size_bytes:
++        raise ValueError(
++            f"VLLM_DSV41_KV_PAIR: page of {spec.page_size_bytes} B is not "
++            f"{ratio} x {kernel.page_size_bytes} B kernel pages."
++        )
++    return spec
++
++
+ def _replace_layer_index(prefix: str, layer_id: int) -> str:
+     """Swap the layer index inside a ``...layers.<idx>...`` prefix."""
+     new_prefix, n = re.subn(r"\.layers\.\d+\.", f".layers.{layer_id}.", prefix)
+@@ -107,6 +128,13 @@
+ # read, and in the short-context case, where forward() selects every candidate and never reads the weights, the
+ # GEMV is not launched at all (TensorFold skips it there too). Same kernels, same inputs: bit-identical.
+ _DSV41_INDEXER_DEFER = __import__("os").environ.get("VLLM_DSV41_INDEXER_DEFER", "0") == "1"
++# patch 0057 (VLLM_DSV41_KV_PAIR=1, default off): the ratio-1 compressed-KV and indexer pages (layer 20's; layers
++# 24/28/32/36 read its indexer cache) take 128-token manager blocks made of two 64-state kernel pages. Both compressed
++# groups then cover 128 tokens per block, so the shared block stride stops charging the ratio-1 group the ratio-2
++# group's width (138,240 B a block for 46,080 B of pages per 64 tokens). Kernels keep 64-state pages;
++# vllm/v1/kv_cache_interface.py views each manager block as two half-stride kernel blocks and the runner expands the
++# block table.
++_DSV41_KV_PAIR = __import__("os").environ.get("VLLM_DSV41_KV_PAIR", "0") == "1"
+ 
+ 
+ @triton.jit
+@@ -1187,6 +1215,10 @@
+         spec_block_size = vllm_config.cache_config.block_size * max(
+             1, self.compress_ratio
+         )
++        # patch 0057: ratio-1 pages pair up into a 128-token manager block
++        pair = _DSV41_KV_PAIR and self.compress_ratio == 1 and uses_fp8_ds_mla_layout
++        if pair:
++            spec_block_size *= 2
+         try:
+             is_sm120_or_sm121 = current_platform.is_device_capability_family(
+                 120
+@@ -1196,14 +1228,14 @@
+ 
+         if is_sm120_or_sm121:
+             states_per_page = spec_block_size // max(1, self.compress_ratio)
+-            if states_per_page != 64:
++            if states_per_page != (128 if pair else 64):
+                 raise ValueError(
+                     f"SM120/SM121 requires 64 states per page for compressed-KV "
+                     f"spec, but got {states_per_page} (block_size={spec_block_size}, "
+                     f"compress_ratio={self.compress_ratio})."
+                 )
+ 
+-        return MLAAttentionSpec(
++        return _dsv41_check_pair(MLAAttentionSpec(
+             block_size=spec_block_size,
+             num_kv_heads=1,
+             head_size=self.head_dim,
+@@ -1217,7 +1249,9 @@
+             state_content_bytes=(
+                 self.compressed_bytes_per_token if uses_fp8_ds_mla_layout else None
+             ),
+-        )
++            # patch 0057: kernels and views keep 64-state pages
++            storage_block_size=spec_block_size // 2 if pair else None,
++        ))
+ 
+     def _compressed_kv_cache(self) -> torch.Tensor:
+         """The compressed-KV cache tensor of this layer's kv source (own
+@@ -1274,6 +1308,15 @@
+             576 if uses_fp8_ds_mla_layout and not _use_v41_mxfp8_kv_record() else 512
+         )
+         spec_block_size = self.cache_config.block_size * max(1, self.compress_ratio)
++        # patch 0057: ratio-1 indexer pages pair up like the compressed-KV page they share blocks with
++        pair = _DSV41_KV_PAIR and self.compress_ratio == 1 and uses_fp8_ds_mla_layout
++        if pair:
++            if self.sparse_logits or self.rocm_mxfp4:
++                raise ValueError(
++                    "VLLM_DSV41_KV_PAIR needs the FP8 indexer cache without "
++                    "indexer_sparse_logits (half-block strides are not 512B-aligned)."
++                )
++            spec_block_size *= 2
+         try:
+             is_sm120_or_sm121 = current_platform.is_device_capability_family(
+                 120
+@@ -1283,15 +1326,16 @@
+ 
+         if is_sm120_or_sm121:
+             states_per_page = spec_block_size // max(1, self.compress_ratio)
+-            if states_per_page != 64:
++            if states_per_page != (128 if pair else 64):
+                 raise ValueError(
+                     f"SM120/SM121 requires 64 states per page for indexer "
+                     f"spec, but got {states_per_page} (block_size={spec_block_size}, "
+                     f"compress_ratio={self.compress_ratio})."
+                 )
+ 
+-        return MLAAttentionSpec(
++        return _dsv41_check_pair(MLAAttentionSpec(
+             block_size=spec_block_size,
++            storage_block_size=spec_block_size // 2 if pair else None,
+             num_kv_heads=1,
+             head_size=self.head_dim,
+             dtype=self.dtype,
+@@ -1310,7 +1354,7 @@
+                 if self.sparse_logits and not self.rocm_mxfp4
+                 else None
+             ),
+-        )
++        ))
+ 
+     def forward(self): ...
+ 
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -4,6 +4,7 @@
+ from __future__ import annotations
+ 
+ import copy
++import os
+ from collections import Counter
+ from collections.abc import Collection, Sequence
+ from dataclasses import dataclass, field, fields, replace
+@@ -366,11 +367,26 @@
+     num_layers = len(kv_cache_tensor.layers)
+     layer_stride = kv_cache_tensor.layer_stride
+     block_stride = kv_cache_tensor.block_stride
++    offset = kv_cache_tensor.offset
+     shape_bytes = compute_layer_kv_cache_shape_bytes(
+         spec, num_blocks, kernel_block_size
+     )
+     ratio = shape_bytes[0] // num_blocks
+-    if ratio > 1:
++    if ratio > 1 and is_paired_spec(spec) and kernel_block_size == spec.storage_block_size:
++        # patch 0057: a paired manager block is `ratio` kernel blocks of block_stride / ratio bytes, each holding
++        # every layer's kernel page packed as in an unpaired block, so layer pages and offsets scale by 1 / ratio.
++        assert block_stride % ratio == 0 and layer_stride % ratio == 0 and offset % ratio == 0, (
++            f"paired KV view: block stride {block_stride}, layer stride {layer_stride} and offset {offset} "
++            f"must split into {ratio} kernel blocks"
++        )
++        spec = paired_kernel_spec(spec)
++        num_blocks *= ratio
++        block_stride //= ratio
++        layer_stride //= ratio
++        offset //= ratio
++        kernel_block_size = None
++        shape_bytes = compute_layer_kv_cache_shape_bytes(spec, num_blocks)
++    elif ratio > 1:
+         # Kernel blocks subdivide a manager block into `ratio` equal pieces, so
+         # they sit a constant stride apart only if a block is one dense page: no
+         # padding at its end, and no other layer's page before the next block.
+@@ -405,7 +421,7 @@
+         raw,
+         size=logical_shape,
+         stride=strides,
+-        storage_offset=raw.storage_offset() + kv_cache_tensor.offset,
++        storage_offset=raw.storage_offset() + offset,
+     )
+ 
+     views = []
+@@ -649,6 +665,25 @@
+         return merged_spec
+ 
+ 
++_DSV41_KV_PAIR = os.environ.get("VLLM_DSV41_KV_PAIR", "0") == "1"
++
++
++def is_paired_spec(spec: KVCacheSpec) -> bool:
++    """patch 0057 (VLLM_DSV41_KV_PAIR=1): a DeepSeek-V4.1 page whose manager block holds several kernel pages of
++    ``storage_block_size`` tokens (vllm/models/deepseek_v41/attention.py)."""
++    return (
++        _DSV41_KV_PAIR
++        and isinstance(spec, MLAAttentionSpec)
++        and spec.storage_block_size is not None
++        and spec.storage_block_size < spec.block_size
++    )
++
++
++def paired_kernel_spec(spec: MLAAttentionSpec) -> MLAAttentionSpec:
++    """The kernel-page spec of a paired spec, with the padding of its own page size."""
++    return replace(spec, block_size=spec.storage_block_size, page_size_padded=None)
++
++
+ def _apply_alignment_padding(spec: MLAAttentionSpec | SlidingWindowMLASpec):
+     if spec.alignment is None:
+         return
+@@ -679,6 +714,20 @@
+         super().__post_init__()
+         _apply_alignment_padding(self)
+ 
++    def is_uniform_with_collection(
++        self, kv_cache_specs: dict[str, KVCacheSpec]
++    ) -> bool:
++        if not super().is_uniform_with_collection(kv_cache_specs):
++            return False
++        if not _DSV41_KV_PAIR:
++            return True
++        # patch 0057: paired and unpaired pages never share a group. Both compressed groups cover 128 tokens per
++        # block once ratio 1 pairs up, but they need different kernel block sizes (64 vs 128 tokens).
++        return all(
++            getattr(spec, "storage_block_size", None) == self.storage_block_size
++            for spec in kv_cache_specs.values()
++        )
++
+     @classmethod
+     def merge(cls, specs: list[Self]) -> Self:
+         assert all(isinstance(spec, MLAAttentionSpec) for spec in specs), (
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -38,6 +38,8 @@
+     MLAAttentionSpec,
+     UniformTypeKVCacheSpecs,
+     create_kv_cache_views,
++    is_paired_spec,
++    paired_kernel_spec,
+ )
+ from vllm.v1.worker.block_table import get_block_table_width
+ 
+@@ -281,8 +283,13 @@
+             isinstance(self.kv_cache_spec, MLAAttentionSpec)
+             and self.kv_cache_spec.storage_block_size is not None
+         ):
+-            kv_cache_spec_builder = self.kv_cache_spec.copy_with_new_block_size(
+-                self.kv_cache_spec.storage_block_size
++            # patch 0057: a paired spec's kernel page keeps the padding of its own size
++            kv_cache_spec_builder = (
++                paired_kernel_spec(self.kv_cache_spec)
++                if is_paired_spec(self.kv_cache_spec)
++                else self.kv_cache_spec.copy_with_new_block_size(
++                    self.kv_cache_spec.storage_block_size
++                )
+             )
+         else:
+             kv_cache_spec_builder = self.kv_cache_spec.copy_with_new_block_size(
+@@ -501,6 +508,16 @@
+             # This is an attention backend that supports virtual block splitting.
+             kv_manager_block_size = kv_cache_group.kv_cache_spec.block_size
+             group_backends = [g.backend for g in attn_groups[kv_cache_gid]]
++            if is_paired_spec(kv_cache_spec):
++                # patch 0057: a paired group's kernels read 64-state pages, so its kernel block is the
++                # storage width even where the backends would also take the manager size.
++                kernel_block_sizes.append(
++                    select_common_block_size(
++                        kv_cache_spec.storage_block_size, group_backends
++                    )
++                )
++                assert kernel_block_sizes[-1] == kv_cache_spec.storage_block_size
++                continue
+             selected_kernel_size = select_common_block_size(
+                 kv_manager_block_size, group_backends
+             )
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -100,6 +100,7 @@
+ 
+ 
+ logger = init_logger(__name__)
++_DSV41_KV_SWA_FILL = os.environ.get("VLLM_DSV41_KV_SWA_FILL", "0") == "1"
+ 
+ # The hash seed for the first block of any prefix block sequence.
+ #
+@@ -2126,6 +2127,17 @@
+             num_groups = max(
+                 num_groups, cdiv(len(spec.kv_cache_specs), states_per_block)
+             )
++        elif (
++            _DSV41_KV_SWA_FILL
++            and anchor_bytes
++            and isinstance(spec.first_spec, SlidingWindowSpec)
++            and len(page_size_layers) == 1
++        ):
++            # patch 0057 (VLLM_DSV41_KV_SWA_FILL=1): fill each sliding-window group up to the block stride the
++            # widest group already needs. Fewer groups shrink the per-request admission reserve (window +
++            # in-flight tokens per group) without widening the block.
++            per_group = max(anchor_bytes // spec.first_spec.page_size_bytes, 1)
++            num_groups = min(num_groups, cdiv(len(spec.kv_cache_specs), per_group))
+         if num_groups == 1:
+             groups.append(KVCacheGroupSpec(list(spec.kv_cache_specs), spec))
+             continue

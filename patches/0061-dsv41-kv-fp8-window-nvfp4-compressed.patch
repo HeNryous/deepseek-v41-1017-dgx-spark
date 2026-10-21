@@ -1,0 +1,261 @@
+dsv41 patch 0061 (20.10.2026): FP8 sliding window + NVFP4 compressed KV, two FlashInfer calls merged by their LSE. In the
+image, off: rejected (KV-KLD and decode speed, see below). Base: the v11 files (0060).
+Why: vLLM's own nvfp4_ds_mla format (SM100 only) keeps the fp8_ds_mla record for the sliding window and stores only the
+compressed KV as NVFP4 (DeepInfer: FP4 for the main KV), and 0059 lost most in the first positions. FlashInfer's SM120
+kernel reads its window and compressed pools in one format only.
+How: VLLM_DSV41_KV_NVFP4=2: the window pages stay FP8 (576 B alignment), compressed and indexer pages are NVFP4 / FP8 at
+512 B, the block stride aligned to lcm(576, 512) = 4,608 B. split_sparse_mla calls FlashInfer's
+_trtllm_batch_decode_sparse_mla_sm120 twice with return_lse (window FP8, compressed NVFP4, both without the attention
+sink) and merges in a Triton kernel: the LSE is base 2 (FlashInfer's docstring says natural log; with base e the merge
+is 9-16 % off in our unit test), the sink enters the merge's denominator, an empty compressed segment (LSE < -1e29) gets
+weight 0. Decode and prefill; our Triton verify off. GPU unit test: FP8 decode split + merge = one call within 0.25-0.29 %
+(relative L2); NVFP4 and FP8 prefill 1.8-4 % apart, because the kernel quantizes P for the P*V MMA relative to each call's
+own maximum (decode_dsv4_nvfp4_kernel.cuh), so two calls round differently from one.
+Measured (21.10.2026, GB10, 2000 MHz, image v12 with 0060, one window against FP8 with 0057): KV pool 1,837,489 tokens
+(0060 alone: 1,531,258), 1,522 B per token live, needles at 250K 6/6, cost per verify round -0.7 % (geometric mean), but
+tok/s -2.8 %: fewer drafts accepted (tokens per round -3.9 %, JSON at T=0 -22.5 %); KV-KLD KL 0.0146 / top-1 96.56 %
+against FP8 records (run-to-run floor of the measurement KL ~0.008 / top-1 ~97.5 %), first 127 positions KL 0.106
+prose / 0.044 code. Not adopted.
+Switch: VLLM_DSV41_KV_NVFP4=2 (default 0 = off; 1 = 0059).
+--- a/vllm/models/deepseek_v41/attention.py
++++ b/vllm/models/deepseek_v41/attention.py
+@@ -81,7 +81,9 @@
+     paired_kernel_spec,
+ )
+ from vllm.models.deepseek_v41.common.ops.nvfp4_fi_cache import (  # patch 0059
++    FP8_SWA_PAGE_ALIGNMENT,
+     KV_NVFP4 as _DSV41_KV_NVFP4,
++    KV_NVFP4_SWA as _DSV41_KV_NVFP4_SWA,
+     NVFP4_RECORD_BYTES,
+     nvfp4_append,
+     nvfp4_rope_insert,
+@@ -561,6 +563,11 @@
+         self.kv_mxfp8 = _use_v41_mxfp8_kv_record()
+         # patch 0059: FlashInfer's 384-byte NVFP4 record for the sliding-window and compressed caches on SM12x
+         self.kv_nvfp4 = (
++            _DSV41_KV_NVFP4_SWA and not self.kv_mxfp8 and self.kv_cache_dtype == "fp8_ds_mla"
++        )
++        # patch 0061 (VLLM_DSV41_KV_NVFP4=2): only the compressed cache in the NVFP4 record, the sliding window stays
++        # fp8_ds_mla; attention runs the two as separate FlashInfer calls merged by LSE (nvfp4_fi_cache.split_sparse_mla)
++        self.kv_nvfp4_comp = (
+             _DSV41_KV_NVFP4 and not self.kv_mxfp8 and self.kv_cache_dtype == "fp8_ds_mla"
+         )
+         self.swa_bytes_per_token = (
+@@ -569,13 +576,23 @@
+         # nvfp4_ds_mla keeps the MXFP8 sliding-window record and stores the
+         # compressed cache as NVFP4 (256 B of e2m1 pairs + 32 e4m3 scales).
+         self.compressed_bytes_per_token = (
+-            288 if self.kv_cache_dtype == "nvfp4_ds_mla" else self.swa_bytes_per_token
++            288
++            if self.kv_cache_dtype == "nvfp4_ds_mla"
++            else (NVFP4_RECORD_BYTES if self.kv_nvfp4_comp else self.swa_bytes_per_token)
+         )
+         # One alignment for every page in the block: the block stride is their
+         # sum, and 512 satisfies both TMA strides in play (512 for the V4.1
+         # fp8 record, 256 for NVFP4).
+         self.kv_page_alignment = 512 if (self.kv_mxfp8 or self.kv_nvfp4) else 576
+-        if self.kv_nvfp4:
++        # patch 0061: mixed records - the window's FP8 pages keep 576 B alignment, the compressed (and indexer) pages
++        # take 512 B, and the block stride becomes a multiple of both (every block start stays aligned for both)
++        self.kv_comp_page_alignment = 512 if self.kv_nvfp4_comp else self.kv_page_alignment
++        self.kv_block_stride_alignment = (
++            math.lcm(FP8_SWA_PAGE_ALIGNMENT, 512)
++            if self.kv_nvfp4_comp and not self.kv_nvfp4
++            else None
++        )
++        if self.kv_nvfp4_comp:
+             _nvfp4_prebuild()
+         if self.kv_cache_dtype == "nvfp4_ds_mla" and not self.kv_mxfp8:
+             raise ValueError(
+@@ -1293,7 +1310,7 @@
+             dtype=torch.uint8 if uses_fp8_ds_mla_layout else self.kv_cache_torch_dtype,
+             tokens_per_state=self.compress_ratio,
+             cache_dtype_str=self.kv_cache_dtype,
+-            alignment=self.kv_page_alignment if uses_fp8_ds_mla_layout else 512,
++            alignment=self.kv_comp_page_alignment if uses_fp8_ds_mla_layout else 512,  # patch 0061
+             model_version="deepseek_v4",
+             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+             # Packed record width; head_size stays semantic (512).
+@@ -1302,6 +1319,8 @@
+             ),
+             # patch 0057: kernels and views keep 64-state pages
+             storage_block_size=spec_block_size // _DSV41_KV_PAGES if pair else None,
++            # patch 0061: block stride a multiple of the FP8 window's and the NVFP4 pages' alignment
++            block_stride_alignment=self.kv_block_stride_alignment,
+         ))
+ 
+     def _compressed_kv_cache(self) -> torch.Tensor:
+@@ -1407,6 +1426,9 @@
+             block_stride_alignment=(
+                 math.lcm(512, page_alignment)
+                 if self.sparse_logits and not self.rocm_mxfp4
++                # patch 0061: same stride alignment as the compressed page it shares blocks with
++                else math.lcm(FP8_SWA_PAGE_ALIGNMENT, 512)
++                if _DSV41_KV_NVFP4 and not _DSV41_KV_NVFP4_SWA and uses_fp8_ds_mla_layout
+                 else None
+             ),
+         ))
+--- a/vllm/models/deepseek_v41/common/ops/nvfp4_fi_cache.py
++++ b/vllm/models/deepseek_v41/common/ops/nvfp4_fi_cache.py
+@@ -15,8 +15,15 @@
+ 
+ from vllm.triton_utils import tl, triton
+ 
+-KV_NVFP4 = os.environ.get("VLLM_DSV41_KV_NVFP4", "0") == "1"
++# patch 0061: VLLM_DSV41_KV_NVFP4=2 keeps the sliding-window cache in the fp8_ds_mla record (584 B) and stores only the
++# compressed cache as NVFP4, the split DeepSeek's own FP4 KV format and vLLM's nvfp4_ds_mla (SM100) use. Mode 1 (patch
++# 0059) quantizes both; window F5 (20.10.2026) measured KL 0.028 against FP8 for it, 0.15 in the first 128 positions,
++# where only the window is read.
++_MODE = os.environ.get("VLLM_DSV41_KV_NVFP4", "0")
++KV_NVFP4 = _MODE in ("1", "2")  # compressed cache NVFP4
++KV_NVFP4_SWA = _MODE == "1"  # sliding-window cache NVFP4 too
+ NVFP4_RECORD_BYTES = 384
++FP8_SWA_PAGE_ALIGNMENT = 576  # fp8_ds_mla pages: rows of 576 data bytes (448 FP8 + 64 BF16), the SM120 kernels' stride
+ 
+ 
+ @triton.jit
+@@ -102,3 +109,87 @@
+         return
+     assert rows.shape[0] >= m and rows.shape[-1] == 512 and rows.dtype == torch.bfloat16
+     nvfp4_quantize_append_sparse_mla_cache(rows[:m].contiguous(), slot_mapping.contiguous(), cache)
++
++
++@triton.jit
++def _lse_merge_kernel(o1, l1, o2, l2, sink, out, H: tl.constexpr, D: tl.constexpr, HAS_SINK: tl.constexpr):
++    # out = (2^l1 o1 + 2^l2 o2) / (2^l1 + 2^l2 + e^sink) per (row, head). FlashInfer's SM120 sparse-MLA kernels return
++    # the LSE of the scaled scores in base 2 (unit test: split + merge matches one call to 0.25 % with base 2, 9-13 %
++    # off with base e). Both calls run WITHOUT the attention sink and the sink is added here: how the kernels fold it
++    # into their LSE differs between FP8/NVFP4 and decode/prefill (2-4 % off when one call took it). The sink logit is
++    # in natural units like the scores (FlashMLA V4: lse' = log(exp(lse) + exp(sink))). An empty segment (no
++    # compressed entries yet, LSE ~ -1e30) has weight 0, whatever its output holds.
++    t = tl.program_id(0)
++    h = tl.program_id(1)
++    a = tl.load(l1 + t * H + h)
++    b = tl.load(l2 + t * H + h)
++    LOG2E: tl.constexpr = 1.4426950408889634
++    m = tl.maximum(a, b)
++    if HAS_SINK:
++        s2 = tl.load(sink + h).to(tl.float32) * LOG2E
++        m = tl.maximum(m, s2)
++    m = tl.where(m < -1e29, 0.0, m)
++    wa = tl.where(a < -1e29, 0.0, tl.exp2(a - m))
++    wb = tl.where(b < -1e29, 0.0, tl.exp2(b - m))
++    den = wa + wb
++    if HAS_SINK:
++        den += tl.exp2(s2 - m)
++    d = tl.arange(0, D)
++    base = (t * H + h).to(tl.int64) * D
++    x = tl.load(o1 + base + d).to(tl.float32)
++    y = tl.load(o2 + base + d).to(tl.float32)
++    x = tl.where(wa > 0, x, 0.0)
++    y = tl.where(wb > 0, y, 0.0)
++    r = tl.where(den > 0, (x * wa + y * wb) / tl.where(den > 0, den, 1.0), 0.0)
++    tl.store(out + base + d, r.to(tl.bfloat16))
++
++
++def _pad_nvfp4_primary(indices: torch.Tensor) -> torch.Tensor:
++    width = indices.shape[-1]
++    if width in (128, 512):
++        return indices
++    target = 128 if width < 128 else 512
++    assert width <= 512, f"index width {width} > 512 has no NVFP4 kernel"
++    return torch.nn.functional.pad(indices, (0, target - width), value=-1)
++
++
++def split_sparse_mla(
++    q: torch.Tensor,
++    swa_cache: torch.Tensor,
++    swa_indices: torch.Tensor,
++    swa_lens: torch.Tensor,
++    comp_cache: torch.Tensor,
++    comp_indices: torch.Tensor,
++    comp_lens: torch.Tensor,
++    out: torch.Tensor,
++    scale: float,
++    sinks: torch.Tensor | None,
++    workspace: torch.Tensor,
++) -> None:
++    """patch 0061: sparse MLA over an FP8 sliding window and an NVFP4 compressed segment. FlashInfer's SM120 kernels
++    read both pools of one call in one format, so the window runs as one call (fp8) and the compressed segment as
++    another (nvfp4), both without the sink and with their LSE, merged by log-sum-exp (sink included) into ``out``.
++    ``q``/``out``: [tokens, heads, 512] BF16; caches in the NHD view of _as_sparse_cache; indices [tokens, 1, width]."""
++    from flashinfer.mla._core import _SparseMLASegment, _trtllm_batch_decode_sparse_mla_sm120
++
++    t, h, d = q.shape
++    if t == 0:
++        return
++    q4 = q.unsqueeze(1)
++    lse_w = torch.empty((t, h), dtype=torch.float32, device=q.device)
++    _trtllm_batch_decode_sparse_mla_sm120(
++        query=q4, kv_cache=swa_cache, workspace_buffer=workspace,
++        sparse_mla_segments=[_SparseMLASegment(indices=swa_indices, lengths=swa_lens)],
++        out=out.view(t, 1, h, d), sm_scale=scale, sinks=None, lse=lse_w, return_lse=True,
++        kv_scale_format="auto", kv_cache_format="fp8",
++    )
++    o_c = torch.empty((t, 1, h, d), dtype=torch.bfloat16, device=q.device)
++    lse_c = torch.empty((t, h), dtype=torch.float32, device=q.device)
++    _trtllm_batch_decode_sparse_mla_sm120(
++        query=q4, kv_cache=comp_cache, workspace_buffer=workspace,
++        sparse_mla_segments=[_SparseMLASegment(indices=_pad_nvfp4_primary(comp_indices), lengths=comp_lens)],
++        out=o_c, sm_scale=scale, sinks=None, lse=lse_c, return_lse=True,
++        kv_scale_format="auto", kv_cache_format="nvfp4",
++    )
++    sink = sinks if sinks is not None else lse_w  # placeholder pointer when there is no sink
++    _lse_merge_kernel[(t, h)](out, lse_w, o_c, lse_c, sink, out, H=h, D=d, HAS_SINK=sinks is not None, num_warps=4)
+--- a/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py
++++ b/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py
+@@ -29,6 +29,7 @@
+ from vllm.platforms import current_platform
+ from vllm.platforms.interface import DeviceCapability
+ from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
++from vllm.models.deepseek_v41.common.ops.nvfp4_fi_cache import split_sparse_mla  # patch 0061
+ from vllm.v1.attention.backend import (
+     AttentionCGSupport,
+     CommonAttentionMetadata,
+@@ -887,7 +888,7 @@
+             raise RuntimeError(
+                 "Compressed sparse MLA decode requires compressed sparse indices."
+             )
+-        if _TRITON_VERIFY and not self.kv_nvfp4:
++        if _TRITON_VERIFY and not self.kv_nvfp4_comp:
+             # decode-form calls (DSpark verify rows of the target, the drafter's rows): FlashInfer's planner sends the
+             # verify calls to prefill_mg_dual by its crossover; ours reads the same pages, indices, lengths and sink.
+             # Dead verify rows (vLLM's is_padding, patch 0010; only the target's forward sets it) skip their attention.
+@@ -912,6 +913,13 @@
+                 pad_off=0,
+             )
+             return
++        if self.kv_nvfp4_comp and not self.kv_nvfp4 and extra_cache is not None:
++            # patch 0061: FP8 sliding window + NVFP4 compressed segment, two FlashInfer calls merged by LSE
++            split_sparse_mla(
++                q, swa_cache, swa_indices, swa_lens, extra_cache, extra_sparse_indices, extra_sparse_lengths,
++                output, self.scale, self.attn_sink, self._get_workspace(q.device),
++            )
++            return
+         if self.kv_nvfp4:
+             swa_indices = _nvfp4_pad_primary_indices(swa_indices)
+         flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+@@ -1031,7 +1039,7 @@
+                 raise RuntimeError(
+                     "Compressed sparse MLA prefill requires compressed sparse indices."
+                 )
+-            if _TRITON_VERIFY and not self.kv_nvfp4:
++            if _TRITON_VERIFY and not self.kv_nvfp4_comp:
+                 # host-side lengths (capture-safe): every request of the chunk a short query
+                 lens_cpu = query_start_loc_cpu[
+                     num_decodes + chunk_start : num_decodes + chunk_end + 1
+@@ -1060,6 +1068,14 @@
+                         pad_off=num_decode_tokens + int(query_start),
+                     )
+                     continue
++            if self.kv_nvfp4_comp and not self.kv_nvfp4 and extra_kv_paged is not None:
++                # patch 0061: FP8 sliding window + NVFP4 compressed segment, two FlashInfer calls merged by LSE
++                split_sparse_mla(
++                    q_chunk, swa_kv_paged, swa_indices_chunk, swa_lens_chunk, extra_kv_paged,
++                    extra_sparse_indices_chunk, extra_sparse_lengths_chunk, output[query_start:query_end],
++                    self.scale, self.attn_sink, self._get_workspace(q.device),
++                )
++                continue
+             if self.kv_nvfp4:
+                 swa_indices_chunk = _nvfp4_pad_primary_indices(swa_indices_chunk)
+             flashinfer_trtllm_batch_decode_sparse_mla_dsv4(

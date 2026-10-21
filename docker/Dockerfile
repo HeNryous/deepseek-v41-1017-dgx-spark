@@ -6,9 +6,12 @@
 #   0045 decode all-gathers over the RDMA ring · 0046 row limit for the LM head on exl3_mrow · 0047 adaptive verify window
 #   0048 mHC boundary in one launch · 0049 router prefetch build flags · 0050 mHC overlap up to 24 rows
 #   0022 Triton verify attention (from the recipe's patches/experimental/, unchanged)
+#   0051 indexer weights GEMV deferred · 0053/0054 display reservation as memory · 0055 hybrid drafting
+#   0056 CRC for the file-system KV offload tier · 0057 paired KV pages · 0058 offload next to expandable_segments
+#   0059 NVFP4 KV records · 0060 three KV pages per block · 0061 FP8 window + NVFP4 compressed KV
 # New switches are off by default (0040 is configuration only, see serve/serve_example.sh). exl3_mrow, exl3_rdma,
 # exl3_mhc and exl3_router have new sources: build the plugin's JIT kernels before the first start (README, step 4).
-# The published image ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v5 (= :latest) is exactly this.
+# The published image ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v12 (= :latest) has exactly these files.
 ARG BASE=dsv41-serve:v4
 FROM ${BASE}
 LABEL org.opencontainers.image.source="https://github.com/HeNryous/deepseek-v41-1017-dgx-spark" \

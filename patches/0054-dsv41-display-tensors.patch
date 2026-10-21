@@ -1,0 +1,24 @@
+dsv41 patch 0054 (20.10.2026): token embedding and DSpark Markov cache in the display reservation.
+Base: vllm/v1/worker/gpu/model_runner.py of image v5; uses vllm_exl3_moe/display_kv.py from patch 0053.
+Why: rarely and contiguously read tensors could live in the 1,792 MiB display region and leave ordinary memory to the KV
+pool. How: after target model and drafter are loaded, move_to_display copies the token embedding (631 MiB per rank) and
+the Markov cache (505 MiB) into the display buffer with a kernel copy (bit-identical, checked) and points them there.
+Measured (20.10.2026, GB10, 2000 MHz, image v6): KV 3.75 -> 4.75 GiB per rank (989,460 -> 1,253,309 tokens, without
+0057), T=0 identical 8/8, but decode -1.7 % (geometric mean), 64K code -6.7 %, 3-4 streams -3...-4 %. Not adopted.
+Switch: VLLM_DSV41_DISPLAY_TENSORS=1 (default off).
+
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -410,6 +410,12 @@
+                         self.speculator, self.speculative_config, load_dummy_weights
+                     )
+         time_after_load = time.perf_counter()
++        # patch 0054 (VLLM_DSV41_DISPLAY_TENSORS=1, default off): token embedding + DSpark Markov cache into the GB10
++        # display reservation (vllm_exl3_moe/display_kv.py); the freed ordinary memory is for the KV pool.
++        if __import__("os").environ.get("VLLM_DSV41_DISPLAY_TENSORS") == "1":
++            from vllm_exl3_moe.display_kv import move_to_display
++
++            move_to_display(self.model, getattr(self.speculator, "model", None), self.device)
+ 
+         self.model_memory_usage = m.consumed_memory
+         logger.info(

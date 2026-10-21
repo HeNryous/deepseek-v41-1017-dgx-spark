@@ -1,0 +1,386 @@
+dsv41 patch 0059 (20.10.2026): NVFP4 KV records on GB10. In the image, off: rejected at the KV-KLD gate (see below).
+Base: the v7 files (0057). 0061 is the mixed variant (FP8 sliding window, NVFP4 only for the compressed KV).
+Why: the KV is DeepSeek's fp8_ds_mla record (448 FP8 NoPE dims + 64 BF16 RoPE dims + UE8M0 scales = 584 B per state).
+DeepSeek's DeepInfer release (Apache-2.0, SM100/Ascend only) uses FP4 (288 B) for the main KV. FlashInfer in the image
+already has SM120 sparse-MLA kernels for a 384 B NVFP4 record (448 NoPE values as e2m1 with an e4m3 scale per 16, 64 RoPE
+values BF16; page = 64 x 352 B data + 64 x 32 B scales), but vLLM never used it on GB10.
+How: VLLM_DSV41_KV_NVFP4=1 stores the sliding-window and the compressed caches in that record (384 B, pages aligned to
+512 B; the FP8 indexer pages are aligned to 512 B as well). Writing: RoPE in BF16 (a plain-row op for q + kv, a Triton
+RoPE for the compressor / context path), then FlashInfer's own nvfp4_quantize_append_sparse_mla_cache, so writer and
+reader match by construction; reading: kv_cache_format="nvfp4". The indexer stays FP8. DSpark's verify is non-causal,
+which makes the SWA index width cdiv(128 window + 5 drafts, 64) x 64 = 192; the NVFP4 kernels take 128 or 512 only, so
+the SWA indices are padded with -1 to 512 (entries beyond swa_topk_lens are never read). Our Triton verify kernel (0022)
+is switched off with NVFP4 records.
+Measured (20.10.2026, GB10, 2000 MHz, image v9, 3.75 GiB KV pool per node, one window against FP8 with 0057):
+KV pool 1,346,928 -> 2,013,868 tokens (+49.5 %; the offline harness with the real allocator code predicted 2,013,561),
+bytes per token live (250K-token prompt) 2,187 -> 1,574, cost per verify round -0.92 % (geometric mean), needles at 250K
+6/6, but KV-KLD (teacher-forced prompt logprobs, 44K positions, top-5) KL 0.0280 / top-1 95.0 % against FP8 records;
+first 127 positions KL 0.147 prose / 0.094 code, 128-4K 0.032 / 0.017, > 4K 0.029 / 0.015. The run-to-run floor of this
+measurement (two identical requests, FP8) is KL ~0.008 / top-1 ~97.5 % from position 128 on (bit-identical before), so
+the NVFP4 records add ~0.02, about as much as the whole weight quantization (KLD 0.0201 against the native weights).
+Not adopted.
+Switch: VLLM_DSV41_KV_NVFP4=1 (default 0 = off).
+--- a/vllm/models/deepseek_v41/attention.py
++++ b/vllm/models/deepseek_v41/attention.py
+@@ -80,6 +80,13 @@
+     get_kv_quant_mode,
+     paired_kernel_spec,
+ )
++from vllm.models.deepseek_v41.common.ops.nvfp4_fi_cache import (  # patch 0059
++    KV_NVFP4 as _DSV41_KV_NVFP4,
++    NVFP4_RECORD_BYTES,
++    nvfp4_append,
++    nvfp4_rope_insert,
++    prebuild as _nvfp4_prebuild,
++)
+ 
+ logger = init_logger(__name__)
+ 
+@@ -547,7 +554,13 @@
+             self.packed_kv_cache_dtype,
+         )
+         self.kv_mxfp8 = _use_v41_mxfp8_kv_record()
+-        self.swa_bytes_per_token = 528 if self.kv_mxfp8 else 584
++        # patch 0059: FlashInfer's 384-byte NVFP4 record for the sliding-window and compressed caches on SM12x
++        self.kv_nvfp4 = (
++            _DSV41_KV_NVFP4 and not self.kv_mxfp8 and self.kv_cache_dtype == "fp8_ds_mla"
++        )
++        self.swa_bytes_per_token = (
++            NVFP4_RECORD_BYTES if self.kv_nvfp4 else (528 if self.kv_mxfp8 else 584)
++        )
+         # nvfp4_ds_mla keeps the MXFP8 sliding-window record and stores the
+         # compressed cache as NVFP4 (256 B of e2m1 pairs + 32 e4m3 scales).
+         self.compressed_bytes_per_token = (
+@@ -556,7 +569,9 @@
+         # One alignment for every page in the block: the block stride is their
+         # sum, and 512 satisfies both TMA strides in play (512 for the V4.1
+         # fp8 record, 256 for NVFP4).
+-        self.kv_page_alignment = 512 if self.kv_mxfp8 else 576
++        self.kv_page_alignment = 512 if (self.kv_mxfp8 or self.kv_nvfp4) else 576
++        if self.kv_nvfp4:
++            _nvfp4_prebuild()
+         if self.kv_cache_dtype == "nvfp4_ds_mla" and not self.kv_mxfp8:
+             raise ValueError(
+                 "nvfp4_ds_mla needs the V4.1 KV records, which FlashMLA "
+@@ -745,18 +760,27 @@
+             # The KV half of _fused_qnorm_rope_kv_insert, bit for bit, without
+             # the unused query; same as dspark's _insert_context_kv.
+             cache = self.swa_cache_layer.kv_cache
+-            torch.ops._C.fused_deepseek_v4_kv_rope_insert(
+-                kv,
+-                cache,
+-                cast(Any, attn_metadata[self.swa_cache_layer.prefix]).slot_mapping,
+-                positions,
+-                self.rotary_emb.cos_sin_cache,
+-                self.swa_cache_layer.block_size,
+-                self._flashinfer_fp8_kv_scale
+-                if cache.dtype == torch.float8_e4m3fn
+-                else None,
+-                self.kv_mxfp8,
+-            )
++            if self.kv_nvfp4:
++                nvfp4_rope_insert(
++                    kv,
++                    positions,
++                    self.rotary_emb.cos_sin_cache,
++                    cache,
++                    cast(Any, attn_metadata[self.swa_cache_layer.prefix]).slot_mapping,
++                )
++            else:
++                torch.ops._C.fused_deepseek_v4_kv_rope_insert(
++                    kv,
++                    cache,
++                    cast(Any, attn_metadata[self.swa_cache_layer.prefix]).slot_mapping,
++                    positions,
++                    self.rotary_emb.cos_sin_cache,
++                    self.swa_cache_layer.block_size,
++                    self._flashinfer_fp8_kv_scale
++                    if cache.dtype == torch.float8_e4m3fn
++                    else None,
++                    self.kv_mxfp8,
++                )
+         if self.compressor is not None:
+             latent = self.compressor(kv_score, positions)
+             self.compressor.insert_cache(latent, positions, self.rotary_emb)
+@@ -1120,6 +1144,28 @@
+         cache_dtype = swa_kv_cache.dtype
+ 
+         # kv is unchanged; attention reads kv solely via swa_kv_cache.
++        if self.kv_nvfp4:
++            # patch 0059: Q RoPE in place and the roped KV rows into a BF16 scratch with the plain-row op (identity
++            # slots), then FlashInfer's NVFP4 quantize-append by the real slots. Q stays unpadded; the SM120
++            # attention pads it to the kernel's head count (_prepare_query).
++            assert not self.accepts_unnormed_unroped_query
++            n = kv.shape[0]
++            if n == 0:
++                return q
++            roped = torch.empty((1, n, self.head_dim), dtype=torch.bfloat16, device=kv.device)
++            torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
++                q,
++                kv,
++                roped,
++                torch.arange(n, dtype=torch.int64, device=kv.device),
++                positions,
++                cos_sin_cache,
++                self.eps,
++                n,
++                False,
++            )
++            nvfp4_append(roped.view(n, self.head_dim), swa_metadata.slot_mapping, swa_kv_cache)
++            return q
+         if cache_dtype == torch.uint8:
+             # fp8_ds_mla UE8M0 paged path. Horizontally fused:
+             #   Q side: GPT-J RoPE, zero-filling the padding head slots; the
+@@ -1305,7 +1351,11 @@
+             "nvfp4_ds_mla",
+         )
+         page_alignment = (
+-            576 if uses_fp8_ds_mla_layout and not _use_v41_mxfp8_kv_record() else 512
++            576
++            if uses_fp8_ds_mla_layout
++            and not _use_v41_mxfp8_kv_record()
++            and not _DSV41_KV_NVFP4
++            else 512
+         )
+         spec_block_size = self.cache_config.block_size * max(1, self.compress_ratio)
+         # patch 0057: ratio-1 indexer pages pair up like the compressed-KV page they share blocks with
+--- /dev/null
++++ b/vllm/models/deepseek_v41/common/ops/nvfp4_fi_cache.py
+@@ -0,0 +1,104 @@
++# SPDX-License-Identifier: Apache-2.0
++"""dsv41 patch 0059 (VLLM_DSV41_KV_NVFP4=1, default off): FlashInfer's 384-byte NVFP4 DSV4 cache record on SM12x.
++
++FlashInfer's SM120 sparse-MLA kernels read a group-16 NVFP4 record for the sliding-window and the compressed KV
++caches (``trtllm_batch_decode_sparse_mla_dsv4(kv_cache_format="nvfp4")``): 448 NoPE values as e2m1 pairs with one
++e4m3 scale per 16 values, the 64 RoPE values copied as BF16, 384 bytes per token instead of the 584 of fp8_ds_mla.
++Inside a page the data rows (352 B) come first and the scale rows (32 B) after them, so the layout is FlashInfer's
++own: rows are written with its ``nvfp4_quantize_append_sparse_mla_cache`` after GPT-J RoPE on dims 448..511 here,
++which keeps writer and reader bit-compatible by construction.
++"""
++
++import os
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++KV_NVFP4 = os.environ.get("VLLM_DSV41_KV_NVFP4", "0") == "1"
++NVFP4_RECORD_BYTES = 384
++
++
++@triton.jit
++def _rope_rows_kernel(
++    rows,
++    positions,
++    cos_sin,
++    out,
++    ROW_STRIDE: tl.constexpr,
++    COS_STRIDE: tl.constexpr,
++    COMPRESS_RATIO: tl.constexpr,
++):
++    # Same rotation as fused_compress_quant_cache.py's insert kernels: GPT-J pairs, NoPE pairs load (cos, sin) =
++    # (1, 0), the compressed state takes the position of its group's first token.
++    t = tl.program_id(0)
++    position = tl.load(positions + t)
++    d = tl.arange(0, 512)
++    x = tl.load(rows + t.to(tl.int64) * ROW_STRIDE + d).to(tl.float32)
++    even, odd = tl.split(tl.reshape(x, (256, 2)))
++    pair = tl.arange(0, 256) - 224
++    cs = cos_sin + (position // COMPRESS_RATIO * COMPRESS_RATIO) * COS_STRIDE
++    c = tl.load(cs + tl.maximum(pair, 0), pair >= 0, other=1.0).to(tl.float32)
++    s = tl.load(cs + 32 + tl.maximum(pair, 0), pair >= 0, other=0.0).to(tl.float32)
++    rotated = tl.interleave(even * c - odd * s, odd * c + even * s)
++    tl.store(out + t.to(tl.int64) * 512 + d, rotated.to(tl.bfloat16))
++
++
++_module = None
++
++
++def prebuild() -> None:
++    """Build/load FlashInfer's NVFP4 module before CUDA graphs are captured (the writer runs inside captured regions)."""
++    global _module
++    if _module is None:
++        from flashinfer.mla._sparse_mla_nvfp4_sm120 import get_sparse_mla_nvfp4_sm120_module
++
++        _module = get_sparse_mla_nvfp4_sm120_module()
++
++
++def nvfp4_rope_insert(
++    rows: torch.Tensor,
++    positions: torch.Tensor,
++    cos_sin_cache: torch.Tensor,
++    cache: torch.Tensor,
++    slot_mapping: torch.Tensor,
++    compress_ratio: int = 1,
++) -> None:
++    """GPT-J RoPE on the RoPE dims of BF16 latent rows, then FlashInfer's NVFP4 quantize-append by cache slot.
++
++    ``rows`` holds one 512-wide BF16 row per slot (KV already normalized); slots < 0 are padding. With
++    ``compress_ratio`` > 1 only rows ending a compress group are written, as in rope_quant_insert.
++    """
++    n = slot_mapping.numel()
++    if n == 0:
++        return
++    assert rows.dtype == torch.bfloat16 and rows.shape[-1] == 512 and rows.stride(-1) == 1
++    assert cache.dtype == torch.uint8 and cache.shape[-1] == NVFP4_RECORD_BYTES
++    roped = torch.empty((n, 512), dtype=torch.bfloat16, device=rows.device)
++    _rope_rows_kernel[(n,)](
++        rows,
++        positions,
++        cos_sin_cache,
++        roped,
++        ROW_STRIDE=rows.stride(0),
++        COS_STRIDE=cos_sin_cache.stride(0),
++        COMPRESS_RATIO=compress_ratio,
++        num_warps=4,
++    )
++    slots = slot_mapping
++    if compress_ratio > 1:
++        slots = torch.where(
++            (positions[:n] + 1) % compress_ratio == 0, slot_mapping, torch.full_like(slot_mapping, -1)
++        )
++    nvfp4_append(roped, slots, cache)
++
++
++def nvfp4_append(rows: torch.Tensor, slot_mapping: torch.Tensor, cache: torch.Tensor) -> None:
++    """FlashInfer's NVFP4 quantize-append of already-roped BF16 rows (one per slot; slots < 0 are skipped)."""
++    from flashinfer.mla._sparse_mla_nvfp4_sm120 import nvfp4_quantize_append_sparse_mla_cache
++
++    m = slot_mapping.numel()
++    if m == 0:
++        return
++    assert rows.shape[0] >= m and rows.shape[-1] == 512 and rows.dtype == torch.bfloat16
++    nvfp4_quantize_append_sparse_mla_cache(rows[:m].contiguous(), slot_mapping.contiguous(), cache)
+--- a/vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py
++++ b/vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py
+@@ -251,6 +251,12 @@
+     if num_tokens == 0:
+         return
+     launch_kwargs = {"launch_pdl": False} if current_platform.is_cuda() else {}
++    if kv_cache.dtype == torch.uint8 and kv_cache.shape[-1] == 384:
++        # patch 0059: FlashInfer's 384-byte NVFP4 record (SM12x), written by FlashInfer's own quantize-append
++        from vllm.models.deepseek_v41.common.ops.nvfp4_fi_cache import nvfp4_rope_insert
++
++        nvfp4_rope_insert(latent, positions, cos_sin_cache, kv_cache, slot_mapping, compress_ratio)
++        return
+     if kv_cache.dtype == torch.uint8:
+         kernel = {
+             584: _rope_quant_insert_kernel,
+--- a/vllm/models/deepseek_v41/nvidia/dspark.py
++++ b/vllm/models/deepseek_v41/nvidia/dspark.py
+@@ -267,6 +267,12 @@
+     # differ). block_size stays the layer's, so the op's size(1) check still
+     # cross-checks the two rather than restating the tensor.
+     cache = attn.swa_cache_layer.kv_cache
++    if getattr(attn, "kv_nvfp4", False):
++        # patch 0059: FlashInfer's NVFP4 record
++        from vllm.models.deepseek_v41.common.ops.nvfp4_fi_cache import nvfp4_rope_insert
++
++        nvfp4_rope_insert(kv, positions, attn.rotary_emb.cos_sin_cache, cache, slot_mapping)
++        return
+     torch.ops._C.fused_deepseek_v4_kv_rope_insert(
+         kv,
+         cache,
+--- a/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py
++++ b/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py
+@@ -73,6 +73,18 @@
+     return block_stride // token_stride
+ 
+ 
++def _nvfp4_pad_primary_indices(indices: torch.Tensor) -> torch.Tensor:
++    """patch 0059: FlashInfer's NVFP4 sparse-MLA kernels take a primary (sliding-window) top-k of 128 or 512 only; with
++    DSpark's non-causal verify the SWA index width is window + drafts rounded up to 64 (192 here). Pad the last dim
++    with -1 to the next supported width; entries past each token's ``swa_topk_lens`` are not read."""
++    width = indices.shape[-1]
++    if width in (128, 512):
++        return indices
++    target = 128 if width < 128 else 512
++    assert width <= 512, f"SWA index width {width} > 512 has no NVFP4 kernel"
++    return torch.nn.functional.pad(indices, (0, target - width), value=-1)
++
++
+ # Sparse MLA h_q counts accepted natively (flashinfer>=0.6.14, #3545).
+ _SPARSE_MLA_SUPPORTED_Q_HEADS = (8, 16, 32, 64, 128)
+ # VLLM_DSV41_FLAT_VERIFY=1: short queries (speculative verify rows, up to _FLAT_MAX_Q tokens a request, which V4.1's SWA
+@@ -875,7 +887,7 @@
+             raise RuntimeError(
+                 "Compressed sparse MLA decode requires compressed sparse indices."
+             )
+-        if _TRITON_VERIFY:
++        if _TRITON_VERIFY and not self.kv_nvfp4:
+             # decode-form calls (DSpark verify rows of the target, the drafter's rows): FlashInfer's planner sends the
+             # verify calls to prefill_mg_dual by its crossover; ours reads the same pages, indices, lengths and sink.
+             # Dead verify rows (vLLM's is_padding, patch 0010; only the target's forward sets it) skip their attention.
+@@ -900,6 +912,8 @@
+                 pad_off=0,
+             )
+             return
++        if self.kv_nvfp4:
++            swa_indices = _nvfp4_pad_primary_indices(swa_indices)
+         flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+             query=q,
+             swa_kv_cache=swa_cache,
+@@ -913,6 +927,8 @@
+             swa_topk_lens=swa_lens,
+             extra_sparse_indices=extra_sparse_indices,
+             extra_sparse_topk_lens=extra_sparse_lengths,
++            # patch 0059: FlashInfer's 384-byte NVFP4 record
++            **({"kv_cache_format": "nvfp4"} if self.kv_nvfp4 else {}),
+         )
+ 
+     def _forward_prefill(
+@@ -1015,7 +1031,7 @@
+                 raise RuntimeError(
+                     "Compressed sparse MLA prefill requires compressed sparse indices."
+                 )
+-            if _TRITON_VERIFY:
++            if _TRITON_VERIFY and not self.kv_nvfp4:
+                 # host-side lengths (capture-safe): every request of the chunk a short query
+                 lens_cpu = query_start_loc_cpu[
+                     num_decodes + chunk_start : num_decodes + chunk_end + 1
+@@ -1044,6 +1060,8 @@
+                         pad_off=num_decode_tokens + int(query_start),
+                     )
+                     continue
++            if self.kv_nvfp4:
++                swa_indices_chunk = _nvfp4_pad_primary_indices(swa_indices_chunk)
+             flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+                 query=q_chunk,
+                 swa_kv_cache=swa_kv_paged,
+@@ -1057,4 +1075,6 @@
+                 swa_topk_lens=swa_lens_chunk,
+                 extra_sparse_indices=extra_sparse_indices_chunk,
+                 extra_sparse_topk_lens=extra_sparse_lengths_chunk,
++                # patch 0059: FlashInfer's 384-byte NVFP4 record
++                **({"kv_cache_format": "nvfp4"} if self.kv_nvfp4 else {}),
+             )
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -2123,10 +2123,23 @@
+         # Cap a state group at the states a block already fits rather than let
+         # it widen the block.
+         if anchor_bytes and is_state_bucket(spec):
+-            states_per_block = max(anchor_bytes // spec.first_spec.page_size_bytes, 1)
+-            num_groups = max(
+-                num_groups, cdiv(len(spec.kv_cache_specs), states_per_block)
+-            )
++            if balanced and len(page_size_layers) > 1:
++                # patch 0059: a balanced state bucket with mixed page sizes (DeepSeek-V4.1's compressor rings,
++                # 32 KiB main + 8 KiB indexer each) repeats one page of every size; sizing the split from the
++                # first spec's page let the six rings (122,880 B) widen the block past the anchor once NVFP4
++                # shrank the KV pages. Fit whole repeats under the anchor instead.
++                per_repeat = sum(page_size_layers)
++                repeats = max(len(names) for names in page_size_layers.values())
++                num_groups = max(
++                    num_groups, cdiv(repeats, max(anchor_bytes // per_repeat, 1))
++                )
++            else:
++                states_per_block = max(
++                    anchor_bytes // spec.first_spec.page_size_bytes, 1
++                )
++                num_groups = max(
++                    num_groups, cdiv(len(spec.kv_cache_specs), states_per_block)
++                )
+         elif (
+             _DSV41_KV_SWA_FILL
+             and anchor_bytes

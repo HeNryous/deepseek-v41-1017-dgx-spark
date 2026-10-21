@@ -410,6 +410,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.speculator, self.speculative_config, load_dummy_weights
                     )
         time_after_load = time.perf_counter()
+        # patch 0054 (VLLM_DSV41_DISPLAY_TENSORS=1, default off): token embedding + DSpark Markov cache into the GB10
+        # display reservation (vllm_exl3_moe/display_kv.py); the freed ordinary memory is for the KV pool.
+        if __import__("os").environ.get("VLLM_DSV41_DISPLAY_TENSORS") == "1":
+            from vllm_exl3_moe.display_kv import move_to_display
+
+            move_to_display(self.model, getattr(self.speculator, "model", None), self.device)
 
         self.model_memory_usage = m.consumed_memory
         logger.info(

@@ -29,6 +29,7 @@ from vllm.models.deepseek_v41.sparse_mla import (
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
+from vllm.models.deepseek_v41.common.ops.nvfp4_fi_cache import split_sparse_mla  # patch 0061
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     CommonAttentionMetadata,
@@ -71,6 +72,18 @@ def _packed_block_span(pool: torch.Tensor) -> int:
             f"({token_stride}); this layout is not supported yet."
         )
     return block_stride // token_stride
+
+
+def _nvfp4_pad_primary_indices(indices: torch.Tensor) -> torch.Tensor:
+    """patch 0059: FlashInfer's NVFP4 sparse-MLA kernels take a primary (sliding-window) top-k of 128 or 512 only; with
+    DSpark's non-causal verify the SWA index width is window + drafts rounded up to 64 (192 here). Pad the last dim
+    with -1 to the next supported width; entries past each token's ``swa_topk_lens`` are not read."""
+    width = indices.shape[-1]
+    if width in (128, 512):
+        return indices
+    target = 128 if width < 128 else 512
+    assert width <= 512, f"SWA index width {width} > 512 has no NVFP4 kernel"
+    return torch.nn.functional.pad(indices, (0, target - width), value=-1)
 
 
 # Sparse MLA h_q counts accepted natively (flashinfer>=0.6.14, #3545).
@@ -875,7 +888,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             raise RuntimeError(
                 "Compressed sparse MLA decode requires compressed sparse indices."
             )
-        if _TRITON_VERIFY:
+        if _TRITON_VERIFY and not self.kv_nvfp4_comp:
             # decode-form calls (DSpark verify rows of the target, the drafter's rows): FlashInfer's planner sends the
             # verify calls to prefill_mg_dual by its crossover; ours reads the same pages, indices, lengths and sink.
             # Dead verify rows (vLLM's is_padding, patch 0010; only the target's forward sets it) skip their attention.
@@ -900,6 +913,15 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 pad_off=0,
             )
             return
+        if self.kv_nvfp4_comp and not self.kv_nvfp4 and extra_cache is not None:
+            # patch 0061: FP8 sliding window + NVFP4 compressed segment, two FlashInfer calls merged by LSE
+            split_sparse_mla(
+                q, swa_cache, swa_indices, swa_lens, extra_cache, extra_sparse_indices, extra_sparse_lengths,
+                output, self.scale, self.attn_sink, self._get_workspace(q.device),
+            )
+            return
+        if self.kv_nvfp4:
+            swa_indices = _nvfp4_pad_primary_indices(swa_indices)
         flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
             query=q,
             swa_kv_cache=swa_cache,
@@ -913,6 +935,8 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             swa_topk_lens=swa_lens,
             extra_sparse_indices=extra_sparse_indices,
             extra_sparse_topk_lens=extra_sparse_lengths,
+            # patch 0059: FlashInfer's 384-byte NVFP4 record
+            **({"kv_cache_format": "nvfp4"} if self.kv_nvfp4 else {}),
         )
 
     def _forward_prefill(
@@ -1015,7 +1039,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 raise RuntimeError(
                     "Compressed sparse MLA prefill requires compressed sparse indices."
                 )
-            if _TRITON_VERIFY:
+            if _TRITON_VERIFY and not self.kv_nvfp4_comp:
                 # host-side lengths (capture-safe): every request of the chunk a short query
                 lens_cpu = query_start_loc_cpu[
                     num_decodes + chunk_start : num_decodes + chunk_end + 1
@@ -1044,6 +1068,16 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                         pad_off=num_decode_tokens + int(query_start),
                     )
                     continue
+            if self.kv_nvfp4_comp and not self.kv_nvfp4 and extra_kv_paged is not None:
+                # patch 0061: FP8 sliding window + NVFP4 compressed segment, two FlashInfer calls merged by LSE
+                split_sparse_mla(
+                    q_chunk, swa_kv_paged, swa_indices_chunk, swa_lens_chunk, extra_kv_paged,
+                    extra_sparse_indices_chunk, extra_sparse_lengths_chunk, output[query_start:query_end],
+                    self.scale, self.attn_sink, self._get_workspace(q.device),
+                )
+                continue
+            if self.kv_nvfp4:
+                swa_indices_chunk = _nvfp4_pad_primary_indices(swa_indices_chunk)
             flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
                 query=q_chunk,
                 swa_kv_cache=swa_kv_paged,
@@ -1057,4 +1091,6 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 swa_topk_lens=swa_lens_chunk,
                 extra_sparse_indices=extra_sparse_indices_chunk,
                 extra_sparse_topk_lens=extra_sparse_lengths_chunk,
+                # patch 0059: FlashInfer's 384-byte NVFP4 record
+                **({"kv_cache_format": "nvfp4"} if self.kv_nvfp4 else {}),
             )
