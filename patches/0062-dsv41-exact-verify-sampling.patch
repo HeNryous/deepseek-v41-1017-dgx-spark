@@ -1,0 +1,452 @@
+dsv41 patch 0062 (21.10.2026): the DSpark verify step's sampling phase on the live rows only (variant 2b of an exact
+verify width per round). Off: expected 0.03-0.25 % per round, below what our A/B resolves; built (image v13), not
+measured, not in v19. Base: the v12 file vllm/v1/worker/gpu/model_runner.py; new file
+vllm/v1/worker/gpu/spec_decode/exact_verify.py.
+Why: with the per-round depth policy a verify window keeps its scheduled shape (k + 1 rows per request); rows past a
+request's depth ("dead rows") skip only the routed experts and are rejected as invalid drafts, so at 1 stream a dead
+row still costs ~0.2-0.25 ms (dense layers, attention). TensorFold sizes its rounds to the drafts it verifies. On 21.10.
+a re-measured round-cost table made the depth policy choose shallower rounds without saving time (tok/s -0.20 %; prose
+at T=0: ms per round -2.7 %, tokens per round -5.0 %). A forward of exact width does not fit this stack: the host would
+need the depth before it launches the target graph, but the DeepSeek-V4.1 attention metadata (indexer next_n,
+short-context twins, SWA and compressor builders) is planned on the host from the CPU query lengths; the V4.1 indexer
+accepts a device/host query-length mismatch only on sm90/sm100, not on GB10; re-planning after a sync would, by our
+estimate, cost more host time than the dead rows (in a profiled round of 19.10. the host spent 5.2 ms from the block
+tables to the last SWA metadata and 0.9-6.1 ms in the graph launch call); and another row count picks other kernels, so
+T=0 texts would change. The sampling phase runs eagerly after the target graph has been launched, and the depth was
+chosen before that graph in stream order: waiting for it on the host costs the GPU nothing.
+How (exact_verify.py, hooks in model_runner.py): prepare_inputs copies the depth policy's dead-row mask (one bool per
+logits row) to pinned host memory behind an event; sample() waits for it, builds the live layout (the stock path unless
+every request's dead rows are its tail), computes the logits of the live rows (head and all-gather on the live rows
+when the window runs the exl3_mrow head, else the head on the window and only the all-gather and the sampler on the
+live rows), runs the stock rejection sampler on them and recomputes num_rejected against the full window, so the
+drafter, the depth-policy statistics and the scheduler see what they see without the switch. Structured outputs,
+logprobs, sampling masks, watermarking, block / synthetic verification, batch-sharded sampling and PP / PCP keep the
+stock path. Same tokens by construction: greedy, the token after the last live row is that row's argmax in both paths
+(lowest index on ties); sampled, a resample of that row's target distribution keyed by the same (seed, position). No
+new CUDA graphs, no device memory. VLLM_DSV41_EXACT_VERIFY=count only counts: stock sampling and a "DSV41_EV" log line
+every VLLM_DSV41_EV_LOG steps with window / live / dead verify rows by request count.
+Tested offline (CPU): a Python port of the V2 rejection kernels, 3000 random cases with forced logit ties, greedy and
+sampled: tokens, num_sampled and num_rejected identical; two deliberate mutations (tie order, live-relative
+num_rejected) are caught; a module test against the stock sample() flow with stand-ins for head, all-gather and sampler.
+Not measured on GB10 (expected ~0.01-0.04 ms per dead row: head rows, a 129 KB all-gather per row, sampler passes).
+Switch: VLLM_DSV41_EXACT_VERIFY=1 (exact sampling phase) | count (statistics only) | 0 (default, off: the runner never
+creates the helper); VLLM_DSV41_EV_LOG=N (default VLLM_DSPARK_DEPTH_LOG, else 256 with count). Only with the depth
+policy, which decides the live rows.
+
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -159,6 +159,10 @@
+     DSparkDepthPolicy,
+     depth_policy_requested,
+ )
++from vllm.v1.worker.gpu.spec_decode.exact_verify import (
++    ExactVerify,
++    maybe_create_exact_verify,
++)
+ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+     set_eagle3_aux_hidden_state_layers,
+     verify_supports_aux_hidden_states_over_pp,
+@@ -313,6 +317,9 @@
+         )
+         self.adaptive_verification: AdaptiveVerificationManager | None = None
+         self.depth_policy: DSparkDepthPolicy | None = None
++        # dsv41 patch 0062 (VLLM_DSV41_EXACT_VERIFY, default off): the sampling phase on the
++        # live verify rows only (spec_decode/exact_verify.py); None without the switch
++        self.exact_verify: ExactVerify | None = None
+         self.prompt_lookup: PromptLookup | None = None
+         self.input_buffers = InputBuffers(
+             max_num_reqs=self.max_num_reqs,
+@@ -726,6 +733,10 @@
+                     ),
+                     depth_cap_by_reqs=depth_cap,
+                 )
++                # dsv41 patch 0062: only with the depth policy, which decides the live rows
++                self.exact_verify = maybe_create_exact_verify(
++                    self.max_num_reqs * self.decode_query_len, self.device
++                )
+                 # dsv41 patch 0043: prompt-lookup drafts need the confidence head (to
+                 # weigh them against DSpark's drafts) and greedy drafts (no cached
+                 # draft distribution); switched by the depth policy's "lookup" option.
+@@ -1535,6 +1546,7 @@
+         # experts (the router reads is_padding: top-k ids -1) and their drafts
+         # are rejected in sample().
+         depth_dead_rows = None
++        ev_seq = None
+         if (
+             self.depth_policy is not None
+             and num_draft_tokens_per_req is not None
+@@ -1544,6 +1556,10 @@
+                 expanded_idx_mapping, expanded_local_pos
+             )
+             is_padding[logits_indices.long()] = depth_dead_rows
++            if self.exact_verify is not None:
++                # dsv41 patch 0062: the mask to pinned host memory (read in sample(),
++                # behind an event that precedes this round's forward)
++                ev_seq = self.exact_verify.stage(depth_dead_rows)
+ 
+         fast_prefill = None
+         if self.fast_prefill is not None:
+@@ -1613,6 +1629,8 @@
+             ),
+         )
+         input_batch.depth_dead_rows = depth_dead_rows
++        if self.exact_verify is not None:
++            input_batch.dsv41_ev_seq = ev_seq
+         if self.pcp_manager is not None:
+             input_batch = self.pcp_manager.partition_batch(input_batch, batch_desc)
+         return input_batch
+@@ -1659,6 +1677,14 @@
+         input_batch: InputBatch,
+         grammar_output: GrammarOutput | None,
+     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
++        if self.exact_verify is not None:
++            # dsv41 patch 0062: logits, their all-gather and the rejection sampler on the
++            # live rows only (None: the stock path below)
++            exact = self.exact_verify.sample(
++                self, hidden_states, input_batch, grammar_output
++            )
++            if exact is not None:
++                return exact
+         shard_metadata = None
+         global_input_batch = input_batch
+         if self.batch_sharder is not None:
+--- /dev/null
++++ b/vllm/v1/worker/gpu/spec_decode/exact_verify.py
+@@ -0,0 +1,337 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""dsv41 patch 0062: the DSpark verify step's sampling phase on the live rows only.
++
++With the per-round depth policy (depth_policy.py) a verify window keeps its shape: rows past a request's depth ("dead
++rows") run through the target forward without routed experts and are rejected as invalid drafts in sample(). The
++forward has to keep that shape, because its CUDA graph and the DeepSeek-V4.1 attention metadata are chosen and planned
++on the host before the depth exists on the GPU. The sampling phase is different: it runs eagerly after the target graph
++of the round has been launched. The host is then about one round ahead of the GPU, and the round's depth was chosen at
++the end of the previous round, before that graph in stream order. Waiting for it on the host leaves the GPU nothing to
++wait for, so the logits, their all-gather and the rejection sampler can take exactly the live rows.
++
++VLLM_DSV41_EXACT_VERIFY=1:
++* prepare_inputs copies the dead-row mask (one bool per logits row) to pinned host memory behind an event (stage());
++* sample() waits for that event, builds the live layout (each request's rows up to its depth), computes the logits of
++  the live rows only, gathers them over the TP group, runs the stock rejection sampler on them and reports
++  num_rejected against the full window as the stock path does, so post-processing, the drafter, the depth-policy
++  statistics and the scheduler see what they see without the switch.
++
++Same tokens as the stock path, by construction:
++* every kernel of the sampling phase computes a row from that row's inputs only. The head keeps its kernel choice:
++  the live rows take the head alone only when the window runs the exl3_mrow head (16-row MMA tiles, every row from its
++  own input, the same bits for 1..16 rows); otherwise the head runs on the full window as before and only the
++  all-gather and the sampler take the live rows.
++* greedy: a request that accepts every live draft takes its next token from the last live row. The stock path rejects
++  the first dead row's (invalid) draft at that same row and stores the row's argmax: the same vocabulary argmax, the
++  lowest index on ties in both kernels (_compute_global_target_argmax / _resample_kernel at temperature 0).
++* sampled: the token after the last live row is a plain resample of that row's target distribution in both paths
++  (invalid rejected draft vs. bonus token), keyed by the same (seed, position); the acceptance draws are keyed by
++  (seed, position) as well. Top-k / top-p see fewer rows, so their row-split count can change (rounding of the cutoff
++  only, same distribution).
++* everything else takes the stock path: structured outputs (grammar bitmask rows), logprobs, sampling masks,
++  watermarking, block / synthetic verification, batch-sharded sampling, PP / PCP, masks that are not a tail per request.
++
++VLLM_DSV41_EXACT_VERIFY=count measures only: the same host copy and wait, the stock sampling path, and every
++VLLM_DSV41_EV_LOG steps (default: VLLM_DSPARK_DEPTH_LOG, else 256 in count mode) one "DSV41_EV" log line with the
++verify rows per step (window, live, dead, by request count). That count bounds what a forward of exact width could
++save.
++
++Off by default: without the switch the runner never creates this object and runs exactly as before.
++"""
++
++import os
++import sys
++from collections import Counter
++from dataclasses import replace
++from typing import Any
++
++import numpy as np
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++_MODES = {"": "off", "0": "off", "off": "off", "1": "exact", "exact": "exact", "count": "count"}
++
++
++def exact_verify_mode() -> str:
++    raw = (os.environ.get("VLLM_DSV41_EXACT_VERIFY") or "0").strip().lower()
++    mode = _MODES.get(raw)
++    if mode is None:
++        raise ValueError(f"VLLM_DSV41_EXACT_VERIFY={raw!r}: expected 0, 1 or count")
++    return mode
++
++
++def maybe_create_exact_verify(max_num_logits: int, device: torch.device) -> "ExactVerify | None":
++    """The helper for VLLM_DSV41_EXACT_VERIFY=1 / count, or None (off)."""
++    mode = exact_verify_mode()
++    if mode == "off":
++        return None
++    return ExactVerify(mode, max_num_logits, device)
++
++
++def live_layout(
++    cu_num_logits: np.ndarray, dead: np.ndarray
++) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
++    """(window rows per request, live rows per request, cu_num_logits of the live layout, window row of every live row),
++    or None when some request's dead rows are not the tail of its rows (the caller then keeps the stock path)."""
++    cu = np.asarray(cu_num_logits, dtype=np.int64)
++    if cu.ndim != 1 or cu.size < 2:
++        return None
++    window = np.diff(cu)
++    total = int(cu[-1])
++    dead = np.asarray(dead, dtype=bool)
++    if total <= 0 or int(cu[0]) != 0 or dead.shape != (total,) or (window <= 0).any():
++        return None
++    live = window - np.add.reduceat(dead.astype(np.int64), cu[:-1])
++    local = np.arange(total, dtype=np.int64) - np.repeat(cu[:-1], window)
++    if (live < 1).any() or not np.array_equal(local >= np.repeat(live, window), dead):
++        return None
++    cu_live = np.zeros(cu.size, dtype=np.int32)
++    cu_live[1:] = np.cumsum(live)
++    rows = np.flatnonzero(~dead).astype(np.int64)
++    return window.astype(np.int32), live.astype(np.int32), cu_live, rows
++
++
++def head_row_class(head: Any, rows: int, dtype: torch.dtype) -> str | None:
++    """'mrow' when the EXL3 lm_head computes `rows` rows with exl3_mrow (vllm_exl3_moe/head.py: VLLM_EXL3_HEAD_MROW=1,
++    rows <= EXL3_HEAD_MROW_MAX_ROWS, bf16 input), else None: an unknown kernel choice that may depend on the row count."""
++    qm = getattr(head, "quant_method", None)
++    if qm is None or type(qm).__name__ != "Exl3HeadMethod" or getattr(head, "_mrow", None) is None:
++        return None
++    cap = getattr(sys.modules.get(type(qm).__module__), "HEAD_MROW_MAX_ROWS", None)
++    if not isinstance(cap, int) or dtype != torch.bfloat16:
++        return None
++    return "mrow" if 0 < rows <= cap else None
++
++
++def live_logits(
++    model: Any,
++    hidden_states: torch.Tensor,
++    window_idx: torch.Tensor,
++    live_idx: torch.Tensor,
++    sel: torch.Tensor,
++    rows_window: int,
++) -> tuple[torch.Tensor, str]:
++    """Logits of the live rows ([live rows, vocab]) with the per-row bits of the stock path, and which path ran:
++    'live' (head + all-gather on the live rows), 'gather' (head on the window as before, all-gather of the live rows),
++    'window' (the stock compute_logits on the window, then the live rows)."""
++    lm = getattr(model, "language_model", None)
++    if lm is None:
++        lm = model
++    lp = getattr(lm, "logits_processor", None)
++    head = getattr(lm, "lm_head", None)
++    plain = (
++        lp is not None
++        and head is not None
++        and getattr(lp, "logits_as_input", True) is False
++        and getattr(lp, "soft_cap", 0.0) is None
++        and getattr(lp, "scale", 0.0) == 1.0
++        and callable(getattr(lp, "_apply_head", None))
++        and callable(getattr(lp, "_gather_logits", None))
++    )
++    if plain and head_row_class(head, rows_window, hidden_states.dtype) == "mrow":
++        # live rows <= window rows <= the head's mrow cap: the same exl3_mrow head for both row counts
++        return model.compute_logits(hidden_states[live_idx]), "live"
++    if plain:
++        # LogitsProcessor._get_logits with the all-gather moved behind the row selection
++        local = lp._apply_head(head, hidden_states[window_idx], None)[sel]
++        logits = lp._gather_logits(local) if getattr(head, "tp_size", 1) > 1 else local
++        return logits[..., : lp.org_vocab_size], "gather"
++    return model.compute_logits(hidden_states[window_idx])[sel], "window"
++
++
++class ExactVerify:
++    def __init__(self, mode: str, max_num_logits: int, device: torch.device):
++        self.mode = mode
++        self.capacity = int(max_num_logits)
++        self.device = device
++        self._host = self._alloc_host(self.capacity)
++        self._event = self._new_event()
++        self._seq = 0
++        self._staged_seq = -1
++        self._staged_rows = 0
++        log = (os.environ.get("VLLM_DSV41_EV_LOG") or os.environ.get("VLLM_DSPARK_DEPTH_LOG") or "").strip()
++        self.log_every = int(log) if log else (256 if mode == "count" else 0)
++        self._warned: set[str] = set()
++        self._reset_stats()
++        logger.info(
++            "DSpark exact verify (patch 0062): %s%s",
++            "sampling phase on the live verify rows only" if mode == "exact" else "counting verify rows only",
++            f", log every {self.log_every} steps" if self.log_every > 0 else "",
++        )
++
++    # Overridden by the offline tests (no CUDA there).
++    @staticmethod
++    def _alloc_host(n: int) -> torch.Tensor:
++        return torch.zeros(n, dtype=torch.bool, pin_memory=torch.cuda.is_available())
++
++    @staticmethod
++    def _new_event() -> Any:
++        return torch.cuda.Event(blocking=True)
++
++    @staticmethod
++    def _wait(event: Any) -> None:
++        try:
++            from vllm.utils.gpu_sync_debug import gpu_sync_allowed
++        except ImportError:  # pragma: no cover
++            event.synchronize()
++            return
++        with gpu_sync_allowed():
++            event.synchronize()
++
++    def stage(self, dead_rows: torch.Tensor) -> int | None:
++        """prepare_inputs, after the depth policy's dead-row mask: copy it to pinned host memory behind an event. The
++        event sits before the target graph in stream order, so sample() never waits for this round's forward."""
++        n = int(dead_rows.shape[0])
++        if n <= 0 or n > self.capacity:
++            return None
++        self._seq += 1
++        self._host[:n].copy_(dead_rows, non_blocking=True)
++        self._event.record()
++        self._staged_seq, self._staged_rows = self._seq, n
++        return self._seq
++
++    def _read(self, input_batch: Any):
++        seq = getattr(input_batch, "dsv41_ev_seq", None)
++        if seq is None or seq != self._staged_seq:
++            return None
++        cu = input_batch.cu_num_logits_np
++        if cu is None or len(cu) != input_batch.num_reqs + 1 or int(cu[-1]) != self._staged_rows:
++            self._stats["stock_layout"] += 1
++            return None
++        self._wait(self._event)
++        dead = self._host[: self._staged_rows].numpy().copy()
++        lay = live_layout(cu, dead)
++        if lay is None:
++            self._stats["stock_notail"] += 1
++            if "notail" not in self._warned:
++                self._warned.add("notail")
++                logger.warning("DSpark exact verify: dead rows that are not a request's tail; stock path")
++            return None
++        window, live = lay[0], lay[1]
++        w, l = int(window.sum()), int(live.sum())
++        n = input_batch.num_reqs
++        self._steps += 1
++        self._reqs += n
++        self._win += w
++        self._live += l
++        e = self._by_n.setdefault(n, [0, 0, 0])
++        e[0] += 1
++        e[1] += w
++        e[2] += l
++        return lay
++
++    def _ineligible(self, runner: Any, input_batch: Any, grammar_output: Any) -> str | None:
++        if grammar_output is not None:
++            return "grammar"
++        if input_batch.num_reqs <= 0 or input_batch.num_draft_tokens <= 0:
++            return "nodraft"
++        if (
++            getattr(runner, "batch_sharder", None) is not None
++            or getattr(runner, "pcp_manager", None) is not None
++            or getattr(runner, "use_pp", False)
++        ):
++            return "parallel"
++        rs = getattr(runner, "rejection_sampler", None)
++        sampler = getattr(runner, "sampler", None)
++        if rs is None or sampler is None or getattr(runner, "speculator", None) is None:
++            return "nosampler"
++        if getattr(rs, "use_block_verification", False) or getattr(rs, "synthetic_conditional_rates", None) is not None:
++            return "method"
++        if getattr(rs, "watermark_key", None) is not None:
++            return "watermark"
++        if getattr(sampler, "return_sampling_mask", False):
++            return "mask"
++        from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
++
++        if sampler.sampling_states.max_num_logprobs(input_batch.idx_mapping_np) != NO_LOGPROBS:
++            return "logprobs"
++        return None
++
++    def sample(
++        self, runner: Any, hidden_states: torch.Tensor, input_batch: Any, grammar_output: Any
++    ) -> tuple[Any, torch.Tensor, torch.Tensor] | None:
++        """GPUModelRunner.sample() on the live rows, or None for the stock path (count mode, no dead row, a case the
++        live layout does not cover)."""
++        lay = self._read(input_batch)
++        result = None
++        if lay is not None and self.mode == "exact" and int(lay[0].sum()) != int(lay[1].sum()):
++            why = self._ineligible(runner, input_batch, grammar_output)
++            if why is None:
++                result = self._sample_live(runner, hidden_states, input_batch, lay)
++                self._stats["live_path"] += 1
++            else:
++                self._stats["stock_" + why] += 1
++        self._maybe_log()
++        return result
++
++    def _sample_live(self, runner: Any, hidden_states: torch.Tensor, input_batch: Any, lay) -> tuple:
++        from vllm.utils.torch_utils import async_tensor_h2d
++        from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
++
++        window, live, cu_live, rows = lay
++        dev = input_batch.cu_num_logits.device
++        sel = async_tensor_h2d(rows, device=dev, dtype=torch.int64)
++        cu_live_gpu = async_tensor_h2d(cu_live, device=dev, dtype=input_batch.cu_num_logits.dtype)
++        live_idx = input_batch.logits_indices[sel]
++        live_batch = replace(
++            input_batch,
++            logits_indices=live_idx,
++            cu_num_logits=cu_live_gpu,
++            cu_num_logits_np=cu_live,
++            expanded_idx_mapping=input_batch.expanded_idx_mapping[sel],
++            expanded_local_pos=input_batch.expanded_local_pos[sel],
++            num_draft_tokens=int(live.sum()) - input_batch.num_reqs,
++            num_draft_tokens_per_req=(live - 1).astype(np.int32),
++        )
++        logits, path = live_logits(
++            runner.model, hidden_states, input_batch.logits_indices, live_idx, sel, int(window.sum())
++        )
++        self._stats["head_" + path] += 1
++        out = runner.rejection_sampler(logits, live_batch, runner.speculator.draft_logits, None)
++        # num_rejected against the full window (what post_update, the drafter and the stock path use); num_sampled is
++        # unchanged (the kernel only zeroes chunked-prefill rows, already zero)
++        num_sampled, num_rejected = get_num_sampled_and_rejected(
++            out.num_sampled,
++            input_batch.seq_lens,
++            input_batch.cu_num_logits,
++            input_batch.idx_mapping,
++            runner.req_states.prefill_len.gpu,
++        )
++        out.num_sampled = num_sampled
++        out.num_rejected = num_rejected
++        return out, num_sampled, num_rejected
++
++    def _reset_stats(self) -> None:
++        self._steps = 0
++        self._reqs = 0
++        self._win = 0
++        self._live = 0
++        self._by_n: dict[int, list[int]] = {}
++        self._stats: Counter[str] = Counter()
++
++    def _maybe_log(self) -> None:
++        if self.log_every <= 0 or self._steps < self.log_every:
++            return
++        s = self._steps
++        dead = self._win - self._live
++        by_n = " ".join(
++            f"n{n}={v[0]}:{v[1] / v[0]:.2f}:{v[2] / v[0]:.2f}" for n, v in sorted(self._by_n.items())
++        )
++        paths = " ".join(f"{k}={v}" for k, v in sorted(self._stats.items()))
++        logger.info(
++            "DSV41_EV mode=%s steps=%d reqs=%.2f window=%.2f live=%.2f dead=%.2f dead_pct=%.1f %s%s",
++            self.mode,
++            s,
++            self._reqs / s,
++            self._win / s,
++            self._live / s,
++            dead / s,
++            100.0 * dead / max(self._win, 1),
++            by_n,
++            f" {paths}" if paths else "",
++        )
++        self._reset_stats()

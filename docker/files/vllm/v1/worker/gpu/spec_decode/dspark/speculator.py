@@ -23,6 +23,7 @@ CUDA graphs (FULL, mirroring DFlash) cover the whole draft step: the parallel
 backbone forward AND the sequential Markov sampling.
 """
 
+import functools
 import os
 from typing import Any
 
@@ -34,11 +35,44 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.depth_policy import depth_policy_requested
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
 
 logger = init_logger(__name__)
+
+# dsv41 patch 0066 (21.10.2026), both off by default (unset: every line below is inert, the speculator runs as before):
+# VLLM_DSV41_MARKOV_FUSED=1: the greedy local-argmax Markov loop (VLLM_DSPARK_LOCAL_ARGMAX=1) in fused launches,
+#   bias -> chunk maxima -> one all-gather -> pick, instead of ~13 kernels a step (ops/markov_step.py). Same drafts.
+# VLLM_DSV41_MARKOV_TRIM=1 (or a comma list of step counts): the Markov loop only as deep as the next step verifies.
+#   The scheduler's next draft count (SchedulerOutput.num_spec_tokens_to_schedule: dynamic schedule + the 0047 window,
+#   2..5) reaches the speculator through gpu_worker.py; under async scheduling no request verifies more drafts than
+#   that next step. A FULL graph holds a fixed loop, so the DSpark graphs are captured once more for each shorter
+#   depth (1: VLLM_DSV41_AK_MIN .. k-1) and replayed by depth; the backbone, the head and the drafts of the steps that
+#   run are those of the full graph, the confidences past the depth are 0 (the depth policy cannot pick rows the
+#   window does not have). With the switch on, the 12 never-dispatched DSpark graphs of the 0047 widths (uniform 2-4
+#   tokens a request: the drafter always dispatches 5) are not captured, so the graph count stays the same.
+_DSV41_MK_FUSED = os.environ.get("VLLM_DSV41_MARKOV_FUSED", "0") == "1"
+_DSV41_MK_TRIM = os.environ.get("VLLM_DSV41_MARKOV_TRIM", "0").strip()
+
+
+def dsv41_trim_steps(spec: str, num_steps: int, ak_min: int) -> list[int]:
+    """Shorter Markov depths to capture for VLLM_DSV41_MARKOV_TRIM=spec: "1" = ak_min .. num_steps-1 (at least 1),
+    a comma list = those depths below num_steps, "" / "0" = none."""
+    spec = (spec or "").strip().lower()
+    if spec in ("", "0", "off"):
+        return []
+    if spec in ("1", "on"):
+        return list(range(max(1, ak_min), num_steps))
+    out = set()
+    for x in spec.split(","):
+        x = x.strip()
+        if x:
+            k = int(x)
+            if 1 <= k < num_steps:
+                out.add(k)
+    return sorted(out)
 
 
 # Patch 0055 (VLLM_DSV41_HYBRID_DRAFT=1, default off; needs draft_sample_method=probabilistic): only requests in the
@@ -116,6 +150,12 @@ class DSparkSpeculator(DFlashSpeculator):
         # patch 0055: per request state, True = draft by sampling (full-window regime), False = greedy
         self._hybrid = os.environ.get("VLLM_DSV41_HYBRID_DRAFT", "0") == "1"
         self._sampled_mode = torch.zeros(self.max_num_reqs, dtype=torch.bool, device=device)
+        # patch 0066: fused Markov loop (decided in load_draft_model), trimmed depths and their graph managers
+        self._mk_fused = False
+        self._trim_steps: list[int] = []
+        self._trim_attr: dict[int, str] = {}
+        self._next_drafts: int | None = None
+        self._draft_steps_now = self.num_speculative_steps
 
     def load_draft_model(
         self,
@@ -158,7 +198,104 @@ class DSparkSpeculator(DFlashSpeculator):
         )
         if self._local_argmax:
             logger.info("DSpark: greedy drafts argmax per vocabulary shard (local argmax)")
+        # patch 0066: both need the greedy local-argmax loop (no draft logits, no top-k candidates)
+        self._mk_fused = _DSV41_MK_FUSED and self._local_argmax
+        if _DSV41_MK_FUSED and not self._mk_fused:
+            logger.warning("DSpark: VLLM_DSV41_MARKOV_FUSED=1 ignored (needs the local-argmax greedy loop)")
+        self._trim_steps = []
+        if _DSV41_MK_TRIM not in ("", "0"):
+            steps = dsv41_trim_steps(
+                _DSV41_MK_TRIM,
+                self.num_speculative_steps,
+                int(os.environ.get("VLLM_DSV41_AK_MIN", "2")),
+            )
+            async_sched = getattr(self.vllm_config.scheduler_config, "async_scheduling", False)
+            if not self._local_argmax:
+                logger.warning("DSpark: VLLM_DSV41_MARKOV_TRIM ignored (needs the local-argmax greedy loop)")
+            elif async_sched is not True:
+                # the synchronous scheduler takes every returned draft, not num_spec_tokens_to_schedule
+                logger.warning("DSpark: VLLM_DSV41_MARKOV_TRIM ignored (needs async scheduling)")
+            else:
+                self._trim_steps = steps
+                logger.info(
+                    "DSpark: Markov loop trimmed to the next step's draft count (patch 0066), "
+                    "extra graphs for depths %s", steps,
+                )
+        if self._mk_fused:
+            logger.info("DSpark: fused Markov loop (patch 0066, VLLM_DSV41_MARKOV_FUSED=1)")
         return model
+
+    # --- dsv41 patch 0066: trimmed Markov loop ------------------------------------------------------------------
+
+    def dsv41_set_next_drafts(self, num_drafts: int) -> None:
+        """gpu_worker.py, before each step: the scheduler's draft count for the next step (VLLM_DSV41_MARKOV_TRIM)."""
+        self._next_drafts = int(num_drafts)
+
+    def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        super().init_cudagraph_manager(cudagraph_mode)
+        self._trim_attr = {}
+        mgr = self.query_cudagraph_manager
+        if not self._trim_steps or mgr is None or mgr.cudagraph_mode == CUDAGraphMode.NONE:
+            return
+        q = self.num_query_per_req
+
+        def dispatched_only(m: DFlashCudaGraphManager) -> None:
+            # the speculator always dispatches uniform_token_count = num_query_per_req (dflash propose)
+            for mode in list(m._capture_descs):
+                m._capture_descs[mode] = [
+                    d
+                    for d in m._capture_descs[mode]
+                    if d.cg_mode != CUDAGraphMode.FULL or d.uniform_token_count == q
+                ]
+
+        dispatched_only(mgr)
+        for k in self._trim_steps:
+            m = DFlashCudaGraphManager(
+                self.vllm_config, self.device, mgr.cudagraph_mode, decode_query_len=q
+            )
+            dispatched_only(m)
+            # a direct attribute, as query_cudagraph_manager: profile_cudagraph_memory finds and drops it
+            name = f"query_cudagraph_manager_s{k}"
+            setattr(self, name, m)
+            self._trim_attr[k] = name
+
+    def capture(self) -> None:
+        super().capture()
+        for k in sorted(self._trim_attr):
+            m = getattr(self, self._trim_attr[k], None)
+            if m is None:
+                continue
+            m.capture(
+                functools.partial(self._generate_draft, steps=k),
+                self.input_buffers,
+                self.block_tables,
+                self.attn_groups,
+                self.kv_cache_config,
+                self.max_model_len,
+                causal=self._group_causal,
+                precompute_context_kv=lambda num_reqs: self._precompute_context_kv(
+                    0, self._num_graph_context_tokens(num_reqs)
+                ),
+                progress_bar_desc=f"Capturing dspark CUDA graphs ({k} Markov steps)",
+            )
+
+    def _trim_manager(self, steps: int) -> tuple[int, DFlashCudaGraphManager] | None:
+        """The captured variant with the fewest Markov steps >= steps, or None (the full graph)."""
+        for k in sorted(self._trim_attr):
+            if k >= steps:
+                m = getattr(self, self._trim_attr[k], None)
+                if m is not None:
+                    return k, m
+        return None
+
+    def _replay_draft_graph(self, batch_desc) -> None:
+        steps = self._draft_steps_now
+        if steps < self.num_speculative_steps and self._trim_attr:
+            hit = self._trim_manager(steps)
+            if hit is not None and batch_desc in hit[1].graphs:
+                hit[1].run_fullgraph(batch_desc)
+                return
+        super()._replay_draft_graph(batch_desc)
 
     def _dsv41_cap(self, num_reqs: int) -> int:
         for lo, hi, k in self.speculative_config.num_speculative_tokens_per_batch_size or ():
@@ -167,6 +304,15 @@ class DSparkSpeculator(DFlashSpeculator):
         return self.num_speculative_steps
 
     def propose(self, input_batch, *args, **kwargs):
+        if self._trim_steps:
+            # patch 0066: this step's drafts serve the next step, which verifies at most the scheduler's count;
+            # dummy / profile runs and a missing count (never set) keep the full loop
+            nxt, self._next_drafts = self._next_drafts, None
+            n_spec = self.num_speculative_steps
+            if kwargs.get("dummy_run", False) or nxt is None:
+                self._draft_steps_now = n_spec
+            else:
+                self._draft_steps_now = max(1, min(nxt, n_spec))
         if self._hybrid and self.draft_logits is not None:
             # patch 0055: this step's window per request decides the next block's draft mode (0047 gives the full
             # window exactly to requests whose accepted-draft average is >= AK_HI, and to new ones)
@@ -239,13 +385,17 @@ class DSparkSpeculator(DFlashSpeculator):
         )
         return out
 
-    def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+    def _sample_sequential(
+        self, num_reqs: int, head_hidden: torch.Tensor, steps: int | None = None
+    ) -> None:
         if self._draft_topk is not None:
             self._sample_sequential_topk(num_reqs, head_hidden)
             return
 
         # Sequential Markov sampling over the backbone's output hidden states.
         n_spec = self.num_speculative_steps
+        # patch 0066: steps < n_spec only from a trimmed graph (local argmax); drafts past it are never verified
+        steps = n_spec if steps is None else steps
         num_sample = num_reqs * n_spec
         # Per-(req, position) head hidden, ordered (req, step).
         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
@@ -258,6 +408,20 @@ class DSparkSpeculator(DFlashSpeculator):
         vocab_size = base_logits.shape[-1]
         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
 
+        if self._mk_fused:
+            # patch 0066: the same drafts from fused launches; returns the Markov embeddings [n, n_spec, rank]
+            embeds = self.model.draft_loop_local_fused(
+                base_logits,
+                self.input_buffers.input_ids,
+                self._anchor_idx[:num_reqs],
+                self.draft_tokens,
+                steps,
+                self.max_num_reqs,
+            )
+            if self.use_confidence_head:
+                self._write_confidence(num_reqs, sample_hidden, embeds.flatten(0, 1), steps)
+            return
+
         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
         confidence_markov_embeds = []
@@ -266,7 +430,7 @@ class DSparkSpeculator(DFlashSpeculator):
         # read via the precomputed persistent index (fixed buffer for capture).
         prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
 
-        for i in range(n_spec):
+        for i in range(steps):
             # Sequential stage: Markov bias from the previously sampled token.
             markov_embed = self.model.markov_embed(prev)
             if self.use_confidence_head:
@@ -290,13 +454,31 @@ class DSparkSpeculator(DFlashSpeculator):
             prev = draft_sampled_i
 
         if self.use_confidence_head:
-            confidence = self.model.compute_confidence(
+            if steps < n_spec:
+                # patch 0066: the confidence head keeps its n_spec rows a request (same GEMM shape, so the rows
+                # that ran keep their bits); the padded rows are zeroed in _write_confidence
+                confidence_markov_embeds += [confidence_markov_embeds[-1]] * (n_spec - steps)
+            self._write_confidence(
+                num_reqs,
                 sample_hidden,
                 torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
+                steps,
             )
-            self.draft_token_confidence_probs[:num_reqs] = confidence.view(
-                num_reqs, n_spec
-            )
+
+    def _write_confidence(
+        self,
+        num_reqs: int,
+        sample_hidden: torch.Tensor,
+        markov_embeds: torch.Tensor,
+        steps: int,
+    ) -> None:
+        n_spec = self.num_speculative_steps
+        confidence = self.model.compute_confidence(sample_hidden, markov_embeds)
+        self.draft_token_confidence_probs[:num_reqs] = confidence.view(num_reqs, n_spec)
+        if steps < n_spec:
+            # patch 0066: positions past the next step's window have no draft: confidence 0, so the depth policy
+            # never prices them (survival 0 adds no expected token, a wider row costs more)
+            self.draft_token_confidence_probs[:num_reqs, steps:] = 0.0
 
     def _sample_sequential_topk(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
         """Apply the sequential Markov head only to top-k base-logit candidates.
@@ -355,9 +537,11 @@ class DSparkSpeculator(DFlashSpeculator):
         slot_mappings: dict[str, torch.Tensor] | None,
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        steps: int | None = None,
     ) -> None:
         # Full draft step (captured under CUDA graph): parallel backbone forward
         # then sequential Markov sampling over its hidden state outputs.
+        # patch 0066: steps = the Markov depth a trimmed graph is captured with (None: num_speculative_steps)
         head_hidden = self._run_model(
             num_tokens_padded,
             attn_metadata,
@@ -365,4 +549,4 @@ class DSparkSpeculator(DFlashSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
-        self._sample_sequential(num_reqs, head_hidden)
+        self._sample_sequential(num_reqs, head_hidden, steps)

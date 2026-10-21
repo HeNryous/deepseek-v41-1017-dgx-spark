@@ -70,6 +70,21 @@ logger = init_logger(__name__)
 # fp4 experts register ``.weight_scale``; block-fp8 experts ``.weight_scale_inv``.
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 
+# dsv41 patch 0066: the out-of-tree EXL3 plugin's drafter L2 prefetch chain (vllm_exl3_moe.l2pf_draft,
+# VLLM_DSV41_DRAFT_L2PF), None = plugin missing or the switch off (then the forward is unchanged)
+_l2pf_draft_mod = None
+
+
+def _l2pf_draft():
+    global _l2pf_draft_mod
+    if _l2pf_draft_mod is None:
+        try:
+            from vllm_exl3_moe import l2pf_draft as m
+        except ImportError:
+            m = None
+        _l2pf_draft_mod = m if (m is not None and m.enabled()) else False
+    return _l2pf_draft_mod or None
+
 
 class DSparkDeepseekV4Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -156,6 +171,9 @@ class DSparkDeepseekV4Model(nn.Module):
                 config.hidden_size + config.dspark_markov_rank,
                 prefix=maybe_prefix(prefix, "confidence_head"),
             )
+        # patch 0066: wo_a / mHC mix tensors registered with the drafter L2 chain on the first forward (all weight
+        # post-processing, e.g. Marlin repacking, is done by then)
+        self._l2pf_registered = False
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -229,6 +247,10 @@ class DSparkDeepseekV4Model(nn.Module):
         # Expand to hc_mult copies for hyper-connections ([T, H] -> [T, hc, H]).
         hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
+        l2pf_draft = _l2pf_draft()
+        if l2pf_draft is not None and not self._l2pf_registered:
+            l2pf_draft.register_drafter(self, self.num_hidden_layers)
+            self._l2pf_registered = True
         residual = post_mix = res_mix = pre_mix = None
         for layer in self.layers:
             hidden_states, residual, post_mix, res_mix, pre_mix, _ = layer(
@@ -241,6 +263,8 @@ class DSparkDeepseekV4Model(nn.Module):
                 residual,
                 mega_gate_metadata=mega_gate_metadata,
             )
+        if l2pf_draft is not None:
+            l2pf_draft.join()           # patch 0066: the drafter graph ends with no prefetch in flight
         hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
         # Collapse the hc copies with the pre-mix from the last layer's FFN
         # mixes — the mix the reference forward_head applies (hc_pre with the
@@ -322,6 +346,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         # (base logits + Markov bias) and all-gather only (value, index) per row, instead of
         # all-gathering the full draft logits and adding a full-vocab bias on every rank.
         self._markov_cache_local = None
+        # dsv41 patch 0066 (VLLM_DSV41_MARKOV_FUSED=1): the local-argmax loop in fused launches
+        # (ops/markov_step.py), buffers made on the first (eager) call
+        self._fused_loop = None
 
     # --- Hooks used by the speculator -------------------------------------
 
@@ -454,6 +481,49 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         gathered = tensor_model_parallel_all_gather(pair, dim=-1).view(-1, tp, 2)
         best = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
         return gathered[:, :, 1].gather(dim=-1, index=best).squeeze(-1).to(torch.int64)
+
+    def draft_loop_local_fused(
+        self,
+        base_local: torch.Tensor,
+        input_ids: torch.Tensor,
+        anchor_idx: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        steps: int,
+        max_rows: int,
+    ) -> torch.Tensor:
+        """dsv41 patch 0066: greedy drafts 0 .. steps-1 of every request, the tokens draft_argmax_local picks step by
+        step (same bias kernel, same bf16 sums, same tie order; ops/markov_step.py), written into draft_tokens.
+        base_local: [n, num_steps, shard] this rank's base logits. Returns the Markov embeddings [n, num_steps, rank]
+        (position i: the token before draft i), the confidence head's input; positions >= steps are stale."""
+        assert self._markov_cache_local is not None
+        if self._fused_loop is None:
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("fused Markov loop: first call inside a CUDA graph capture (buffers not made)")
+            from .ops.markov_step import FusedMarkovLoop
+
+            lo, hi = self._vocab_shard()
+            self._fused_loop = FusedMarkovLoop(
+                self._markov_cache_local,
+                self.model.markov_head.markov_w1.weight.data,
+                lo,
+                hi - lo,
+                self.lm_head.tp_size,
+                max_rows,
+                base_local.shape[1],
+                base_local.dtype,
+            )
+            logger.info(
+                "DSpark: fused Markov loop (patch 0066), vocabulary columns %d-%d, %d chunks a row",
+                lo, hi, self._fused_loop.chunks,
+            )
+        return self._fused_loop.run(
+            base_local,
+            input_ids,
+            anchor_idx,
+            draft_tokens,
+            steps,
+            lambda t: tensor_model_parallel_all_gather(t, dim=-1),
+        )
 
     def apply_markov_bias_gathered(
         self,

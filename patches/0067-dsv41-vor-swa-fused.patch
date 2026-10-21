@@ -1,0 +1,599 @@
+dsv41 patch 0067 (21.10.2026): a shorter eager "vor" phase (the kernels between the drafter graph and the target graph
+of a decode round): the decode SWA metadata of all sliding-window groups in one launch. In use (VLLM_DSV41_VOR_FUSED=1,
+image v18 and later; measured with 0066's VLLM_DSV41_MARKOV_FUSED=1). Base: vllm/v1/attention/backends/mla/sparse_swa.py
+as in the recipe image (no patch of ours touches it) and vllm/models/deepseek_v41/nvidia/model_state.py of image v12;
+new file vllm/models/deepseek_v41/common/ops/swa_fused.py.
+Why: between the drafter graph and the target graph every round runs ~103 eager kernels on the main stream, 0.27 ms of
+GPU time (profile of 19.10., 1 stream; the host is ~30 ms ahead, so all of it is on the GPU's critical path). 94 us of
+it is the SWA metadata: build_attn_metadata calls DeepseekSparseSWAMetadataBuilder.build once per sliding-window KV
+cache group (15 on DeepSeek-V4.1-Flash: 43 SWA layers, 3 a group), and each runs torch.ge(slot_mapping, 0),
+decode_swa_lens[n:] = 0 and _compute_swa_indices_and_lens_kernel: 45 launches of 1-3 us with ~0.5 us gaps. Another
+9 us: the model state uploads replay_start every round (16 B pinned -> device), zeros in decode-only rounds.
+How:
+  1. swa (VLLM_DSV41_VOR_FUSED=1 or =swa): model_state.prepare_attn arms a plan with every KV group whose only attention
+     group has a DeepseekSparseSWAMetadataBuilder (in build order, with the block tables and slot-mapping rows that
+     build_attn_metadata hands them). The first of these builders launches _swa_decode_groups_kernel once for all
+     groups (a per-group row of a cached int64 pointer table): rows < n run torch.ge for the token and then the
+     upstream kernel's body verbatim, tail programs the torch.ge of the slot-mapping entries past n and
+     decode_swa_lens[n:] = 0. The other builders skip their three launches if their inputs are the ones the launch
+     read. Only decode-only causal steps; mixed steps, captures, microbatches, the drafter's builders and any mismatch
+     take the upstream path unchanged.
+  2. copy (=1 or =copy): the replay_start upload runs only when the values differ from what the device buffer holds
+     (the model state is its only writer).
+Same bits: the same values land in the same buffers, the metadata objects are unchanged and the graphs read the same
+addresses. Tested on CPU (a numpy interpreter of the Triton subset: 34 decode steps x 15 groups incl. FULL padding,
+contexts up to 327K, replay starts, stale buffers; mismatch / mixed / non-causal fallbacks; five mutated kernels are
+all caught) and on GB10 (sm_121, bits ok). Expected from the profile: -0.09 ms (swa) and -0.008 ms (copy) of GPU time a
+round, ~-0.3 %, below what an A/B of tok/s resolves.
+Measured (21.10.2026, GB10, 2000 MHz, image v18, from a fresh start): together with 0066's MARKOV_FUSED against the
+stored reference run of the production setup without both: cost per verify round -0.66 % (geometric mean), T=0 texts
+identical (details in 0066). Not measured alone.
+Switch: VLLM_DSV41_VOR_FUSED=1 (both parts), =swa, =copy; default 0 = off (the base image's kernels and buffers).
+
+--- a/vllm/v1/attention/backends/mla/sparse_swa.py
++++ b/vllm/v1/attention/backends/mla/sparse_swa.py
+@@ -439,6 +439,8 @@
+     reorder_batch_threshold: int | None = None
+     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+     supports_draft_decode_metadata_update = True
++    # dsv41 patch 0067: set by the DeepSeek-V4.1 model state (VLLM_DSV41_VOR_FUSED)
++    dsv41_swa_plan: Any = None
+ 
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+@@ -611,7 +613,20 @@
+         )
+ 
+         is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
+-        torch.ge(slot_mapping, 0, out=is_valid_token)
++        # dsv41 patch 0067: in a decode-only step the model state's plan may have
++        # written this group's is_valid_token, decode_swa_lens and
++        # decode_swa_indices already, in one launch for all sliding-window groups
++        # (vllm/models/deepseek_v41/common/ops/swa_fused.py).
++        fused = self.dsv41_swa_plan is not None and self.dsv41_swa_plan.claim(
++            self,
++            common_attn_metadata,
++            num_decode_tokens,
++            num_prefill_tokens,
++            token_to_req_indices,
++            replay_start,
++        )
++        if not fused:
++            torch.ge(slot_mapping, 0, out=is_valid_token)
+         if replay_start is None:
+             # Graph captures build without it; their dummy batches replay nothing.
+             replay_start = self.no_replay_start
+@@ -622,7 +637,8 @@
+         )
+         decode_swa_indices = self.decode_swa_indices
+         if num_decode_tokens > 0:
+-            self.decode_swa_lens[num_decode_tokens:] = 0
++            if not fused:
++                self.decode_swa_lens[num_decode_tokens:] = 0
+             if non_causal:
+                 assert self.is_dspark, (
+                     "Non-causal DeepseekV4 SWA is only supported for the DSpark "
+@@ -653,7 +669,7 @@
+                     num_tokens=num_decode_tokens,
+                     token_offset=0,
+                 )
+-            else:
++            elif not fused:
+                 _COMPUTE_SWA_INDICES_AND_LENS_KERNEL(
+                     decode_swa_indices,
+                     self.decode_swa_lens,
+--- a/vllm/models/deepseek_v41/nvidia/model_state.py
++++ b/vllm/models/deepseek_v41/nvidia/model_state.py
+@@ -11,6 +11,7 @@
+ from vllm.config import CUDAGraphMode, VllmConfig
+ from vllm.distributed.parallel_state import get_dp_group
+ from vllm.forward_context import DPMetadata, create_forward_context
++from vllm.models.deepseek_v41.common.ops import swa_fused  # dsv41 patch 0067
+ from vllm.models.deepseek_v41.decoder_replay_layers import DecoderReplayLayers
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadataBuilder
+@@ -204,6 +205,15 @@
+         # The replay window and the indices of the prefix-cacheable groups, from
+         # the KV cache config on first use; None until then.
+         self._replay: tuple[int, torch.Tensor] | None = None
++        # dsv41 patch 0067 (VLLM_DSV41_VOR_FUSED, default off): upload replay_start
++        # only when it changes, and one launch for the decode SWA metadata of all
++        # sliding-window groups (common/ops/swa_fused.py); None when off.
++        self._replay_start_mirror = (
++            swa_fused.ReplayStartMirror(self.max_num_reqs)
++            if swa_fused.REPLAY_COPY_SKIP
++            else None
++        )
++        self._swa_plan = swa_fused.SWADecodePlan() if swa_fused.SWA_FUSED else None
+ 
+         self.decoder_replay_layers: DecoderReplayLayers | None = getattr(
+             model, "decoder_replay_layers", None
+@@ -314,9 +324,16 @@
+                 self._replay_start_np[input_batch.idx_mapping_np[:num_reqs]],
+                 0,
+             ).astype(np.int32)
+-            replay_start = self._replay_start_staging.copy_to_gpu(
+-                replay_start_np, out=self._replay_start[:num_reqs]
+-            )
++            mirror = self._replay_start_mirror
++            if mirror is not None and mirror.holds(replay_start_np):
++                # patch 0067: the buffer holds these values already
++                replay_start = self._replay_start[:num_reqs]
++            else:
++                replay_start = self._replay_start_staging.copy_to_gpu(
++                    replay_start_np, out=self._replay_start[:num_reqs]
++                )
++                if mirror is not None:
++                    mirror.wrote(replay_start_np)
+             if replay_start_np.any():
+                 # The replayed tokens rebuild window KV only: their slots in the
+                 # prefix-cacheable groups are padded so the cached KV stays as is.
+@@ -334,17 +351,36 @@
+                 )
+             assert model_specific_attn_metadata is None
+             model_specific_attn_metadata = ReplayAttnMetadata(replay_start)
+-        attn_metadata = super().prepare_attn(
+-            input_batch,
+-            cudagraph_mode,
+-            block_tables,
+-            slot_mappings,
+-            attn_groups,
+-            kv_cache_config,
+-            for_capture=for_capture,
+-            ubatch_idx=ubatch_idx,
+-            model_specific_attn_metadata=model_specific_attn_metadata,
+-        )
++        plan = self._swa_plan
++        if plan is not None and not for_capture and ubatch_idx == 0:
++            # patch 0067: the first sliding-window builder writes every group's
++            # decode metadata in one launch, the others skip their launches
++            plan.arm(
++                swa_fused.swa_plan_entries(
++                    attn_groups,
++                    block_tables,
++                    slot_mappings,
++                    DeepseekSparseSWAMetadataBuilder,
++                    ubatch_idx,
++                )
++            )
++        else:
++            plan = None
++        try:
++            attn_metadata = super().prepare_attn(
++                input_batch,
++                cudagraph_mode,
++                block_tables,
++                slot_mappings,
++                attn_groups,
++                kv_cache_config,
++                for_capture=for_capture,
++                ubatch_idx=ubatch_idx,
++                model_specific_attn_metadata=model_specific_attn_metadata,
++            )
++        finally:
++            if plan is not None:
++                plan.disarm()
+         if self.decoder_replay_layers is not None:
+             assert replay_start is not None
+             self._prepare_replay_batch(
+--- /dev/null
++++ b/vllm/models/deepseek_v41/common/ops/swa_fused.py
+@@ -0,0 +1,418 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""dsv41 patch 0067: a shorter eager "before" phase of a decode round.
++
++VLLM_DSV41_VOR_FUSED=1 turns on both parts below, =swa or =copy one of them; default 0 = off.
++
++swa:  the decode SWA metadata of all sliding-window KV cache groups of the target in one launch.
++      Per group the SWA builder runs torch.ge(slot_mapping, 0), decode_swa_lens[n:] = 0 and
++      _compute_swa_indices_and_lens_kernel (sparse_swa.py); DeepSeek-V4.1-Flash has 15 such groups,
++      so 45 launches, ~95 us of GPU time a round in trace F15 (kernels ~1-3 us, launch gaps ~0.5 us).
++      _swa_decode_groups_kernel writes the same three buffers of every group in one grid; its per-row
++      code is the upstream kernel's, the tail work is the torch.ge / fill of the rows past the decode
++      tokens.
++copy: DeepseekV41ModelState uploads replay_start every round, zeros in decode-only rounds; the copy
++      engine round trip costs ~9 us of GPU time a round (F15). The upload now runs only when the values
++      differ from what the buffer holds (the model state is its only writer).
++"""
++
++import os
++from typing import Any
++
++import numpy as np
++import torch
++
++from vllm.logger import init_logger
++from vllm.triton_utils import tl, triton
++
++logger = init_logger(__name__)
++
++_MODE = os.environ.get("VLLM_DSV41_VOR_FUSED", "0").strip().lower()
++SWA_FUSED = _MODE in ("1", "swa")
++REPLAY_COPY_SKIP = _MODE in ("1", "copy")
++
++# Pointer table columns, one int64 row per group (the kernel reads rows of 8).
++_SLOT, _VALID, _TABLE, _INDICES, _LENS, _TABLE_STRIDE, _BLOCK_SIZE = range(7)
++_COLS = 8
++_BLOCK = 1024  # = the TRITON_BLOCK_SIZE of the upstream kernel
++
++
++@triton.jit(do_not_specialize=["num_tokens", "num_valid"])
++def _swa_decode_groups_kernel(
++    table_ptr,  # int64 [num_groups, _COLS]: see the column names above
++    query_start_loc_ptr,
++    seq_lens_ptr,
++    token_to_req_indices_ptr,
++    replay_start_ptr,
++    num_tokens,  # decode rows of the step, the same in every group
++    num_valid,  # slot_mapping entries of a group (>= num_tokens)
++    lens_capacity,  # decode_swa_lens entries of a group
++    window_size,
++    index_width,
++    swa_indices_stride,
++    TRITON_BLOCK_SIZE: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    row = table_ptr + tl.program_id(1) * 8
++    slot_mapping_ptr = tl.cast(tl.load(row + 0), tl.pointer_type(tl.int64))
++    is_valid_token_ptr = tl.cast(tl.load(row + 1), tl.pointer_type(tl.int8))
++    block_table_ptr = tl.cast(tl.load(row + 2), tl.pointer_type(tl.int32))
++    swa_indices_ptr = tl.cast(tl.load(row + 3), tl.pointer_type(tl.int32))
++    swa_lens_ptr = tl.cast(tl.load(row + 4), tl.pointer_type(tl.int32))
++    block_table_stride = tl.cast(tl.load(row + 5), tl.int32)
++    block_size = tl.cast(tl.load(row + 6), tl.int32)
++
++    if pid >= num_tokens:
++        # Past the decode rows: torch.ge(slot_mapping, 0, out=is_valid_token) and
++        # decode_swa_lens[num_tokens:] = 0. Masked-off lanes keep in-range addresses.
++        offs = num_tokens + (pid - num_tokens) * TRITON_BLOCK_SIZE
++        offs = offs + tl.arange(0, TRITON_BLOCK_SIZE)
++        in_valid = offs < num_valid
++        safe = tl.where(in_valid, offs, 0)
++        slot = tl.load(slot_mapping_ptr + safe, mask=in_valid, other=-1)
++        tl.store(is_valid_token_ptr + safe, tl.cast(slot >= 0, tl.int8), mask=in_valid)
++        in_lens = offs < lens_capacity
++        tl.store(swa_lens_ptr + tl.where(in_lens, offs, 0), 0, mask=in_lens)
++        return
++
++    # Decode row `pid`: torch.ge for its token, then the body of
++    # _compute_swa_indices_and_lens_kernel with token_offset 0 and HAS_IMAGE False.
++    token_idx = pid
++    is_valid = tl.load(slot_mapping_ptr + token_idx) >= 0
++    tl.store(is_valid_token_ptr + token_idx, tl.cast(is_valid, tl.int8))
++    if not is_valid:
++        tl.store(swa_lens_ptr + pid, 0)
++        # Clear the row so a padded token cannot gather through stale indices.
++        for i in range(0, index_width, TRITON_BLOCK_SIZE):
++            offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
++            tl.store(
++                swa_indices_ptr + pid * swa_indices_stride + offset,
++                -1,
++                mask=offset < index_width,
++            )
++        return
++
++    req_idx = tl.load(token_to_req_indices_ptr + token_idx)
++
++    query_start = tl.load(query_start_loc_ptr + req_idx)
++    query_end = tl.load(query_start_loc_ptr + req_idx + 1)
++    query_len = query_end - query_start
++
++    seq_len = tl.load(seq_lens_ptr + req_idx)
++    prefix_len = seq_len - query_len
++
++    pos = prefix_len + token_idx - query_start
++    left = 0
++    right = 0
++    left_add = tl.maximum(left - (window_size - 1), 0)
++    start_pos = tl.maximum(pos - (window_size - 1) - left_add, 0)
++    # SWA bounded replay: no window KV exists below the request's replay start.
++    start_pos = tl.maximum(start_pos, tl.load(replay_start_ptr + req_idx))
++    end_pos = pos + right + 1
++
++    swa_len = end_pos - start_pos
++    tl.store(swa_lens_ptr + pid, swa_len)
++
++    for i in range(0, index_width, TRITON_BLOCK_SIZE):
++        offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
++
++        pos_offset = start_pos + offset
++        block_indices = pos_offset // block_size
++        block_numbers = tl.load(
++            block_table_ptr + req_idx * block_table_stride + block_indices,
++            mask=pos_offset < end_pos,
++        )
++        block_offsets = pos_offset % block_size
++        slot_ids = block_numbers * block_size + block_offsets
++
++        slot_ids = tl.where(offset < swa_len, slot_ids, -1)
++        tl.store(
++            swa_indices_ptr + pid * swa_indices_stride + offset,
++            slot_ids,
++            mask=offset < index_width,
++        )
++
++
++def _same_view(a: torch.Tensor, b: torch.Tensor) -> bool:
++    return (
++        a.data_ptr() == b.data_ptr()
++        and a.shape == b.shape
++        and a.stride() == b.stride()
++        and a.dtype == b.dtype
++    )
++
++
++def swa_plan_entries(
++    attn_groups: list[list[Any]],
++    block_tables: tuple[torch.Tensor, ...],
++    slot_mappings: torch.Tensor,
++    builder_cls: type,
++    ubatch_idx: int = 0,
++) -> list[tuple[Any, torch.Tensor, torch.Tensor]]:
++    """(builder, block table, slot-mapping row) of every KV cache group whose only attention
++    group has a ``builder_cls`` builder, in the order build_attn_metadata builds them, with the
++    tensors it hands them (block_tables[i] itself, a view of slot_mappings[i]). Groups that
++    also hold other builders stay out: those could change the shared block table first."""
++    entries = []
++    for i, groups in enumerate(attn_groups):
++        if len(groups) != 1:
++            continue
++        builder = groups[0].get_metadata_builder(ubatch_idx)
++        if isinstance(builder, builder_cls):
++            entries.append((builder, block_tables[i], slot_mappings[i]))
++    return entries
++
++
++class SWADecodePlan:
++    """Decode SWA metadata of several sliding-window groups in one launch.
++
++    The model state arms it around one build_attn_metadata call. The first entry's builder
++    launches the kernel for every entry from its own build(), once its token_to_req_indices
++    exists, where the upstream code launches that builder's kernels. A builder skips its own
++    three launches only if its inputs are the ones the launch read (same block table object,
++    same slot-mapping view, same shared tensors and sizes); otherwise it launches them as
++    before, after the plan's launch, and so overwrites whatever the plan wrote for it.
++    """
++
++    def __init__(self) -> None:
++        self.armed = False
++        self.disabled = False
++        self.entries: list[tuple[Any, torch.Tensor, torch.Tensor]] = []
++        self._pos: dict[int, int] = {}
++        self._launched: tuple | None = None
++        self._table_key: tuple | None = None
++        self._table: torch.Tensor | None = None
++        self._table_host: torch.Tensor | None = None
++        self._warm = False
++        self.launches = 0  # diagnostics: fused launches so far
++
++    def arm(self, entries: list[tuple[Any, torch.Tensor, torch.Tensor]]) -> None:
++        self.entries = entries
++        self._pos = {id(builder): i for i, (builder, _, _) in enumerate(entries)}
++        self._launched = None
++        self.armed = bool(entries) and not self.disabled
++        for builder, _, _ in entries:
++            builder.dsv41_swa_plan = self
++        if self.armed and not self._warm:
++            self._warmup(entries[0][0])
++
++    def disarm(self) -> None:
++        self.armed = False
++        self.entries = []
++        self._pos = {}
++        self._launched = None
++
++    def claim(
++        self,
++        builder: Any,
++        common_attn_metadata: Any,
++        num_decode_tokens: int,
++        num_prefill_tokens: int,
++        token_to_req_indices: torch.Tensor,
++        replay_start: torch.Tensor | None,
++    ) -> bool:
++        """True if this builder's is_valid_token, decode_swa_lens and decode_swa_indices hold
++        what its own three launches would write; the first entry launches for all."""
++        if not self.armed:
++            return False
++        i = self._pos.get(id(builder))
++        if i is None:
++            return False
++        _, block_table, slot_mapping = self.entries[i]
++        cm = common_attn_metadata
++        if cm.block_table_tensor is not block_table or not _same_view(
++            cm.slot_mapping, slot_mapping
++        ):
++            return False
++        key = (
++            num_decode_tokens,
++            num_prefill_tokens,
++            cm.causal is True,
++            slot_mapping.shape[0],
++            token_to_req_indices.data_ptr(),
++            cm.query_start_loc.data_ptr(),
++            cm.seq_lens.data_ptr(),
++            None if replay_start is None else replay_start.data_ptr(),
++        )
++        if i == 0:
++            launched = self._launch(
++                builder,
++                cm,
++                num_decode_tokens,
++                num_prefill_tokens,
++                token_to_req_indices,
++                replay_start,
++            )
++            self._launched = key if launched else None
++            return launched
++        return self._launched is not None and key == self._launched
++
++    def _eligible(
++        self,
++        cm: Any,
++        num_decode_tokens: int,
++        num_prefill_tokens: int,
++        token_to_req_indices: torch.Tensor,
++        replay_start: torch.Tensor,
++    ) -> bool:
++        if num_prefill_tokens != 0 or num_decode_tokens <= 0 or cm.causal is not True:
++            return False
++        first = self.entries[0][0]
++        num_valid = self.entries[0][2].shape[0]
++        if num_valid < num_decode_tokens:
++            return False
++        for t in (cm.query_start_loc, cm.seq_lens, token_to_req_indices, replay_start):
++            if t.dtype != torch.int32 or t.dim() != 1 or t.stride(0) != 1:
++                return False
++        if token_to_req_indices.shape[0] < num_decode_tokens:
++            return False
++        capacity = first.decode_swa_lens.shape[0]
++        if capacity < num_valid:
++            return False
++        for builder, block_table, slot_mapping in self.entries:
++            indices, lens, valid = (
++                builder.decode_swa_indices,
++                builder.decode_swa_lens,
++                builder.is_valid_token,
++            )
++            if not (
++                builder.window_size == first.window_size
++                and indices.dtype == torch.int32
++                and indices.is_contiguous()
++                and indices.shape[1:] == first.decode_swa_indices.shape[1:]
++                and indices.shape[0] >= num_decode_tokens
++                and lens.dtype == torch.int32
++                and lens.dim() == 1
++                and lens.is_contiguous()
++                and lens.shape[0] == capacity
++                and valid.dtype == torch.bool
++                and valid.is_contiguous()
++                and valid.shape[0] >= num_valid
++                and block_table.dtype == torch.int32
++                and block_table.dim() == 2
++                and block_table.stride(1) == 1
++                and slot_mapping.dtype == torch.int64
++                and slot_mapping.dim() == 1
++                and slot_mapping.stride(0) == 1
++                and slot_mapping.shape[0] == num_valid
++            ):
++                return False
++        return True
++
++    def _table_for(self, device: torch.device) -> torch.Tensor:
++        rows = []
++        for builder, block_table, slot_mapping in self.entries:
++            row = [0] * _COLS
++            row[_SLOT] = slot_mapping.data_ptr()
++            row[_VALID] = builder.is_valid_token.data_ptr()
++            row[_TABLE] = block_table.data_ptr()
++            row[_INDICES] = builder.decode_swa_indices.data_ptr()
++            row[_LENS] = builder.decode_swa_lens.data_ptr()
++            row[_TABLE_STRIDE] = block_table.stride(0)
++            row[_BLOCK_SIZE] = builder.block_size
++            rows.append(tuple(row))
++        key = tuple(rows)
++        if key != self._table_key:
++            host = torch.tensor(rows, dtype=torch.int64)
++            if device.type == "cuda":
++                host = host.pin_memory()
++            # The pinned source stays referenced until the next rebuild, after
++            # the copy (same stream) has run.
++            self._table = host.to(device, non_blocking=True)
++            self._table_host = host
++            self._table_key = key
++        assert self._table is not None
++        return self._table
++
++    def _launch(
++        self,
++        builder: Any,
++        cm: Any,
++        num_decode_tokens: int,
++        num_prefill_tokens: int,
++        token_to_req_indices: torch.Tensor,
++        replay_start: torch.Tensor | None,
++    ) -> bool:
++        if self.disabled:
++            return False
++        if replay_start is None:
++            replay_start = builder.no_replay_start
++        if not self._eligible(
++            cm, num_decode_tokens, num_prefill_tokens, token_to_req_indices, replay_start
++        ):
++            return False
++        device = builder.decode_swa_lens.device
++        if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
++            return False
++        try:
++            table = self._table_for(device)
++            num_valid = self.entries[0][2].shape[0]
++            capacity = builder.decode_swa_lens.shape[0]
++            num_tail = triton.cdiv(capacity - num_decode_tokens, _BLOCK)
++            _swa_decode_groups_kernel[(num_decode_tokens + num_tail, len(self.entries))](
++                table,
++                cm.query_start_loc,
++                cm.seq_lens,
++                token_to_req_indices,
++                replay_start,
++                num_decode_tokens,
++                num_valid,
++                capacity,
++                builder.window_size,
++                builder.decode_swa_indices.shape[-1],
++                builder.decode_swa_indices.stride(0),
++                TRITON_BLOCK_SIZE=_BLOCK,
++            )
++        except Exception:  # first launch compiles; stay on the upstream path if that fails
++            logger.exception("dsv41 patch 0067: fused SWA metadata off, launch failed")
++            self.disabled = True
++            self.armed = False
++            return False
++        self.launches += 1
++        return True
++
++    def _warmup(self, builder: Any) -> None:
++        """Compile at the first arm (startup dummy runs) instead of in the first request;
++        the signature specializes like the step's launches (int32 vectors, int64 table)."""
++        self._warm = True
++        device = builder.decode_swa_lens.device
++        if device.type != "cuda":
++            return
++        try:
++            i32 = torch.zeros(16, dtype=torch.int32, device=device)
++            _swa_decode_groups_kernel.warmup(
++                torch.zeros((1, _COLS), dtype=torch.int64, device=device),
++                i32,
++                i32,
++                i32,
++                i32,
++                2,
++                3,
++                builder.decode_swa_lens.shape[0],
++                builder.window_size,
++                builder.decode_swa_indices.shape[-1],
++                builder.decode_swa_indices.stride(0),
++                TRITON_BLOCK_SIZE=_BLOCK,
++                grid=(1, 1),
++            )
++        except Exception:  # compiles at the first launch instead
++            logger.warning("dsv41 patch 0067: warmup compile skipped", exc_info=True)
++
++
++class ReplayStartMirror:
++    """Host copy of the values DeepseekV41ModelState._replay_start holds on the device; the
++    upload runs only if the step's values differ (copies are stream-ordered, the model state
++    is the buffer's only writer)."""
++
++    def __init__(self, size: int) -> None:
++        self.values = np.zeros(size, dtype=np.int32)
++        self.skipped = 0  # diagnostics
++
++    def holds(self, values: Any) -> bool:
++        n = len(values)
++        same = bool((self.values[:n] == values).all())
++        self.skipped += same
++        return same
++
++    def wrote(self, values: Any) -> None:
++        self.values[: len(values)] = values

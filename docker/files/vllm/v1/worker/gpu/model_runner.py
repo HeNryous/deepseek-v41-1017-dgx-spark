@@ -1243,6 +1243,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.adaptive_verification.add_request(req_index)
             if self.depth_policy is not None:
                 self.depth_policy.reset(req_index)
+                # dsv41 patch 0071: background verify-depth cap by priority
+                self.depth_policy.set_priority(req_index, getattr(new_req_data, "priority", 0))
             if self.prompt_lookup is not None:
                 self.prompt_lookup.reset(req_index)
 

@@ -1,0 +1,42 @@
+dsv41 patch 0063 (21.10.2026): the dense L2 prefetch also for 17-32-row verify windows. Off: tok/s -2.2 %, the prefetch
+competes with the routed experts' DRAM reads at 17-32 rows; not in v19. Base: the plugin vllm_exl3_moe as in image v12
+(l2pf.py).
+Why: l2pf.py (TensorFold's paced prefetch, EXL3_L2PF=attn,moe,next in the recipe launcher) pulls the next dense weights
+into L2 only for forwards of at most 16 rows, the exl3_mrow range before patch 0042. With 0042/0042b
+(VLLM_EXL3_MROW_MAX_ROWS=32) 17-32 rows run on exl3_mrow as well, but the prefetch cap stayed at 16, so the verify
+windows of 3-4 streams ran without it. At 1 stream the prefetch gives +2 % end to end with the RDMA ring (the recipe's
+measurement).
+How: MAX_ROWS = min(EXL3_L2PF_MAX_ROWS, the exl3_mrow range: 32 with VLLM_EXL3_MROW_MAX_ROWS=32, else 16); without
+EXL3_L2PF_MAX_ROWS the cap stays 16. The same three points a layer, the same plan, budget and pacing; the last layer's
+"next" point joins without forking, so a captured graph ends with nothing in flight, as at <= 16 rows. A prefetch only
+reads (into L2) on a side stream that the main stream joins: outputs keep their bits.
+Measured (21.10.2026, GB10, 2000 MHz, image v14 = v12 + 0063 with EXL3_L2PF_MAX_ROWS=32 from a fresh start, against
+the stored reference run of that morning's production setup, k = 5 at 1-4 streams; prose / code / JSON at 1 and 4
+streams, T = 0 and 1, plus 64K cells): cost per verify round +0.78 % (geometric mean), tok/s -2.22 %; 4 streams JSON
+-6.2 % (ms per round +8.1 %), code -3.0 % (+5.4 %), prose -0.9 %; 1 stream unchanged; T=0 texts identical. An earlier
+arm of 0063 together with VLLM_EXL3_MOE_COOP_MAX_TOKENS=42 and EXL3_RDMA_AR_MAX_KB=3072: tok/s -1.65 %, kit_bench
+sustained (4 streams, 90 s) -0.4 %. Our reading (not measured directly): at 17-32 rows the prefetch competes with the
+routed experts' DRAM reads, which grow with the rows. Not adopted.
+Switch: EXL3_L2PF_MAX_ROWS=32 (needs VLLM_EXL3_MROW_MAX_ROWS=32 and EXL3_L2PF on). Default 16 = as before.
+
+--- a/vllm_exl3_moe/l2pf.py
++++ b/vllm_exl3_moe/l2pf.py
+@@ -32,6 +32,11 @@
+ 
+ CHUNK = 8 << 10
+ MAX_ROWS = 16                      # decode sizes only (the dense modules' exl3_mrow range)
++# dsv41 patch 0063: EXL3_L2PF_MAX_ROWS (default 16 = as before) lets the prefetch points run up to that many rows, at
++# most the dense modules' exl3_mrow range (patch 0042: VLLM_EXL3_MROW_MAX_ROWS=32 runs 17..32 rows on exl3_mrow, but
++# the cap here stayed at 16, so 3-4-stream verify windows of 17-32 rows got no prefetch). A prefetch writes nothing.
++_MROW_ROWS = 32 if os.environ.get("VLLM_EXL3_MROW_MAX_ROWS", "16") == "32" else 16
++MAX_ROWS = max(1, min(int(os.environ.get("EXL3_L2PF_MAX_ROWS") or MAX_ROWS), _MROW_ROWS))
+ POINTS = {p for p in os.environ.get("EXL3_L2PF", "0").replace(" ", "").split(",") if p and p != "0"}
+ BUDGET = int(float(os.environ.get("EXL3_L2PF_MB") or 16) * (1 << 20))
+ RATE_GBPS = float(os.environ.get("EXL3_L2PF_RATE_GBPS") or 230)
+@@ -146,4 +151,5 @@
+     if not _announced:
+         _announced = True
+         logger.info("EXL3 L2 prefetch on: points %s, %d MiB a fork, %.0f GB/s pacing, %d modules registered "
+-                    "(layers 0-%d)", ",".join(sorted(POINTS)), BUDGET >> 20, RATE_GBPS, len(_reg), _last_layer)
++                    "(layers 0-%d), up to %d rows", ",".join(sorted(POINTS)), BUDGET >> 20, RATE_GBPS, len(_reg),
++                    _last_layer, MAX_ROWS)

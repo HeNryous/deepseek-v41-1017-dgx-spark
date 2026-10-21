@@ -1,0 +1,320 @@
+dsv41 patch 0065 (21.10.2026): mixed prefill + decode steps of up to 32 tokens (40 with the coop limit raised) as
+breakable PIECEWISE CUDA graphs next to the FULL decode graphs. Off: no gain after 0064 (sustained +0.0 %), 446 MiB
+less free memory on the head node; not in v19. Base: the v12 files vllm/v1/worker/gpu/cudagraph_utils.py,
+model_runner.py, vllm/models/deepseek_v41/attention.py and vllm_exl3_moe/l2pf.py; independent of 0062-0064.
+Why: with FULL_DECODE_ONLY (the launcher's default) every step that holds a prefill row runs eagerly. In the profile of
+19.10. (4 streams) eager steps of 16-29 tokens on the decode kernels took 224-260 ms, 214-254 ms of it host time, where
+a graph round of the same width takes 65-95 ms.
+How: upstream's breakable graphs (vllm/compilation/breakable_cudagraph.py) capture the forward in segments and end one
+at every eager break: each layer's sparse indexer + MLA (40 a forward) and the Engram prefetch (4). The segments hold
+mHC, the projections, KV insert, compressor, indexer Q/K, routed and shared experts, the dense layers and the
+all-reduces, and read the step's values from persistent buffers; the breaks read the step's own metadata at replay.
+  1. cudagraph_utils.py: PIECEWISE graphs from their own size list (VLLM_DSV41_PW_SIZES, else the capture sizes),
+     capped at the plugin's coop limit (VLLM_DSV41_PW_MAX_ROWS, default VLLM_EXL3_MOE_COOP_MAX_TOKENS or 32, at most
+     42): above it the plugin captures exl3_moe with fp32 atomics (not reproducible, other rounding than eager). The
+     decode graphs keep cudagraph_capture_sizes. Optional PIECEWISE short-context twins (VLLM_DSV41_PW_TWINS), each in
+     its own breakable wrapper (a wrapper keys on the token count only).
+  2. model_runner.py: the batch's longest sequence also for mixed batches when PIECEWISE twins exist; run_pw_graph gets
+     the dispatched bound.
+  3. vllm_exl3_moe/l2pf.py: no L2 prefetch in PIECEWISE forwards (a prefetch forked before an attention break and
+     joined after it would leave its segment with an unjoined side stream: a capture error).
+  4. attention.py: VLLM_DSV41_PW_WIDE=1 breaks at the whole _prepare_and_attn instead (a diagnostic arm).
+Rounding: the same kernels as the eager step up to 32 rows; without a twin a captured step scores the indexer where the
+eager step takes the short-context branch (same entries in another order). Deterministic run to run.
+Measured (21.10.2026, GB10, 2000 MHz, image v17 = v12 + 0064 + 0065 with cudagraph_mode FULL_AND_PIECEWISE,
+VLLM_USE_BREAKABLE_CUDAGRAPH=1, VLLM_EXL3_MOE_COOP_MAX_TOKENS=42, VLLM_DSV41_PW_SIZES=8,16,24,32,40 and
+VLLM_DSV41_PW_TWINS=512: 10 PIECEWISE graphs next to the 48 FULL ones; kit_bench and arrivals against the production
+setup with 0064 running in the same window, decode cells against its stored reference run): kit_bench sustained (4
+streams, 90 s) 128.5 -> 128.6 tok/s, concurrent 2 / 4 streams 76.3 / 117.4 -> 76.3 / 116.7; when a short request
+arrives next to running streams (~24 / 32 / 40 rows in the mixed step, all on graphs) the running streams lose 20.4 /
+46.1 / 65.9 -> 19.1 / 50.0 / 63.3 ms (median) and the new request's first token comes after 219 / 242 / 248 -> 190 /
+209 / 216 ms; cost per decode round -0.66 % (geometric mean), tok/s -0.39 %; T=0 texts identical 8/8 and between two
+runs; corruption test (30K/100K, 2 each) 0 hits; lowest free memory under load 2,458 -> 2,012 MiB head, 3,535 -> 3,113
+MiB worker. With 0064 a mixed step costs the running streams only 20-66 ms (before 0064 and the CPU pin, the profile of
+19.10. suggested 150-185 ms per arrival), so little is left for graphs. Not adopted.
+Switch: cudagraph_mode FULL_AND_PIECEWISE (the launcher's GRAPH) with breakable graphs; VLLM_DSV41_PW_SIZES,
+VLLM_DSV41_PW_MAX_ROWS, VLLM_DSV41_PW_TWINS, VLLM_DSV41_PW_WIDE. With FULL_DECODE_ONLY every switch is inert.
+
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -56,6 +56,56 @@
+ logger = init_logger(__name__)
+ 
+ 
++# dsv41 patch 0065: PIECEWISE (breakable) CUDA graphs for mixed prefill + decode steps, bounded. Only active when the
++# cudagraph mode has a PIECEWISE mixed routine (FULL_AND_PIECEWISE); FULL_DECODE_ONLY serves exactly as before.
++#   VLLM_DSV41_PW_SIZES     comma list of token counts that get a PIECEWISE graph; empty = every cudagraph_capture_sizes
++#                           entry (upstream). The FULL decode graphs keep cudagraph_capture_sizes either way.
++#   VLLM_DSV41_PW_MAX_ROWS  PIECEWISE graphs above this many tokens are dropped. Default: the EXL3 MoE plugin's coop
++#                           limit (VLLM_EXL3_MOE_COOP_MAX_TOKENS, else the config's 32; at most 42 = 256 slots / top-k 6),
++#                           because above it the plugin captures exl3_moe with fp32 atomics (vllm_exl3_moe/forward.py:
++#                           not bit-reproducible, other rounding than the eager paths). 0 = no limit.
++#   VLLM_DSV41_PW_TWINS     short-context twins (short_ctx.py) of the PIECEWISE graphs too: bounds out of
++#                           VLLM_SHORT_CTX_BOUNDS as a comma list, "1" = all of them, empty / "0" = none. Without them a
++#                           captured mixed step scores the indexer where the eager step takes the short branch (same
++#                           entries in another order: rounding only, T=0 texts can differ from eager).
++def _dsv41_env_ints(name: str) -> list[int]:
++    raw = os.environ.get(name, "").replace(" ", "")
++    return sorted({int(x) for x in raw.split(",") if x})
++
++
++def dsv41_pw_max_rows() -> int:
++    raw = os.environ.get("VLLM_DSV41_PW_MAX_ROWS", "").strip()
++    if raw:
++        return max(0, int(raw))
++    coop = int(os.environ.get("VLLM_EXL3_MOE_COOP_MAX_TOKENS", "").strip() or 32)
++    return max(1, min(coop, 42))
++
++
++def dsv41_pw_sizes(capture_sizes: Iterable[int], max_tokens: int) -> list[int]:
++    """Token counts that get a PIECEWISE graph: VLLM_DSV41_PW_SIZES (else the capture sizes), within the cap."""
++    sizes = _dsv41_env_ints("VLLM_DSV41_PW_SIZES") or sorted(set(capture_sizes))
++    cap = dsv41_pw_max_rows()
++    keep = [s for s in sizes if 0 < s <= max_tokens and (cap == 0 or s <= cap)]
++    dropped = [s for s in sizes if s not in keep]
++    if dropped:
++        logger.warning(
++            "dsv41 0065: no PIECEWISE graph for %s tokens (cap %s rows, max %d tokens; "
++            "VLLM_DSV41_PW_MAX_ROWS)", dropped, cap or "none", max_tokens,
++        )
++    return keep
++
++
++def dsv41_pw_twin_bounds() -> list[int]:
++    """Context bounds of the PIECEWISE short-context twins (VLLM_DSV41_PW_TWINS)."""
++    raw = os.environ.get("VLLM_DSV41_PW_TWINS", "").replace(" ", "")
++    if raw in ("", "0"):
++        return []
++    if raw == "1":
++        return list(short_ctx.BOUNDS)
++    want = {int(x) for x in raw.split(",") if x}
++    return [b for b in short_ctx.BOUNDS if b in want]
++
++
+ class AttentionState(NamedTuple):
+     attn_metadata: dict[str, Any] | None
+     slot_mappings: dict[str, torch.Tensor]
+@@ -202,6 +252,9 @@
+             and self.cudagraph_mode.has_piecewise_cudagraphs()
+         )
+         self.breakable_cg_runner: BreakableCUDAGraphWrapper | None = None
++        # dsv41 patch 0065: one breakable wrapper per PIECEWISE twin bound. A wrapper keys its
++        # captures on the BatchDescriptor (token count), which cannot tell twins apart.
++        self._dsv41_twin_runners: dict[int, BreakableCUDAGraphWrapper] = {}
+ 
+         self._init_candidates()
+ 
+@@ -320,6 +373,14 @@
+         capture_varlen_decode = (
+             separate_decode_routine and bool(decode_mode) and self.varlen_decode
+         )
++        # dsv41 patch 0065: PIECEWISE (mixed) graphs come from their own, capped size list
++        # (dsv41_pw_sizes); the loop below then builds only the decode graphs.
++        pw_sizes: list[int] | None = None
++        if mixed_mode == CUDAGraphMode.PIECEWISE:
++            pw_sizes = dsv41_pw_sizes(
++                capture_sizes,
++                self.vllm_config.scheduler_config.max_num_batched_tokens,
++            )
+         for num_tokens, num_active_loras in product(
+             capture_sizes, self.lora_capture_cases
+         ):
+@@ -369,7 +430,7 @@
+                         descs_by_mode[decode_mode].append(ubatch_desc)
+ 
+             # recoverSSM cannot capture a dummy query wider than its workspace.
+-            if mixed_mode and (
++            if mixed_mode and pw_sizes is None and (
+                 not self.vllm_config.cache_config.use_kda_recoverssm
+                 or num_tokens <= max_decode_tokens
+             ):
+@@ -393,6 +454,36 @@
+                 if ubatch_desc is not None:
+                     descs_by_mode[mixed_mode].append(ubatch_desc)
+ 
++        if pw_sizes is not None:
++            # dsv41 patch 0065: the PIECEWISE graphs, as the loop above builds them (no request
++            # padding), for the capped size list only
++            pw_descs = [
++                BatchExecutionDescriptor(
++                    cg_mode=mixed_mode,
++                    num_tokens=num_tokens,
++                    num_reqs=None,
++                    num_active_loras=num_active_loras,
++                )
++                for num_tokens, num_active_loras in product(
++                    pw_sizes, self.lora_capture_cases
++                )
++                if not (
++                    self.vllm_config.cache_config.use_kda_recoverssm
++                    and num_tokens > max_decode_tokens
++                )
++            ]
++            twin_bounds = dsv41_pw_twin_bounds() if self.SHORT_CTX_TWINS else []
++            pw_descs += [replace(d, ctx_bound=b) for d in pw_descs for b in twin_bounds]
++            if pw_descs:
++                descs_by_mode[mixed_mode].extend(pw_descs)
++            logger.info(
++                "dsv41 0065: PIECEWISE graphs for mixed steps of %s tokens, short-context "
++                "twins %s: %d graphs",
++                pw_sizes,
++                twin_bounds or "none",
++                len(pw_descs),
++            )
++
+         if self.SHORT_CTX_TWINS and short_ctx.BOUNDS:
+             full = descs_by_mode.get(CUDAGraphMode.FULL, [])
+             twins = [
+@@ -622,12 +713,25 @@
+                 model, self.vllm_config
+             )
+ 
+-    def run_pw_graph(self, model: nn.Module, model_inputs: dict[str, Any]) -> Any:
++    def run_pw_graph(
++        self,
++        model: nn.Module,
++        model_inputs: dict[str, Any],
++        ctx_bound: int | None = None,
++    ) -> Any:
+         if not self.use_breakable_cg:
+             # Default: Use torch-compiled piecewise cudagraph.
+             return model(**model_inputs)
+         assert self.breakable_cg_runner is not None
+-        return self.breakable_cg_runner(**model_inputs)
++        runner = self.breakable_cg_runner
++        if ctx_bound is not None:
++            # dsv41 patch 0065: a PIECEWISE short-context twin captures and replays in
++            # its own wrapper (created at capture, every twin is captured at startup)
++            runner = self._dsv41_twin_runners.get(ctx_bound)
++            if runner is None:
++                runner = BreakableCUDAGraphWrapper(model, self.vllm_config)
++                self._dsv41_twin_runners[ctx_bound] = runner
++        return runner(**model_inputs)
+ 
+ 
+ class ModelCudaGraphManager(CudaGraphManager):
+@@ -807,8 +911,10 @@
+                 ):
+                     if cg_mode == CUDAGraphMode.PIECEWISE:
+                         # PIECEWISE graph (compiled PW or breakable, chosen inside
+-                        # run_pw_graph).
+-                        model_output = self.run_pw_graph(model, model_inputs)
++                        # run_pw_graph). dsv41 patch 0065: twins in their own wrapper.
++                        model_output = self.run_pw_graph(
++                            model, model_inputs, desc.ctx_bound
++                        )
+                     else:
+                         model_output = model(**model_inputs)
+ 
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -101,6 +101,7 @@
+ from vllm.v1.worker.gpu.cudagraph_utils import (
+     BatchExecutionDescriptor,
+     ModelCudaGraphManager,
++    dsv41_pw_twin_bounds,
+     has_compiled_submodule,
+     make_cudagraph_stats,
+ )
+@@ -190,6 +191,10 @@
+ 
+ logger = init_logger(__name__)
+ 
++# dsv41 patch 0065 (VLLM_DSV41_PW_TWINS): PIECEWISE short-context twins serve batches with a
++# prefill, so the dispatch needs those batches' longest sequence too
++_DSV41_PW_TWINS = bool(dsv41_pw_twin_bounds())
++
+ 
+ class GPUModelRunner(LoRAModelRunnerMixin):
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+@@ -1854,8 +1859,14 @@
+         if short_ctx.BOUNDS:
+             # Short-context twins (short_ctx.py): the batch's longest sequence after
+             # this step, plus a margin; unknown (no twin) with a prefill or a dummy.
++            # dsv41 patch 0065: known for a mixed / prefill batch too when PIECEWISE
++            # twins exist (FULL decode graphs never take such a batch: no uniform
++            # token count, no max_query_len).
+             max_seq_len = None
+-            if batch_req_state is not None and not batch_req_state.has_prefill:
++            if batch_req_state is not None and (
++                not batch_req_state.has_prefill
++                or (_DSV41_PW_TWINS and not batch_req_state.decode_graph_eligible)
++            ):
+                 idx = batch_req_state.idx_mapping_np
+                 max_seq_len = (
+                     int(
+@@ -2129,8 +2140,9 @@
+                     # cudagraph, chosen inside run_pw_graph). cg_mode is only
+                     # PIECEWISE after the cudagraph manager exists.
+                     assert self.cudagraph_manager is not None
++                    # dsv41 patch 0065: a short-context twin replays in its own wrapper
+                     model_output = self.cudagraph_manager.run_pw_graph(
+-                        self.model, model_inputs
++                        self.model, model_inputs, batch_desc.ctx_bound
+                     )
+                 else:
+                     # Eager (NONE): call the raw model directly.
+--- a/vllm/models/deepseek_v41/attention.py
++++ b/vllm/models/deepseek_v41/attention.py
+@@ -149,6 +149,12 @@
+ # patch 0059's NVFP4 records), exactly the ratio-2 group's block stride: no padding left in either compressed group.
+ _DSV41_KV_PAGES = 3 if __import__("os").environ.get("VLLM_DSV41_KV_PAIR", "0") == "3" else 2
+ _DSV41_KV_PAIR = _DSV41_KV_PAIR or _DSV41_KV_PAGES == 3
++# patch 0065 (VLLM_DSV41_PW_WIDE=1, default off): breakable PIECEWISE graphs break at the whole _prepare_and_attn
++# (Q projection, KV insert, compressor, indexer, attention run eagerly at replay with the step's own metadata) instead
++# of at _sparse_indexer_and_attn only. MRV1's choice; with MRV2 a diagnostic arm (more eager launches per layer, but
++# the indexer's short branch is decided per replay, so no PIECEWISE twins are needed for eager-identical rounding).
++# FULL graphs and eager steps are unaffected: the break only acts inside a breakable capture.
++_DSV41_PW_WIDE = __import__("os").environ.get("VLLM_DSV41_PW_WIDE", "0") == "1"
+ 
+ 
+ @triton.jit
+@@ -533,10 +539,10 @@
+             )
+ 
+         self._prepare_and_attn_fn = self._prepare_and_attn
+-        if not vllm_config.use_v2_model_runner:
++        if not vllm_config.use_v2_model_runner or _DSV41_PW_WIDE:
+             # MRV1's piecewise capture only tolerates the wide eager region: with
+             # the narrow one the attention input preparation stays in the captured
+-            # graph and MRV1 produces garbage (#51430).
++            # graph and MRV1 produces garbage (#51430). patch 0065: VLLM_DSV41_PW_WIDE.
+             self._prepare_and_attn_fn = self._prepare_and_attn_eager
+ 
+         self.aux_stream_list = aux_stream_list
+--- a/vllm_exl3_moe/l2pf.py
++++ b/vllm_exl3_moe/l2pf.py
+@@ -121,11 +121,33 @@
+         _pending = False
+ 
+ 
++_in_pw = None
++
++
++def _piecewise() -> bool:
++    """dsv41 patch 0065: whether this forward runs as a breakable PIECEWISE graph (capture or replay)."""
++    global _in_pw
++    if _in_pw is None:
++        try:
++            from vllm.forward_context import in_piecewise_cudagraph as f
++        except ImportError:  # an image without breakable graphs: never PIECEWISE here
++            def f() -> bool:
++                return False
++        _in_pw = f
++    return _in_pw()
++
++
+ def point(name: str, layer: int, rows: int) -> None:
+     """Prefetch point `name` of `layer` (a decode forward with `rows` rows)."""
+     global _stream, _pending, _announced
+     if not POINTS or not 0 < rows <= MAX_ROWS:
+         return
++    if _piecewise():
++        # dsv41 patch 0065: a breakable PIECEWISE capture ends a graph segment at every attention and Engram break, and a
++        # fork joined only at the next point would leave its segment with an unjoined side stream (the capture fails).
++        # Replays run no Python, so PIECEWISE forwards prefetch nothing; a complete forward leaves nothing pending.
++        join()
++        return
+     last = name == "next" and layer >= _last_layer
+     if name not in POINTS and not last:
+         return

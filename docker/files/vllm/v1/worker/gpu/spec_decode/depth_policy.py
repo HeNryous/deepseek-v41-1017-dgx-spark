@@ -47,6 +47,18 @@ environment behaves exactly as before:
   the next step verifies at most cap[n] drafts with n requests; slots past it are
   never priced or chosen.
 
+dsv41 patch 0071 (21.10.2026), off by default: background verify-depth cap. While a
+foreground request (scheduling priority < bgprio, the sampling proxy gives Hermes 0,
+subagents 5, Hindsight 10) is in the step, every background request (priority >= bgprio)
+verifies at most "bg" drafts; its other window rows stay in the window as padding (no
+routed experts, like any row past a depth). The foreground request's round gets cheaper
+(the routed experts of a second request's rows are most of what it adds: F15 1x6 rows
+36.8 ms, 2x6 60.2 ms, moe 12.4 -> 30.8 ms), the background request keeps 1 + bg tokens
+a round. The depth only decides how many drafts can be accepted, never which tokens come
+out, so outputs stay the same (T=0) or keep their distribution (T>0). The priority comes
+with the request (NewRequestData.priority); both TP ranks see the same priorities and
+confidences, so they choose the same depths.
+
 Environment:
   VLLM_DSPARK_DEPTH_POLICY  "conf" (the rule above), "confb", "confr:<rows ms>",
                             "fixed:<d>" (every request verifies d drafts) or unset / "0" (off)
@@ -64,6 +76,10 @@ Environment:
                             missing from the file fall back to these environment values.
   VLLM_DSPARK_DEPTH_LOG     N > 0: every N verify steps, log the chosen depths and
                             the drafts verified / accepted (and the calibration)
+  VLLM_DSV41_BG_DEPTH       0071: drafts a background request verifies while a foreground
+                            request is in the step (-1 = off); depth-file token "bg=..."
+  VLLM_DSV41_BG_MIN_PRIO    0071: priority from which a request counts as background
+                            (default 10 = Hindsight); depth-file token "bgprio=..."
 """
 
 import os
@@ -258,7 +274,12 @@ class DSparkDepthPolicy:
         self._env_opts = {
             "cal": os.environ.get("VLLM_DSPARK_CONF_CALIB", "0"),
             "lookup": os.environ.get("VLLM_DSPARK_LOOKUP", "0"),
+            "bg": os.environ.get("VLLM_DSV41_BG_DEPTH", "-1"),
+            "bgprio": os.environ.get("VLLM_DSV41_BG_MIN_PRIO", "10"),
         }
+        # 0071: scheduling priority by request slot (NewRequestData.priority)
+        self.prio = torch.zeros((max_num_reqs,), dtype=torch.int32, device=device)
+        self.bg_depth, self.bg_min_prio = -1, 10
         self._env_opts.update(_parse_options(text))
         self.calib = False
         self.lookup_opt = "0"
@@ -282,6 +303,9 @@ class DSparkDepthPolicy:
             ", confidence calibration on" if self.calib else "",
             f", context ms {self.ctx_pts}" if self.ctx_pts else "",
         )
+        if self.bg_depth >= 0:
+            logger.info("DSpark background depth cap (0071): requests with priority >= %d verify at most "
+                        "%d drafts while a foreground request is in the step", self.bg_min_prio, self.bg_depth)
 
     def describe(self) -> str:
         return f"fixed:{self.fixed}" if self.mode == "fixed" else self.mode
@@ -289,6 +313,11 @@ class DSparkDepthPolicy:
     def _apply_options(self, opts: dict[str, str]) -> None:
         self.calib = opts.get("cal", "0") in ("1", "on", "true")
         self.lookup_opt = opts.get("lookup", "0")
+        try:
+            self.bg_depth = min(int(opts.get("bg", "-1")), self.k)
+            self.bg_min_prio = int(opts.get("bgprio", "10"))
+        except ValueError:
+            self.bg_depth, self.bg_min_prio = -1, 10
         self.ctx_pts = _parse_ctx(opts.get("ctx"))
         if self.ctx_pts:
             dev = self.cost_ms.device
@@ -299,6 +328,19 @@ class DSparkDepthPolicy:
 
     def reset(self, req_index: int) -> None:
         self.depth[req_index] = self.k
+
+    def set_priority(self, req_index: int, priority: int) -> None:
+        """0071: the request's scheduling priority (lower = earlier)."""
+        self.prio[req_index] = max(-(2 ** 31), min(2 ** 31 - 1, int(priority)))
+
+    def _bg_capped(self, idx: torch.Tensor, decoding: torch.Tensor | None, num_reqs: int) -> torch.Tensor:
+        """0071: [n] bool, background requests of a step that also holds a foreground request
+        (one that verifies next step, if decoding is given). Device ops only, no host sync."""
+        bg = self.prio[idx] >= self.bg_min_prio
+        fg = ~bg
+        if decoding is not None:
+            fg = fg & (decoding[:num_reqs] != 0)
+        return bg & fg.any()
 
     def _maybe_reload(self) -> None:
         """Measurement knob: take the policy in VLLM_DSPARK_DEPTH_FILE. Rank 0 reads
@@ -348,11 +390,12 @@ class DSparkDepthPolicy:
                                                     dtype=torch.float32, device=self.rows_ms.device))
                     logger.info("DSpark depth cost table -> %s", [round(c, 2) for c in table[: self.k + 1]])
         opts = {**self._env_opts, **_parse_options(text)}
-        before = (self.calib, tuple(self.ctx_pts), self.lookup_opt)
+        before = (self.calib, tuple(self.ctx_pts), self.lookup_opt, self.bg_depth, self.bg_min_prio)
         self._apply_options(opts)
-        if (self.calib, tuple(self.ctx_pts), self.lookup_opt) != before:
-            logger.info("DSpark depth options -> calibration %s, context ms %s, lookup %s",
-                        self.calib, self.ctx_pts, self.lookup_opt)
+        if (self.calib, tuple(self.ctx_pts), self.lookup_opt, self.bg_depth, self.bg_min_prio) != before:
+            logger.info("DSpark depth options -> calibration %s, context ms %s, lookup %s, background cap %s "
+                        "(priority >= %d)", self.calib, self.ctx_pts, self.lookup_opt,
+                        self.bg_depth if self.bg_depth >= 0 else "off", self.bg_min_prio)
         if (mode, fixed) != (self.mode, self.fixed):
             self.mode, self.fixed = mode, fixed
             logger.info("DSpark depth policy -> %s", self.describe())
@@ -394,6 +437,8 @@ class DSparkDepthPolicy:
         self._maybe_reload()
         self.num_records += 1
         idx = idx_mapping[:num_reqs].long()
+        # 0071: background requests of a step with a foreground request (None = cap off)
+        bgc = self._bg_capped(idx, decoding, num_reqs) if self.bg_depth >= 0 else None
         if self.mode == "off":
             depth = torch.full(
                 (num_reqs,), self.k, dtype=torch.int32, device=self.depth.device
@@ -430,6 +475,10 @@ class DSparkDepthPolicy:
             if self.cap is not None:
                 cap = self.cap[min(num_reqs, self.cap.numel() - 1)]
                 conf = torch.where(self._pos[None, :] < cap, conf, torch.zeros_like(conf))
+            if bgc is not None:
+                # 0071: capped background slots carry no confidence (a joint choice prices them as dead rows)
+                conf = torch.where(bgc[:, None] & (self._pos[None, :] >= self.bg_depth),
+                                   torch.zeros_like(conf), conf)
             if self.mode == "conf":
                 depth = choose_depth(conf, self.cost_ms)
             else:
@@ -440,6 +489,9 @@ class DSparkDepthPolicy:
                 depth = choose_depth_joint(
                     conf, self.rows_ms, self._ctx_extra(seq_lens, num_reqs, decoding), live
                 )
+        if bgc is not None:
+            # 0071 (every mode): background requests verify at most bg drafts next to a foreground request
+            depth = torch.where(bgc, depth.clamp(max=self.bg_depth), depth)
         self.depth.index_copy_(0, idx, depth)
 
     def dead_rows(

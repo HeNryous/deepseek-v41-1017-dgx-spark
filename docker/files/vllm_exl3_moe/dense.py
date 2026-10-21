@@ -33,7 +33,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearMethodBase, ReplicatedLinear, RowParallelLinear
 from vllm.model_executor.utils import set_weight_attrs
 
-from . import l2pf
+from . import l2pf, l2pf_draft
 from .hostcopy import copy_from_host
 
 logger = init_logger(__name__)
@@ -144,6 +144,9 @@ class Exl3DenseLinearMethod(LinearMethodBase):
         self.k = int(k)
         self.layer_idx = layer_idx
         self.prefetch = prefetch          # backbone modules join l2pf's per-layer chain; the drafter's do not
+        # dsv41 patch 0066: drafter modules join l2pf_draft's chain instead (config.py sets it when
+        # VLLM_DSV41_DRAFT_L2PF is on; False = as before)
+        self.draft_pf = False
 
     # ----------------------------------------------------------------------------------------------- weights
     def create_weights(self, layer: torch.nn.Module, input_size_per_partition: int, output_partition_sizes: list[int],
@@ -333,6 +336,8 @@ class Exl3DenseLinearMethod(LinearMethodBase):
             layer.grouped_bmm = grouped_bmm
             if self.prefetch:
                 l2pf.register(self.layer_idx, self.module, mrow.trellis if mrow is not None else [])
+            elif self.draft_pf:                       # patch 0066
+                l2pf_draft.register(self.layer_idx, self.module, mrow.trellis if mrow is not None else [])
             return
         if getattr(layer, "exl3_flat", None):
             in_f = layer.exl3_shape[0]
@@ -345,6 +350,9 @@ class Exl3DenseLinearMethod(LinearMethodBase):
             layer._mrow = self._mrow_group([(t, su, sv, 0, c) for (t, su, sv), c in zip(parts, col)])
             if self.prefetch:
                 l2pf.register(self.layer_idx, self.module, layer._mrow.trellis if layer._mrow is not None else [])
+            elif self.draft_pf:                       # patch 0066
+                l2pf_draft.register(self.layer_idx, self.module,
+                                    layer._mrow.trellis if layer._mrow is not None else [])
             return
         in_f, out_f = layer.exl3_shape
         if layer.exl3_n == 1:
@@ -357,6 +365,8 @@ class Exl3DenseLinearMethod(LinearMethodBase):
                                             for i in range(layer.exl3_n)])
         if self.prefetch:
             l2pf.register(self.layer_idx, self.module, layer._mrow.trellis if layer._mrow is not None else [])
+        elif self.draft_pf:                           # patch 0066
+            l2pf_draft.register(self.layer_idx, self.module, layer._mrow.trellis if layer._mrow is not None else [])
 
     def _mrow_group(self, parts):
         """One exl3_mrow launch for the module's matrices on one input, or None (disabled, unsupported K or shape)."""
@@ -384,6 +394,8 @@ class Exl3DenseLinearMethod(LinearMethodBase):
             y = mrow(x2, y).reshape(*x.shape[:-1], -1)
             if self.prefetch and self.module in _L2PF_AFTER:
                 l2pf.point(_L2PF_AFTER[self.module], self.layer_idx, rows)
+            elif self.draft_pf and self.module == "attn.wq_b":   # patch 0066: drafter wo_a / wo_b into L2
+                l2pf_draft.point("attn", self.layer_idx, rows)
             return y if bias is None else y + bias
         xs = x.reshape(-1, x.shape[-1])
         sc = None

@@ -1,0 +1,198 @@
+dsv41 patch 0071 (21.10.2026): background verify-depth cap by request priority. In use (VLLM_DSV41_BG_DEPTH=0, image
+v19 and later): foreground decode +29 ... +56 % next to background requests; 0072 pauses their decode on top. Base:
+the v12 files vllm/v1/core/sched/output.py, vllm/v1/worker/gpu/model_runner.py and
+vllm/v1/worker/gpu/spec_decode/depth_policy.py (incl. our 0041/0043).
+Why: our clients send a `priority` with each request (interactive 0, subagents 5, background jobs 10; vLLM runs with
+--scheduling-policy priority, 0031c throttles background prefills). In our request log since 18.10. practically every
+interactive request ran next to a background request. A second request in the step mostly adds the routed experts of
+its rows: in the profile of 19.10. one request with 6 verify rows took 36.8 ms a round, two 60.2 ms, the MoE part
+12.4 -> 30.8 ms. Background decodes still verified their full depth next to the foreground request.
+How: NewRequestData carries the request's priority to the worker (output.py), the runner hands it to the depth policy
+per slot (model_runner.py, add_requests), and while a decoding foreground request (priority < bgprio) is in the step,
+every background request (priority >= bgprio) verifies at most "bg" drafts: under the conf rule its confidences past
+bg are masked before the choice (a joint choice prices those rows as dead), and in every mode the chosen depth is
+clamped after it. Its other window rows stay in the window as padding (no routed experts, as any row past a depth).
+Device ops only, no host sync; both TP ranks see the same priorities and confidences, so they choose the same depths.
+The depth only decides how many drafts can be accepted, never which tokens come out: outputs stay the same at T=0 and
+keep their distribution at T > 0. Live switching through the depth file (rank 0 reads it and broadcasts it): "bg=<n>",
+"bgprio=<p>". Tested on CPU: cap off = the original file's depths bit for bit (5 modes x 40 random cases); cap,
+foreground detection, decoding mask, bgprio and the depth-file options checked.
+Measured (21.10.2026, GB10, live on the production setup: image v19 with 0066/0067's MARKOV_FUSED and VOR_FUSED, GPU
+2190 MHz; arms switched through the depth file, interleaved A/B/C/A/B/C, 2 runs per cell): one foreground request
+(priority 0, 384 tokens, T=0) next to one or two background streams (priority 10, long outputs at T=0), foreground
+decode tok/s with the cap off / bg=0 / bg=1:
+  prose + 1 background stream    31.3 / 42.5 (+36 %) / 38.0 (+21 %)
+  prose + 2 background streams   22.2 / 34.7 (+56 %) / 30.3 (+36 %)
+  code + 1 background stream     50.9 / 65.7 (+29 %) / 61.3 (+20 %)
+  code + 2 background streams    40.2 / 57.6 (+43 %) / 51.3 (+28 %)
+First token 0.22-0.31 s in every arm. Capped at bg=0, a background stream gets one token a round, at more rounds per
+second (one background stream: 15.7 -> 22.2 rounds with output per second during the foreground decode).
+Switch: VLLM_DSV41_BG_DEPTH=<n> (default -1 = off), VLLM_DSV41_BG_MIN_PRIO=<p> (default 10: priority-5 requests count as
+foreground); the depth-file tokens bg= / bgprio= override them live (bg=-1 = off). Needs priorities from the clients
+and the depth policy (VLLM_DSPARK_DEPTH_POLICY, conf in the recipe launcher); without priorities nothing changes.
+
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -54,6 +54,9 @@
+     prefill_token_ids: list[int] | None = None
+     # DeepSeek-V4.1 only: SWA bounded replay; see Request.replay_start.
+     replay_start: int = 0
++    # dsv41 patch 0071: the request's scheduling priority, for the worker's background verify-depth cap
++    # (spec_decode/depth_policy.py, VLLM_DSV41_BG_DEPTH); lower = earlier, as in --scheduling-policy priority
++    priority: int = 0
+ 
+     @classmethod
+     def from_request(
+@@ -80,6 +83,7 @@
+             prompt_is_token_ids=request.prompt_is_token_ids,
+             prefill_token_ids=prefill_token_ids,
+             replay_start=request.replay_start,
++            priority=getattr(request, "priority", 0),
+         )
+ 
+     @property
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1243,6 +1243,8 @@
+                 self.adaptive_verification.add_request(req_index)
+             if self.depth_policy is not None:
+                 self.depth_policy.reset(req_index)
++                # dsv41 patch 0071: background verify-depth cap by priority
++                self.depth_policy.set_priority(req_index, getattr(new_req_data, "priority", 0))
+             if self.prompt_lookup is not None:
+                 self.prompt_lookup.reset(req_index)
+ 
+--- a/vllm/v1/worker/gpu/spec_decode/depth_policy.py
++++ b/vllm/v1/worker/gpu/spec_decode/depth_policy.py
+@@ -47,6 +47,18 @@
+   the next step verifies at most cap[n] drafts with n requests; slots past it are
+   never priced or chosen.
+ 
++dsv41 patch 0071 (21.10.2026), off by default: background verify-depth cap. While a
++foreground request (scheduling priority < bgprio, the sampling proxy gives Hermes 0,
++subagents 5, Hindsight 10) is in the step, every background request (priority >= bgprio)
++verifies at most "bg" drafts; its other window rows stay in the window as padding (no
++routed experts, like any row past a depth). The foreground request's round gets cheaper
++(the routed experts of a second request's rows are most of what it adds: F15 1x6 rows
++36.8 ms, 2x6 60.2 ms, moe 12.4 -> 30.8 ms), the background request keeps 1 + bg tokens
++a round. The depth only decides how many drafts can be accepted, never which tokens come
++out, so outputs stay the same (T=0) or keep their distribution (T>0). The priority comes
++with the request (NewRequestData.priority); both TP ranks see the same priorities and
++confidences, so they choose the same depths.
++
+ Environment:
+   VLLM_DSPARK_DEPTH_POLICY  "conf" (the rule above), "confb", "confr:<rows ms>",
+                             "fixed:<d>" (every request verifies d drafts) or unset / "0" (off)
+@@ -64,6 +76,10 @@
+                             missing from the file fall back to these environment values.
+   VLLM_DSPARK_DEPTH_LOG     N > 0: every N verify steps, log the chosen depths and
+                             the drafts verified / accepted (and the calibration)
++  VLLM_DSV41_BG_DEPTH       0071: drafts a background request verifies while a foreground
++                            request is in the step (-1 = off); depth-file token "bg=..."
++  VLLM_DSV41_BG_MIN_PRIO    0071: priority from which a request counts as background
++                            (default 10 = Hindsight); depth-file token "bgprio=..."
+ """
+ 
+ import os
+@@ -258,7 +274,12 @@
+         self._env_opts = {
+             "cal": os.environ.get("VLLM_DSPARK_CONF_CALIB", "0"),
+             "lookup": os.environ.get("VLLM_DSPARK_LOOKUP", "0"),
++            "bg": os.environ.get("VLLM_DSV41_BG_DEPTH", "-1"),
++            "bgprio": os.environ.get("VLLM_DSV41_BG_MIN_PRIO", "10"),
+         }
++        # 0071: scheduling priority by request slot (NewRequestData.priority)
++        self.prio = torch.zeros((max_num_reqs,), dtype=torch.int32, device=device)
++        self.bg_depth, self.bg_min_prio = -1, 10
+         self._env_opts.update(_parse_options(text))
+         self.calib = False
+         self.lookup_opt = "0"
+@@ -282,6 +303,9 @@
+             ", confidence calibration on" if self.calib else "",
+             f", context ms {self.ctx_pts}" if self.ctx_pts else "",
+         )
++        if self.bg_depth >= 0:
++            logger.info("DSpark background depth cap (0071): requests with priority >= %d verify at most "
++                        "%d drafts while a foreground request is in the step", self.bg_min_prio, self.bg_depth)
+ 
+     def describe(self) -> str:
+         return f"fixed:{self.fixed}" if self.mode == "fixed" else self.mode
+@@ -289,6 +313,11 @@
+     def _apply_options(self, opts: dict[str, str]) -> None:
+         self.calib = opts.get("cal", "0") in ("1", "on", "true")
+         self.lookup_opt = opts.get("lookup", "0")
++        try:
++            self.bg_depth = min(int(opts.get("bg", "-1")), self.k)
++            self.bg_min_prio = int(opts.get("bgprio", "10"))
++        except ValueError:
++            self.bg_depth, self.bg_min_prio = -1, 10
+         self.ctx_pts = _parse_ctx(opts.get("ctx"))
+         if self.ctx_pts:
+             dev = self.cost_ms.device
+@@ -300,6 +329,19 @@
+     def reset(self, req_index: int) -> None:
+         self.depth[req_index] = self.k
+ 
++    def set_priority(self, req_index: int, priority: int) -> None:
++        """0071: the request's scheduling priority (lower = earlier)."""
++        self.prio[req_index] = max(-(2 ** 31), min(2 ** 31 - 1, int(priority)))
++
++    def _bg_capped(self, idx: torch.Tensor, decoding: torch.Tensor | None, num_reqs: int) -> torch.Tensor:
++        """0071: [n] bool, background requests of a step that also holds a foreground request
++        (one that verifies next step, if decoding is given). Device ops only, no host sync."""
++        bg = self.prio[idx] >= self.bg_min_prio
++        fg = ~bg
++        if decoding is not None:
++            fg = fg & (decoding[:num_reqs] != 0)
++        return bg & fg.any()
++
+     def _maybe_reload(self) -> None:
+         """Measurement knob: take the policy in VLLM_DSPARK_DEPTH_FILE. Rank 0 reads
+         the file and broadcasts it, so every rank switches at the same step (ranks
+@@ -348,11 +390,12 @@
+                                                     dtype=torch.float32, device=self.rows_ms.device))
+                     logger.info("DSpark depth cost table -> %s", [round(c, 2) for c in table[: self.k + 1]])
+         opts = {**self._env_opts, **_parse_options(text)}
+-        before = (self.calib, tuple(self.ctx_pts), self.lookup_opt)
++        before = (self.calib, tuple(self.ctx_pts), self.lookup_opt, self.bg_depth, self.bg_min_prio)
+         self._apply_options(opts)
+-        if (self.calib, tuple(self.ctx_pts), self.lookup_opt) != before:
+-            logger.info("DSpark depth options -> calibration %s, context ms %s, lookup %s",
+-                        self.calib, self.ctx_pts, self.lookup_opt)
++        if (self.calib, tuple(self.ctx_pts), self.lookup_opt, self.bg_depth, self.bg_min_prio) != before:
++            logger.info("DSpark depth options -> calibration %s, context ms %s, lookup %s, background cap %s "
++                        "(priority >= %d)", self.calib, self.ctx_pts, self.lookup_opt,
++                        self.bg_depth if self.bg_depth >= 0 else "off", self.bg_min_prio)
+         if (mode, fixed) != (self.mode, self.fixed):
+             self.mode, self.fixed = mode, fixed
+             logger.info("DSpark depth policy -> %s", self.describe())
+@@ -394,6 +437,8 @@
+         self._maybe_reload()
+         self.num_records += 1
+         idx = idx_mapping[:num_reqs].long()
++        # 0071: background requests of a step with a foreground request (None = cap off)
++        bgc = self._bg_capped(idx, decoding, num_reqs) if self.bg_depth >= 0 else None
+         if self.mode == "off":
+             depth = torch.full(
+                 (num_reqs,), self.k, dtype=torch.int32, device=self.depth.device
+@@ -430,6 +475,10 @@
+             if self.cap is not None:
+                 cap = self.cap[min(num_reqs, self.cap.numel() - 1)]
+                 conf = torch.where(self._pos[None, :] < cap, conf, torch.zeros_like(conf))
++            if bgc is not None:
++                # 0071: capped background slots carry no confidence (a joint choice prices them as dead rows)
++                conf = torch.where(bgc[:, None] & (self._pos[None, :] >= self.bg_depth),
++                                   torch.zeros_like(conf), conf)
+             if self.mode == "conf":
+                 depth = choose_depth(conf, self.cost_ms)
+             else:
+@@ -440,6 +489,9 @@
+                 depth = choose_depth_joint(
+                     conf, self.rows_ms, self._ctx_extra(seq_lens, num_reqs, decoding), live
+                 )
++        if bgc is not None:
++            # 0071 (every mode): background requests verify at most bg drafts next to a foreground request
++            depth = torch.where(bgc, depth.clamp(max=self.bg_depth), depth)
+         self.depth.index_copy_(0, idx, depth)
+ 
+     def dead_rows(

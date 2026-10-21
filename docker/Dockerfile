@@ -9,9 +9,15 @@
 #   0051 indexer weights GEMV deferred · 0053/0054 display reservation as memory · 0055 hybrid drafting
 #   0056 CRC for the file-system KV offload tier · 0057 paired KV pages · 0058 offload next to expandable_segments
 #   0059 NVFP4 KV records · 0060 three KV pages per block · 0061 FP8 window + NVFP4 compressed KV
-# New switches are off by default (0040 is configuration only, see serve/serve_example.sh). exl3_mrow, exl3_rdma,
-# exl3_mhc and exl3_router have new sources: build the plugin's JIT kernels before the first start (README, step 4).
-# The published image ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v12 (= :latest) has exactly these files.
+#   0064 33-63-row MoE calls as exl3_smoe row chunks · 0066 cheaper DSpark drafter (fused / trimmed Markov loop,
+#   drafter L2 prefetch) · 0067 pre-round SWA metadata in one launch · 0071 background verify-depth cap
+#   0072 background decode pause · 0073 prefill throttle also for a waiting foreground request
+#   0074 background prefill chunks keep the long-prefill threshold when alone
+# 0062, 0063 and 0065 are in patches/ but not in the image. New switches are off by default (0040 is configuration only,
+# see serve/serve_example.sh). exl3_mrow, exl3_rdma, exl3_mhc and exl3_router have new sources: build the plugin's JIT
+# kernels before the first start (README, step 4). 0064-0074 change no CUDA source; the Triton kernels of 0066 and 0067
+# compile at the first start.
+# The image ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v22 has exactly these files.
 ARG BASE=dsv41-serve:v4
 FROM ${BASE}
 LABEL org.opencontainers.image.source="https://github.com/HeNryous/deepseek-v41-1017-dgx-spark" \

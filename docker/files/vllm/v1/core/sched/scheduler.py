@@ -17,6 +17,41 @@ _DSV41_AK_ALPHA = float(_dsv41_os.environ.get("VLLM_DSV41_AK_ALPHA", "0.3"))
 # two regimes: a request whose EMA is at least AK_HI (code, JSON: ~3 accepted drafts a round, bursty) keeps the full
 # schedule; below it (prose: ~1) the window follows the EMA. Default 99 = one regime (window always follows the EMA).
 _DSV41_AK_HI = float(_dsv41_os.environ.get("VLLM_DSV41_AK_HI", "99"))
+# dsv41 patch 0072 (21.10.2026): background decode pause. While a foreground request (priority < P) runs, decoding
+# background requests (priority >= P; the sampling proxy gives Hermes 0, subagents 5, Hindsight 10) are not scheduled.
+# They keep their KV blocks and drafts and go on as soon as no foreground request runs: background work only in idle
+# time, the foreground round no longer carries their rows (routed experts of a second context are most of what a second
+# request adds to a round). Prefill chunks are left to 0031. P = VLLM_DSV41_BG_PAUSE_PRIO, 0 = off; the depth file
+# (VLLM_DSPARK_DEPTH_FILE) token "bgpause=<P>" overrides it live (read every 256 steps; a line without the token falls
+# back to the environment value).
+_DSV41_BG_PAUSE_PRIO = int(_dsv41_os.environ.get("VLLM_DSV41_BG_PAUSE_PRIO", "0"))
+# dsv41 patch 0073 (21.10.2026): the 0031 prefill throttle also counts WAITING foreground requests (priority below
+# VLLM_PREFILL_THROTTLE_MIN_PRIO), so a new interactive request is admitted in a step without a background prefill chunk.
+# VLLM_DSV41_FG_WAIT_THROTTLE=1 turns it on (default off).
+_DSV41_FG_WAIT_THROTTLE = _dsv41_os.environ.get("VLLM_DSV41_FG_WAIT_THROTTLE", "0") == "1"
+# dsv41 patch 0074 (22.10.2026): background prefill chunks keep long_prefill_token_threshold even when the background
+# request is alone (vLLM drops the cap for a single request). Then a foreground request that arrives meanwhile waits at
+# most for ~0.7 s chunks instead of full-budget ones (~1.9 s at 4096 tokens; with async scheduling two are in flight), at
+# the price of a slower background prefill in idle time. Only requests at or above VLLM_PREFILL_THROTTLE_MIN_PRIO are
+# capped (0031), so a foreground request alone still uses the whole budget. VLLM_DSV41_BG_LPT_SOLO=1, default off.
+_DSV41_BG_LPT_SOLO = _dsv41_os.environ.get("VLLM_DSV41_BG_LPT_SOLO", "0") == "1"
+_DSV41_DEPTH_FILE = _dsv41_os.environ.get("VLLM_DSPARK_DEPTH_FILE") or None
+
+
+def _dsv41_bgpause_from(text, default):
+    """0072: the "bgpause=<P>" token of a depth-file text (tokens after the policy), else default."""
+    for tok in (text or "").strip().lower().split()[1:]:
+        if tok.startswith("bgpause="):
+            try:
+                return int(tok.split("=", 1)[1])
+            except ValueError:
+                return default
+    return default
+
+
+def _dsv41_bg_paused(request, pause_prio, fg_running):
+    """0072: whether a running request waits this step (a decoding background request next to a foreground one)."""
+    return pause_prio > 0 and fg_running and request.priority >= pause_prio and not request.is_prefill_chunk
 import itertools
 import math
 import time
@@ -636,11 +671,15 @@ class Scheduler(SchedulerInterface):
         # all prefill compute unless saturated.
         defer_prefills = (
             throttle_prefills and not self.prefill_capacity_bound
-        ) and any(
+        ) and (any(
             r.priority < _DSV41_THROTTLE_MIN_PRIO
             if _DSV41_THROTTLE_MIN_PRIO > 0 else not r.is_prefill_chunk
             for r in self.running
-        )  # dsv41 0031c: with a priority floor, throttle while a foreground request runs (decode OR prefill;
+        ) or (_DSV41_FG_WAIT_THROTTLE and _DSV41_THROTTLE_MIN_PRIO > 0 and any(
+            r.priority < _DSV41_THROTTLE_MIN_PRIO for r in self.waiting
+        )))  # dsv41 0073: also while a foreground request WAITS (its admission step then carries no background
+        # chunk; before, the in-flight steps each held a ~0.7 s background chunk and the first token took 3-5 s).
+        # dsv41 0031c: with a priority floor, throttle while a foreground request runs (decode OR prefill;
         # 0031b counted only decoding ones, so background chunks also ate the budget of a foreground prefill).
         # Admission of a WAITING foreground request needs budget left after the background chunks of a release
         # step (else prefill_capacity_bound switches the throttle off and it starves: 150 s TTFT on 18.10.):
@@ -653,7 +692,7 @@ class Scheduler(SchedulerInterface):
         num_eligible_reqs = num_running + num_waiting
         long_prefill_token_threshold = (
             self.scheduler_config.long_prefill_token_threshold
-            if num_eligible_reqs > 1
+            if num_eligible_reqs > 1 or (_DSV41_BG_LPT_SOLO and _DSV41_THROTTLE_MIN_PRIO > 0)  # dsv41 0074
             else 0
         )
         if long_prefill_token_threshold > 0 and self.adaptive_long_prefill_threshold:
@@ -662,6 +701,10 @@ class Scheduler(SchedulerInterface):
             long_prefill_token_threshold = max(
                 long_prefill_token_threshold, input_budget // num_eligible_reqs
             )
+
+        # dsv41 patch 0072: background decodes wait while a foreground request runs
+        bg_pause = self._dsv41_pause_prio()
+        fg_running = bg_pause > 0 and any(r.priority < bg_pause for r in self.running)
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -695,6 +738,12 @@ class Scheduler(SchedulerInterface):
             if defer_prefills and request.is_prefill_chunk and request.priority >= _DSV41_THROTTLE_MIN_PRIO:
                 # DP prefill balancing: defer this in-progress prefill chunk to a
                 # cadence-aligned step; decodes still run to fill this step.
+                req_index += 1
+                continue
+
+            if _dsv41_bg_paused(request, bg_pause, fg_running):
+                # dsv41 patch 0072: this background decode waits (keeps its KV and drafts) while a
+                # foreground request runs, like a decode skipped for the V2+PP cadence above.
                 req_index += 1
                 continue
 
@@ -2021,6 +2070,22 @@ class Scheduler(SchedulerInterface):
         return GrammarOutput(
             structured_output_request_ids, bitmask, num_acceptable_drafts
         )
+
+    def _dsv41_pause_prio(self) -> int:
+        """0072: the background pause floor, from the depth file every 256 steps (else the environment)."""
+        n = getattr(self, "_dsv41_bgp_n", 0)
+        self._dsv41_bgp_n = n + 1
+        if _DSV41_DEPTH_FILE is not None and n % 256 == 0:
+            try:
+                with open(_DSV41_DEPTH_FILE) as f:
+                    new = _dsv41_bgpause_from(f.read(), _DSV41_BG_PAUSE_PRIO)
+            except OSError:
+                new = _DSV41_BG_PAUSE_PRIO
+            if new != getattr(self, "_dsv41_bgp", None):
+                logger.info("dsv41 0072: background decode pause %s",
+                            f"for priority >= {new} next to a foreground request" if new > 0 else "off")
+            self._dsv41_bgp = new
+        return getattr(self, "_dsv41_bgp", _DSV41_BG_PAUSE_PRIO)
 
     def _dsv41_adaptive_k(self, num_scheduled_tokens, cap: int) -> int:
         """0047: the next step's draft count from the decode requests' accepted-draft EMA."""

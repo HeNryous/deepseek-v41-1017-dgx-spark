@@ -1,0 +1,957 @@
+dsv41 patch 0066 (21.10.2026): the DSpark drafter cheaper per verify round, three switches. VLLM_DSV41_MARKOV_FUSED=1
+in use (with 0067, image v18 and later); VLLM_DSV41_MARKOV_TRIM off (-0.42 % per round alone, +0.04 % on top of
+MARKOV_FUSED); VLLM_DSV41_DRAFT_L2PF off (-0.01 %). Base: the v12 files; no file of 0064 or 0065 is touched.
+Why: the drafter pass costs ~3.6 ms a round at 1 stream (profile of 19.10., 192 kernels), ~0.52 ms of it the Markov
+loop: five sequential steps of ~13 small kernels each (torch.max over the 64,640-column shard alone ~15 us), 46-53 us
+a step with a cached bias row, ~186 us with a computed one. The loop always runs 5 steps although the 0047 window
+verifies 2-3 drafts at prose. And the drafter's dense weights are never prefetched into L2 (its modules are outside
+l2pf.py's chain), while TensorFold's batched drafter graph forks paced L2 prefetches per stage.
+How:
+  1. VLLM_DSV41_MARKOV_FUSED=1 (new nvidia/ops/markov_step.py; dspark.py; dspark speculator): each greedy local-argmax
+     step as the unchanged bias kernel -> a reduction kernel (base + bias rounded to bf16 as torch's add rounds it, per
+     2,048 columns the maximum and its first column in torch.max's order: NaN above all, -0.0 = +0.0, ties to the
+     lower index) -> one all-gather of the chunk maxima -> a pick kernel (the first maximum over rank and chunk; writes
+     the draft, the next step's previous token and its Markov embedding). Three kernels and one all-gather a step
+     instead of ~13 kernels; the same drafts bit for bit.
+  2. VLLM_DSV41_MARKOV_TRIM=1 (gpu_worker.py, dflash and dspark speculators): the scheduler's draft count for the next
+     step (dynamic schedule + 0047 window) reaches the speculator before each step; under async scheduling no request
+     verifies more drafts than that. A FULL graph holds a fixed loop, so the DSpark graphs are captured once more for
+     each shorter depth (VLLM_DSV41_AK_MIN .. k-1) and replayed by depth; the 12 never-dispatched DSpark graphs of the
+     0047 widths are dropped, so the graph count stays at 16. Confidences past the depth are 0.
+  3. VLLM_DSV41_DRAFT_L2PF=next[,attn] (new vllm_exl3_moe/l2pf_draft.py; dense.py, config.py, moe_method.py, dspark.py):
+     a second prefetch chain over the three drafter blocks with l2pf.py's kernel and pacing. "next" after block j's MoE
+     pulls block j+1's mHC mix (EXL3_L2PF_HC=1), wq_a+wkv and wq_b; "attn" after wq_b pulls wo_a and wo_b. The chain is
+     joined before the drafter graph ends, so it never overlaps the target's MoE reads (0063's slowdown). Drafter passes
+     above EXL3_DRAFT_L2PF_MAX_ROWS (16) rows prefetch nothing.
+Bits: 1 changes no draft; 2 changes no verified draft, only the depth choice in rounds where the policy wanted more
+drafts than the window has; 3 writes nothing. The target's verification decides every emitted token, so T=0 texts stay
+the same with all three. Tested on CPU (the kernel sources on an interpreter against the original step) and on GB10
+(8/8 bit-identical).
+Measured (21.10.2026, GB10, 2000 MHz, image v18 = v12 + 0064 + 0066 + 0067, three arms one after the other, each from a
+fresh start against the stored reference run of the production setup with 0064 and the CPU pin; prose / code / JSON at
+1 and 4 streams, T = 0 and 1, plus 64K cells):
+  MARKOV_FUSED + 0067's VOR_FUSED   cost per verify round -0.66 % (geometric mean, worst cell +1.5 %), tok/s -0.78 %,
+                                    T=0 identical; the tok/s loss is the code cell at 64K context (-18.5 % at -3.3 % ms
+                                    per round: T=0 texts are not reproducible at 64K, so it compares two texts)
+  MARKOV_TRIM alone                 -0.42 % (worst cell +0.1 %), tok/s -0.42 % (64K cells -5.7 / -2.9 %), T=0 identical
+  DRAFT_L2PF=next alone             -0.01 %, tok/s +0.24 %, T=0 identical
+  MARKOV_TRIM on top of the first   +0.04 % (worst cell +3.7 %), tok/s +2.32 % (other texts), T=0 identical; measured
+  row (later, on image v20)         against the stored run of the first row: not adopted
+All three with 0067 in an earlier window against the same reference: +1.32 % per round (1-stream cells +1.7..+2.6 %),
+tok/s -0.40 %, T=0 identical. Each switch alone measured <= 0; what slowed the combination down is not resolved.
+Switches: VLLM_DSV41_MARKOV_FUSED=1; VLLM_DSV41_MARKOV_TRIM=1 (or a comma list of depths); VLLM_DSV41_DRAFT_L2PF=next or
+attn,next (EXL3_DRAFT_L2PF_MAX_ROWS; budget / pacing / delay as for l2pf.py: EXL3_L2PF_MB / _RATE_GBPS / _DELAY_NS).
+All off by default (markov_step.py is then not imported, l2pf_draft.py only reads its switch). FUSED and TRIM need the
+greedy local-argmax loop (VLLM_DSPARK_LOCAL_ARGMAX=1, the launcher's default), TRIM also async scheduling; otherwise
+they log a warning and stay off.
+
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -108,6 +108,12 @@
+ 
+ logger = init_logger(__name__)
+ 
++# dsv41 patch 0066 (VLLM_DSV41_MARKOV_TRIM, default off): the scheduler's draft count for the next step
++# (SchedulerOutput.num_spec_tokens_to_schedule: dynamic speculation schedule and the 0047 adaptive window; under async
++# scheduling every request scheduled now gets exactly that many draft placeholders, so the next step verifies at most
++# that many drafts) goes to the DSpark speculator before this step runs, which then runs its Markov loop only that deep.
++_DSV41_MARKOV_TRIM = os.environ.get("VLLM_DSV41_MARKOV_TRIM", "0").strip() not in ("", "0")
++
+ 
+ def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> int:
+     spec_config = vllm_config.speculative_config
+@@ -1314,6 +1320,14 @@
+                 comm_postprocess=comm_postprocess,
+             )
+ 
++        if _DSV41_MARKOV_TRIM:
++            # dsv41 patch 0066: read by this step's propose (sample_tokens follows execute_model on every rank)
++            set_next = getattr(
++                getattr(self.model_runner, "speculator", None), "dsv41_set_next_drafts", None
++            )
++            if set_next is not None:
++                set_next(scheduler_output.num_spec_tokens_to_schedule)
++
+         with self.annotate_profile(scheduler_output):
+             output = self.model_runner.execute_model(
+                 scheduler_output, intermediate_tensors
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -504,7 +504,7 @@
+ 
+         if batch_desc.cg_mode == CUDAGraphMode.FULL:
+             assert self.query_cudagraph_manager is not None
+-            self.query_cudagraph_manager.run_fullgraph(batch_desc)
++            self._replay_draft_graph(batch_desc)
+         else:
+             self._generate_draft(
+                 num_reqs,
+@@ -517,6 +517,11 @@
+ 
+         return self.draft_tokens[:num_reqs]
+ 
++    def _replay_draft_graph(self, batch_desc) -> None:
++        """Replay the captured FULL draft graph of batch_desc. dsv41 patch 0066: a subclass may replay a variant
++        captured for the same descriptor (DSpark: a shorter Markov loop, VLLM_DSV41_MARKOV_TRIM)."""
++        self.query_cudagraph_manager.run_fullgraph(batch_desc)
++
+ 
+ @triton.jit
+ def _prepare_dflash_inputs_kernel(
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -23,6 +23,7 @@
+ backbone forward AND the sequential Markov sampling.
+ """
+ 
++import functools
+ import os
+ from typing import Any
+ 
+@@ -34,12 +35,45 @@
+ from vllm.logger import init_logger
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
++from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
+ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+ from vllm.v1.worker.gpu.spec_decode.depth_policy import depth_policy_requested
+ from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+ 
+ logger = init_logger(__name__)
+ 
++# dsv41 patch 0066 (21.10.2026), both off by default (unset: every line below is inert, the speculator runs as before):
++# VLLM_DSV41_MARKOV_FUSED=1: the greedy local-argmax Markov loop (VLLM_DSPARK_LOCAL_ARGMAX=1) in fused launches,
++#   bias -> chunk maxima -> one all-gather -> pick, instead of ~13 kernels a step (ops/markov_step.py). Same drafts.
++# VLLM_DSV41_MARKOV_TRIM=1 (or a comma list of step counts): the Markov loop only as deep as the next step verifies.
++#   The scheduler's next draft count (SchedulerOutput.num_spec_tokens_to_schedule: dynamic schedule + the 0047 window,
++#   2..5) reaches the speculator through gpu_worker.py; under async scheduling no request verifies more drafts than
++#   that next step. A FULL graph holds a fixed loop, so the DSpark graphs are captured once more for each shorter
++#   depth (1: VLLM_DSV41_AK_MIN .. k-1) and replayed by depth; the backbone, the head and the drafts of the steps that
++#   run are those of the full graph, the confidences past the depth are 0 (the depth policy cannot pick rows the
++#   window does not have). With the switch on, the 12 never-dispatched DSpark graphs of the 0047 widths (uniform 2-4
++#   tokens a request: the drafter always dispatches 5) are not captured, so the graph count stays the same.
++_DSV41_MK_FUSED = os.environ.get("VLLM_DSV41_MARKOV_FUSED", "0") == "1"
++_DSV41_MK_TRIM = os.environ.get("VLLM_DSV41_MARKOV_TRIM", "0").strip()
++
++
++def dsv41_trim_steps(spec: str, num_steps: int, ak_min: int) -> list[int]:
++    """Shorter Markov depths to capture for VLLM_DSV41_MARKOV_TRIM=spec: "1" = ak_min .. num_steps-1 (at least 1),
++    a comma list = those depths below num_steps, "" / "0" = none."""
++    spec = (spec or "").strip().lower()
++    if spec in ("", "0", "off"):
++        return []
++    if spec in ("1", "on"):
++        return list(range(max(1, ak_min), num_steps))
++    out = set()
++    for x in spec.split(","):
++        x = x.strip()
++        if x:
++            k = int(x)
++            if 1 <= k < num_steps:
++                out.add(k)
++    return sorted(out)
++
+ 
+ # Patch 0055 (VLLM_DSV41_HYBRID_DRAFT=1, default off; needs draft_sample_method=probabilistic): only requests in the
+ # full-window regime of 0047 (scheduled drafts == the batch's k, i.e. accepted-draft average >= VLLM_DSV41_AK_HI: code,
+@@ -116,6 +150,12 @@
+         # patch 0055: per request state, True = draft by sampling (full-window regime), False = greedy
+         self._hybrid = os.environ.get("VLLM_DSV41_HYBRID_DRAFT", "0") == "1"
+         self._sampled_mode = torch.zeros(self.max_num_reqs, dtype=torch.bool, device=device)
++        # patch 0066: fused Markov loop (decided in load_draft_model), trimmed depths and their graph managers
++        self._mk_fused = False
++        self._trim_steps: list[int] = []
++        self._trim_attr: dict[int, str] = {}
++        self._next_drafts: int | None = None
++        self._draft_steps_now = self.num_speculative_steps
+ 
+     def load_draft_model(
+         self,
+@@ -158,8 +198,105 @@
+         )
+         if self._local_argmax:
+             logger.info("DSpark: greedy drafts argmax per vocabulary shard (local argmax)")
++        # patch 0066: both need the greedy local-argmax loop (no draft logits, no top-k candidates)
++        self._mk_fused = _DSV41_MK_FUSED and self._local_argmax
++        if _DSV41_MK_FUSED and not self._mk_fused:
++            logger.warning("DSpark: VLLM_DSV41_MARKOV_FUSED=1 ignored (needs the local-argmax greedy loop)")
++        self._trim_steps = []
++        if _DSV41_MK_TRIM not in ("", "0"):
++            steps = dsv41_trim_steps(
++                _DSV41_MK_TRIM,
++                self.num_speculative_steps,
++                int(os.environ.get("VLLM_DSV41_AK_MIN", "2")),
++            )
++            async_sched = getattr(self.vllm_config.scheduler_config, "async_scheduling", False)
++            if not self._local_argmax:
++                logger.warning("DSpark: VLLM_DSV41_MARKOV_TRIM ignored (needs the local-argmax greedy loop)")
++            elif async_sched is not True:
++                # the synchronous scheduler takes every returned draft, not num_spec_tokens_to_schedule
++                logger.warning("DSpark: VLLM_DSV41_MARKOV_TRIM ignored (needs async scheduling)")
++            else:
++                self._trim_steps = steps
++                logger.info(
++                    "DSpark: Markov loop trimmed to the next step's draft count (patch 0066), "
++                    "extra graphs for depths %s", steps,
++                )
++        if self._mk_fused:
++            logger.info("DSpark: fused Markov loop (patch 0066, VLLM_DSV41_MARKOV_FUSED=1)")
+         return model
+ 
++    # --- dsv41 patch 0066: trimmed Markov loop ------------------------------------------------------------------
++
++    def dsv41_set_next_drafts(self, num_drafts: int) -> None:
++        """gpu_worker.py, before each step: the scheduler's draft count for the next step (VLLM_DSV41_MARKOV_TRIM)."""
++        self._next_drafts = int(num_drafts)
++
++    def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
++        super().init_cudagraph_manager(cudagraph_mode)
++        self._trim_attr = {}
++        mgr = self.query_cudagraph_manager
++        if not self._trim_steps or mgr is None or mgr.cudagraph_mode == CUDAGraphMode.NONE:
++            return
++        q = self.num_query_per_req
++
++        def dispatched_only(m: DFlashCudaGraphManager) -> None:
++            # the speculator always dispatches uniform_token_count = num_query_per_req (dflash propose)
++            for mode in list(m._capture_descs):
++                m._capture_descs[mode] = [
++                    d
++                    for d in m._capture_descs[mode]
++                    if d.cg_mode != CUDAGraphMode.FULL or d.uniform_token_count == q
++                ]
++
++        dispatched_only(mgr)
++        for k in self._trim_steps:
++            m = DFlashCudaGraphManager(
++                self.vllm_config, self.device, mgr.cudagraph_mode, decode_query_len=q
++            )
++            dispatched_only(m)
++            # a direct attribute, as query_cudagraph_manager: profile_cudagraph_memory finds and drops it
++            name = f"query_cudagraph_manager_s{k}"
++            setattr(self, name, m)
++            self._trim_attr[k] = name
++
++    def capture(self) -> None:
++        super().capture()
++        for k in sorted(self._trim_attr):
++            m = getattr(self, self._trim_attr[k], None)
++            if m is None:
++                continue
++            m.capture(
++                functools.partial(self._generate_draft, steps=k),
++                self.input_buffers,
++                self.block_tables,
++                self.attn_groups,
++                self.kv_cache_config,
++                self.max_model_len,
++                causal=self._group_causal,
++                precompute_context_kv=lambda num_reqs: self._precompute_context_kv(
++                    0, self._num_graph_context_tokens(num_reqs)
++                ),
++                progress_bar_desc=f"Capturing dspark CUDA graphs ({k} Markov steps)",
++            )
++
++    def _trim_manager(self, steps: int) -> tuple[int, DFlashCudaGraphManager] | None:
++        """The captured variant with the fewest Markov steps >= steps, or None (the full graph)."""
++        for k in sorted(self._trim_attr):
++            if k >= steps:
++                m = getattr(self, self._trim_attr[k], None)
++                if m is not None:
++                    return k, m
++        return None
++
++    def _replay_draft_graph(self, batch_desc) -> None:
++        steps = self._draft_steps_now
++        if steps < self.num_speculative_steps and self._trim_attr:
++            hit = self._trim_manager(steps)
++            if hit is not None and batch_desc in hit[1].graphs:
++                hit[1].run_fullgraph(batch_desc)
++                return
++        super()._replay_draft_graph(batch_desc)
++
+     def _dsv41_cap(self, num_reqs: int) -> int:
+         for lo, hi, k in self.speculative_config.num_speculative_tokens_per_batch_size or ():
+             if lo <= num_reqs <= hi:
+@@ -167,6 +304,15 @@
+         return self.num_speculative_steps
+ 
+     def propose(self, input_batch, *args, **kwargs):
++        if self._trim_steps:
++            # patch 0066: this step's drafts serve the next step, which verifies at most the scheduler's count;
++            # dummy / profile runs and a missing count (never set) keep the full loop
++            nxt, self._next_drafts = self._next_drafts, None
++            n_spec = self.num_speculative_steps
++            if kwargs.get("dummy_run", False) or nxt is None:
++                self._draft_steps_now = n_spec
++            else:
++                self._draft_steps_now = max(1, min(nxt, n_spec))
+         if self._hybrid and self.draft_logits is not None:
+             # patch 0055: this step's window per request decides the next block's draft mode (0047 gives the full
+             # window exactly to requests whose accepted-draft average is >= AK_HI, and to new ones)
+@@ -239,13 +385,17 @@
+         )
+         return out
+ 
+-    def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
++    def _sample_sequential(
++        self, num_reqs: int, head_hidden: torch.Tensor, steps: int | None = None
++    ) -> None:
+         if self._draft_topk is not None:
+             self._sample_sequential_topk(num_reqs, head_hidden)
+             return
+ 
+         # Sequential Markov sampling over the backbone's output hidden states.
+         n_spec = self.num_speculative_steps
++        # patch 0066: steps < n_spec only from a trimmed graph (local argmax); drafts past it are never verified
++        steps = n_spec if steps is None else steps
+         num_sample = num_reqs * n_spec
+         # Per-(req, position) head hidden, ordered (req, step).
+         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+@@ -258,6 +408,20 @@
+         vocab_size = base_logits.shape[-1]
+         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
+ 
++        if self._mk_fused:
++            # patch 0066: the same drafts from fused launches; returns the Markov embeddings [n, n_spec, rank]
++            embeds = self.model.draft_loop_local_fused(
++                base_logits,
++                self.input_buffers.input_ids,
++                self._anchor_idx[:num_reqs],
++                self.draft_tokens,
++                steps,
++                self.max_num_reqs,
++            )
++            if self.use_confidence_head:
++                self._write_confidence(num_reqs, sample_hidden, embeds.flatten(0, 1), steps)
++            return
++
+         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
+         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
+         confidence_markov_embeds = []
+@@ -266,7 +430,7 @@
+         # read via the precomputed persistent index (fixed buffer for capture).
+         prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+ 
+-        for i in range(n_spec):
++        for i in range(steps):
+             # Sequential stage: Markov bias from the previously sampled token.
+             markov_embed = self.model.markov_embed(prev)
+             if self.use_confidence_head:
+@@ -290,13 +454,31 @@
+             prev = draft_sampled_i
+ 
+         if self.use_confidence_head:
+-            confidence = self.model.compute_confidence(
++            if steps < n_spec:
++                # patch 0066: the confidence head keeps its n_spec rows a request (same GEMM shape, so the rows
++                # that ran keep their bits); the padded rows are zeroed in _write_confidence
++                confidence_markov_embeds += [confidence_markov_embeds[-1]] * (n_spec - steps)
++            self._write_confidence(
++                num_reqs,
+                 sample_hidden,
+                 torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
++                steps,
+             )
+-            self.draft_token_confidence_probs[:num_reqs] = confidence.view(
+-                num_reqs, n_spec
+-            )
++
++    def _write_confidence(
++        self,
++        num_reqs: int,
++        sample_hidden: torch.Tensor,
++        markov_embeds: torch.Tensor,
++        steps: int,
++    ) -> None:
++        n_spec = self.num_speculative_steps
++        confidence = self.model.compute_confidence(sample_hidden, markov_embeds)
++        self.draft_token_confidence_probs[:num_reqs] = confidence.view(num_reqs, n_spec)
++        if steps < n_spec:
++            # patch 0066: positions past the next step's window have no draft: confidence 0, so the depth policy
++            # never prices them (survival 0 adds no expected token, a wider row costs more)
++            self.draft_token_confidence_probs[:num_reqs, steps:] = 0.0
+ 
+     def _sample_sequential_topk(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+         """Apply the sequential Markov head only to top-k base-logit candidates.
+@@ -355,9 +537,11 @@
+         slot_mappings: dict[str, torch.Tensor] | None,
+         num_tokens_across_dp: torch.Tensor | None,
+         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
++        steps: int | None = None,
+     ) -> None:
+         # Full draft step (captured under CUDA graph): parallel backbone forward
+         # then sequential Markov sampling over its hidden state outputs.
++        # patch 0066: steps = the Markov depth a trimmed graph is captured with (None: num_speculative_steps)
+         head_hidden = self._run_model(
+             num_tokens_padded,
+             attn_metadata,
+@@ -365,4 +549,4 @@
+             num_tokens_across_dp,
+             cudagraph_runtime_mode,
+         )
+-        self._sample_sequential(num_reqs, head_hidden)
++        self._sample_sequential(num_reqs, head_hidden, steps)
+--- a/vllm/models/deepseek_v41/nvidia/dspark.py
++++ b/vllm/models/deepseek_v41/nvidia/dspark.py
+@@ -70,6 +70,21 @@
+ # fp4 experts register ``.weight_scale``; block-fp8 experts ``.weight_scale_inv``.
+ _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
+ 
++# dsv41 patch 0066: the out-of-tree EXL3 plugin's drafter L2 prefetch chain (vllm_exl3_moe.l2pf_draft,
++# VLLM_DSV41_DRAFT_L2PF), None = plugin missing or the switch off (then the forward is unchanged)
++_l2pf_draft_mod = None
++
++
++def _l2pf_draft():
++    global _l2pf_draft_mod
++    if _l2pf_draft_mod is None:
++        try:
++            from vllm_exl3_moe import l2pf_draft as m
++        except ImportError:
++            m = None
++        _l2pf_draft_mod = m if (m is not None and m.enabled()) else False
++    return _l2pf_draft_mod or None
++
+ 
+ class DSparkDeepseekV4Model(nn.Module):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+@@ -156,6 +171,9 @@
+                 config.hidden_size + config.dspark_markov_rank,
+                 prefix=maybe_prefix(prefix, "confidence_head"),
+             )
++        # patch 0066: wo_a / mHC mix tensors registered with the drafter L2 chain on the first forward (all weight
++        # post-processing, e.g. Marlin repacking, is done by then)
++        self._l2pf_registered = False
+ 
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.embed_tokens(input_ids)
+@@ -229,6 +247,10 @@
+         # Expand to hc_mult copies for hyper-connections ([T, H] -> [T, hc, H]).
+         hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+ 
++        l2pf_draft = _l2pf_draft()
++        if l2pf_draft is not None and not self._l2pf_registered:
++            l2pf_draft.register_drafter(self, self.num_hidden_layers)
++            self._l2pf_registered = True
+         residual = post_mix = res_mix = pre_mix = None
+         for layer in self.layers:
+             hidden_states, residual, post_mix, res_mix, pre_mix, _ = layer(
+@@ -241,6 +263,8 @@
+                 residual,
+                 mega_gate_metadata=mega_gate_metadata,
+             )
++        if l2pf_draft is not None:
++            l2pf_draft.join()           # patch 0066: the drafter graph ends with no prefetch in flight
+         hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
+         # Collapse the hc copies with the pre-mix from the last layer's FFN
+         # mixes — the mix the reference forward_head applies (hc_pre with the
+@@ -322,6 +346,9 @@
+         # (base logits + Markov bias) and all-gather only (value, index) per row, instead of
+         # all-gathering the full draft logits and adding a full-vocab bias on every rank.
+         self._markov_cache_local = None
++        # dsv41 patch 0066 (VLLM_DSV41_MARKOV_FUSED=1): the local-argmax loop in fused launches
++        # (ops/markov_step.py), buffers made on the first (eager) call
++        self._fused_loop = None
+ 
+     # --- Hooks used by the speculator -------------------------------------
+ 
+@@ -455,6 +482,49 @@
+         best = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
+         return gathered[:, :, 1].gather(dim=-1, index=best).squeeze(-1).to(torch.int64)
+ 
++    def draft_loop_local_fused(
++        self,
++        base_local: torch.Tensor,
++        input_ids: torch.Tensor,
++        anchor_idx: torch.Tensor,
++        draft_tokens: torch.Tensor,
++        steps: int,
++        max_rows: int,
++    ) -> torch.Tensor:
++        """dsv41 patch 0066: greedy drafts 0 .. steps-1 of every request, the tokens draft_argmax_local picks step by
++        step (same bias kernel, same bf16 sums, same tie order; ops/markov_step.py), written into draft_tokens.
++        base_local: [n, num_steps, shard] this rank's base logits. Returns the Markov embeddings [n, num_steps, rank]
++        (position i: the token before draft i), the confidence head's input; positions >= steps are stale."""
++        assert self._markov_cache_local is not None
++        if self._fused_loop is None:
++            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
++                raise RuntimeError("fused Markov loop: first call inside a CUDA graph capture (buffers not made)")
++            from .ops.markov_step import FusedMarkovLoop
++
++            lo, hi = self._vocab_shard()
++            self._fused_loop = FusedMarkovLoop(
++                self._markov_cache_local,
++                self.model.markov_head.markov_w1.weight.data,
++                lo,
++                hi - lo,
++                self.lm_head.tp_size,
++                max_rows,
++                base_local.shape[1],
++                base_local.dtype,
++            )
++            logger.info(
++                "DSpark: fused Markov loop (patch 0066), vocabulary columns %d-%d, %d chunks a row",
++                lo, hi, self._fused_loop.chunks,
++            )
++        return self._fused_loop.run(
++            base_local,
++            input_ids,
++            anchor_idx,
++            draft_tokens,
++            steps,
++            lambda t: tensor_model_parallel_all_gather(t, dim=-1),
++        )
++
+     def apply_markov_bias_gathered(
+         self,
+         markov_embed: torch.Tensor,
+--- a/vllm_exl3_moe/config.py
++++ b/vllm_exl3_moe/config.py
+@@ -218,7 +218,10 @@
+             elif dm is not None and dm[1] != "attn.wo_a":     # DSpark drafter layers (index >= num_hidden_layers)
+                 k = self.exl3_settings.drafter_k(dm[1])
+                 if k:
+-                    return Exl3DenseLinearMethod(dm[1], k, layer_idx=dm[0], prefetch=False)
++                    method = Exl3DenseLinearMethod(dm[1], k, layer_idx=dm[0], prefetch=False)
++                    from . import l2pf_draft                   # dsv41 patch 0066: the drafter's own L2 chain
++                    method.draft_pf = l2pf_draft.enabled()
++                    return method
+             elif prefix.endswith("main_proj"):                 # the drafter's context combiner (replicated)
+                 k = self.exl3_settings.drafter_k("main_proj")
+                 if k:
+--- a/vllm_exl3_moe/dense.py
++++ b/vllm_exl3_moe/dense.py
+@@ -33,7 +33,7 @@
+ from vllm.model_executor.layers.linear import LinearMethodBase, ReplicatedLinear, RowParallelLinear
+ from vllm.model_executor.utils import set_weight_attrs
+ 
+-from . import l2pf
++from . import l2pf, l2pf_draft
+ from .hostcopy import copy_from_host
+ 
+ logger = init_logger(__name__)
+@@ -144,6 +144,9 @@
+         self.k = int(k)
+         self.layer_idx = layer_idx
+         self.prefetch = prefetch          # backbone modules join l2pf's per-layer chain; the drafter's do not
++        # dsv41 patch 0066: drafter modules join l2pf_draft's chain instead (config.py sets it when
++        # VLLM_DSV41_DRAFT_L2PF is on; False = as before)
++        self.draft_pf = False
+ 
+     # ----------------------------------------------------------------------------------------------- weights
+     def create_weights(self, layer: torch.nn.Module, input_size_per_partition: int, output_partition_sizes: list[int],
+@@ -333,6 +336,8 @@
+             layer.grouped_bmm = grouped_bmm
+             if self.prefetch:
+                 l2pf.register(self.layer_idx, self.module, mrow.trellis if mrow is not None else [])
++            elif self.draft_pf:                       # patch 0066
++                l2pf_draft.register(self.layer_idx, self.module, mrow.trellis if mrow is not None else [])
+             return
+         if getattr(layer, "exl3_flat", None):
+             in_f = layer.exl3_shape[0]
+@@ -345,6 +350,9 @@
+             layer._mrow = self._mrow_group([(t, su, sv, 0, c) for (t, su, sv), c in zip(parts, col)])
+             if self.prefetch:
+                 l2pf.register(self.layer_idx, self.module, layer._mrow.trellis if layer._mrow is not None else [])
++            elif self.draft_pf:                       # patch 0066
++                l2pf_draft.register(self.layer_idx, self.module,
++                                    layer._mrow.trellis if layer._mrow is not None else [])
+             return
+         in_f, out_f = layer.exl3_shape
+         if layer.exl3_n == 1:
+@@ -357,6 +365,8 @@
+                                             for i in range(layer.exl3_n)])
+         if self.prefetch:
+             l2pf.register(self.layer_idx, self.module, layer._mrow.trellis if layer._mrow is not None else [])
++        elif self.draft_pf:                           # patch 0066
++            l2pf_draft.register(self.layer_idx, self.module, layer._mrow.trellis if layer._mrow is not None else [])
+ 
+     def _mrow_group(self, parts):
+         """One exl3_mrow launch for the module's matrices on one input, or None (disabled, unsupported K or shape)."""
+@@ -384,6 +394,8 @@
+             y = mrow(x2, y).reshape(*x.shape[:-1], -1)
+             if self.prefetch and self.module in _L2PF_AFTER:
+                 l2pf.point(_L2PF_AFTER[self.module], self.layer_idx, rows)
++            elif self.draft_pf and self.module == "attn.wq_b":   # patch 0066: drafter wo_a / wo_b into L2
++                l2pf_draft.point("attn", self.layer_idx, rows)
+             return y if bias is None else y + bias
+         xs = x.reshape(-1, x.shape[-1])
+         sc = None
+--- a/vllm_exl3_moe/moe_method.py
++++ b/vllm_exl3_moe/moe_method.py
+@@ -35,7 +35,7 @@
+ from vllm.utils.torch_utils import aux_stream
+ 
+ from . import kernels as K
+-from . import l2pf
++from . import l2pf, l2pf_draft
+ from .bank import TENSOR_NAMES, Exl3Bank
+ from .forward import routed_moe_forward
+ from .plan import CODEBOOK_MCG, CODEBOOK_MUL1, PROJ_DOWN, PROJ_GATE, PROJ_UP, Exl3MoEPlan
+@@ -288,6 +288,7 @@
+             par=getattr(self, "par", None), prefill_wait=aux_stream(), smoe=getattr(self, "smoe", None),
+             pad=_padding_rows(x.shape[0]))
+         l2pf.point("next", self.layer_idx, x.shape[0])     # the next layer's attention weights into L2 (l2pf.py)
++        l2pf_draft.point("next", self.layer_idx, x.shape[0])   # dsv41 patch 0066: drafter blocks only
+         return out
+ 
+     def _attach_shared(self, shared_experts) -> bool:
+@@ -348,6 +349,7 @@
+                                     self.act_limit, float(moe.routed_scaling_factor), _padding_rows(m), shared,
+                                     None if bvl is None else bvl.data, tok, sent)
+         l2pf.point("next", self.layer_idx, m)
++        l2pf_draft.point("next", self.layer_idx, m)            # dsv41 patch 0066: drafter blocks only
+         if getattr(moe, "reduce_results", True) and self.tp_size > 1:
+             from vllm.distributed import tensor_model_parallel_all_reduce
+             out = tensor_model_parallel_all_reduce(out)
+@@ -398,6 +400,7 @@
+             out = self.smoe(x, topk_ids, topk_weights, self.perm, self.act_limit, _padding_rows(m), shared=True)
+             shared_experts._output[shared_experts._output_idx] = torch.zeros_like(out)
+             l2pf.point("next", self.layer_idx, m)
++            l2pf_draft.point("next", self.layer_idx, m)        # dsv41 patch 0066: drafter blocks only
+             return out
+         shared_experts(shared_experts_input if shared_experts_input is not None else x,
+                        SharedExpertsOrder.MK_INTERNAL_OVERLAPPED)
+--- /dev/null
++++ b/vllm/models/deepseek_v41/nvidia/ops/markov_step.py
+@@ -0,0 +1,192 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""dsv41 patch 0066: the DSpark Markov loop's greedy steps in three launches each (VLLM_DSV41_MARKOV_FUSED=1).
++
++With VLLM_DSPARK_LOCAL_ARGMAX=1 a draft step (dspark.py draft_argmax_local) ran ~13 kernels: the Markov embedding
++lookup, the Markov bias (markov_cache.py), the bf16 add of base logits and bias, torch.max over the rank's 64,640
++vocabulary columns (15 us of a ~46 us step in the F15 trace), four casts and a stack, the (value, index) all-gather,
++argmax over the ranks, gather, cast and the draft column write. Here a step is:
++  1. markov_bias_rows: the unchanged bias kernel on the same inputs (the same bias bits; cached rows are copies),
++  2. _partial_kernel: base + bias rounded to the add's dtype as torch rounds it (fp32 sum, round to nearest even),
++     then per CHUNK columns the maximum and its first column, kept as an order key: torch.max's order (GreaterOrNan:
++     NaN above everything, -0.0 equal to +0.0, ties to the lower index),
++  3. one all-gather of every rank's chunk maxima ([rows, 2 * chunks] int32 a rank) instead of the (value, index) pair,
++  4. _pick_kernel: the first maximum over (rank, chunk), rank-major. That is torch.max per rank followed by the argmax
++     over the ranks (lower rank on ties, a NaN wins), so the same token. It writes the draft column, the previous token
++     of the next step and that token's Markov embedding (a copy of its markov_w1 row) for the next step's bias and for
++     the confidence head.
++Step 0 starts with _first_kernel (anchor token and its embedding, one launch instead of an index and a lookup).
++The drafts are the unfused path's bit for bit. Drafts only propose: a different draft could only change the tokens a
++round, never a reply (the target's verification decides every emitted token).
++"""
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++from .markov_cache import MarkovBiasCache, markov_bias_rows
++
++CHUNK = 2048            # columns a partial program reduces (64,640-column shard: 32 programs a row)
++
++
++@triton.jit
++def _first_kernel(ids_ptr, anchor_ptr, w1_ptr, w1_stride, prev_ptr, emb_ptr, emb_stride, R, RP: tl.constexpr):
++    """Step 0: the anchor token (input id at the request's first query slot) and its Markov embedding."""
++    b = tl.program_id(0)
++    tok = tl.load(ids_ptr + tl.load(anchor_ptr + b)).to(tl.int64)
++    tl.store(prev_ptr + b, tok)
++    r = tl.arange(0, RP)
++    rm = r < R
++    tl.store(emb_ptr + b * emb_stride + r, tl.load(w1_ptr + tok * w1_stride + r, mask=rm), mask=rm)
++
++
++@triton.jit
++def _partial_kernel(
++    base_ptr,
++    base_stride,
++    bias_ptr,
++    bias_stride,
++    part_ptr,
++    part_stride,
++    V,
++    lo,
++    ROUND: tl.constexpr,      # 1: round the sum to bf16, 2: to fp16, 0: keep fp32 (torch's result dtype of the add)
++    CHUNK_N: tl.constexpr,
++):
++    b = tl.program_id(0)
++    c = tl.program_id(1)
++    cols = c * CHUNK_N + tl.arange(0, CHUNK_N)
++    m = cols < V
++    row = b.to(tl.int64)
++    x = tl.load(base_ptr + row * base_stride + cols, mask=m, other=0.0).to(tl.float32)
++    y = tl.load(bias_ptr + row * bias_stride + cols, mask=m, other=0.0).to(tl.float32)
++    s = x + y
++    if ROUND == 1:
++        s = s.to(tl.bfloat16).to(tl.float32)
++    elif ROUND == 2:
++        s = s.to(tl.float16).to(tl.float32)
++    s = tl.where(s == 0.0, 0.0, s)                       # -0.0 -> +0.0: torch.max sees them equal
++    bits = tl.cast(s, tl.int32, bitcast=True)
++    key = bits ^ ((bits >> 31) & 0x7FFFFFFF)             # monotone in the float value (signed int order)
++    key = tl.where((bits & 0x7FFFFFFF) > 0x7F800000, 2147483647, key)    # NaN: above everything
++    key = tl.where(m, key, -2147483648)
++    kmax = tl.max(key, axis=0)
++    first = tl.min(tl.where(key == kmax, cols, 2147483647), axis=0)
++    tl.store(part_ptr + b * part_stride + 2 * c, kmax)
++    tl.store(part_ptr + b * part_stride + 2 * c + 1, first + lo)
++
++
++@triton.jit
++def _pick_kernel(
++    g_ptr,
++    g_stride,
++    N,                          # tp ranks x chunks
++    draft_ptr,
++    draft_stride,
++    col,
++    prev_ptr,
++    w1_ptr,
++    w1_stride,
++    emb_ptr,
++    emb_stride,
++    R,
++    WRITE_EMB: tl.constexpr,
++    NP: tl.constexpr,
++    RP: tl.constexpr,
++):
++    b = tl.program_id(0)
++    p = tl.arange(0, NP)
++    pm = p < N
++    key = tl.load(g_ptr + b * g_stride + 2 * p, mask=pm, other=-2147483648)
++    kmax = tl.max(key, axis=0)
++    pos = tl.min(tl.where((key == kmax) & pm, p, NP), axis=0)
++    tok = tl.load(g_ptr + b * g_stride + 2 * pos + 1).to(tl.int64)
++    tl.store(draft_ptr + b * draft_stride + col, tok)
++    tl.store(prev_ptr + b, tok)
++    if WRITE_EMB:
++        r = tl.arange(0, RP)
++        rm = r < R
++        tl.store(emb_ptr + b * emb_stride + r, tl.load(w1_ptr + tok * w1_stride + r, mask=rm), mask=rm)
++
++
++def round_mode(base_dtype: torch.dtype, bias_dtype: torch.dtype) -> int | None:
++    """The _partial_kernel ROUND for torch's add of these dtypes, None when unsupported."""
++    out = torch.promote_types(base_dtype, bias_dtype)
++    return {torch.bfloat16: 1, torch.float16: 2, torch.float32: 0}.get(out)
++
++
++class FusedMarkovLoop:
++    """Buffers and launches of the fused greedy Markov loop for one rank's vocabulary shard [lo, lo + vocab)."""
++
++    def __init__(
++        self,
++        cache: MarkovBiasCache,
++        w1: torch.Tensor,
++        lo: int,
++        vocab: int,
++        tp: int,
++        max_rows: int,
++        num_steps: int,
++        base_dtype: torch.dtype,
++    ):
++        mode = round_mode(base_dtype, cache.out_dtype)
++        if mode is None:
++            raise ValueError(f"fused Markov loop: base {base_dtype} + bias {cache.out_dtype} not supported")
++        if w1.dim() != 2 or w1.stride(1) != 1:
++            raise ValueError("fused Markov loop: markov_w1 must be a row-major [vocab, rank] matrix")
++        self.cache = cache
++        self.w1 = w1
++        self.lo = int(lo)
++        self.vocab = int(vocab)
++        self.tp = int(tp)
++        self.round = mode
++        self.num_steps = int(num_steps)
++        self.chunks = triton.cdiv(self.vocab, CHUNK)
++        self.rank = int(w1.shape[1])
++        dev = w1.device
++        self.prev = torch.zeros(max_rows, dtype=torch.int64, device=dev)
++        # [req, position, rank]: position i holds the embedding of the token before draft i (anchor, d0, d1, ...),
++        # the layout torch.stack(confidence_markov_embeds, dim=1) gives the confidence head
++        self.emb = torch.zeros(max_rows, self.num_steps, self.rank, dtype=w1.dtype, device=dev)
++        self.bias = torch.empty(max_rows, cache.w2.shape[0], dtype=cache.out_dtype, device=dev)
++        self.part = torch.zeros(max_rows, 2 * self.chunks, dtype=torch.int32, device=dev)
++        self._np = triton.next_power_of_2(self.tp * self.chunks)
++        self._rp = triton.next_power_of_2(self.rank)
++
++    def run(
++        self,
++        base_logits: torch.Tensor,
++        input_ids: torch.Tensor,
++        anchor_idx: torch.Tensor,
++        draft_tokens: torch.Tensor,
++        steps: int,
++        gather,
++    ) -> torch.Tensor:
++        """Greedy drafts 0 .. steps-1 into draft_tokens[:n, :steps] (base_logits: [n, num_steps, >= vocab], this
++        rank's shard); returns the Markov embeddings [n, num_steps, rank] (positions >= steps hold stale rows)."""
++        n = base_logits.shape[0]
++        assert base_logits.shape[1] == self.num_steps and base_logits.stride(2) == 1
++        assert 1 <= steps <= self.num_steps and draft_tokens.stride(1) == 1
++        if n == 0:
++            return self.emb[:0]
++        c = self.cache
++        _first_kernel[(n,)](
++            input_ids, anchor_idx, self.w1, self.w1.stride(0), self.prev, self.emb, self.emb.stride(0),
++            self.rank, RP=self._rp,
++        )
++        for i in range(steps):
++            markov_bias_rows(self.prev[:n], c.slot_of_token, c.cache, self.emb[:n, i], c.w2, self.bias[:n])
++            base_i = base_logits[:, i]
++            _partial_kernel[(n, self.chunks)](
++                base_i, base_i.stride(0), self.bias, self.bias.stride(0), self.part, self.part.stride(0),
++                self.vocab, self.lo, ROUND=self.round, CHUNK_N=CHUNK, num_warps=4,
++            )
++            g = gather(self.part[:n])                           # [n, tp * 2 * chunks], rank-major
++            nxt = i + 1 < steps
++            emb_next = self.emb[:, i + 1] if nxt else self.emb[:, 0]
++            _pick_kernel[(n,)](
++                g, g.stride(0), self.tp * self.chunks, draft_tokens, draft_tokens.stride(0), i, self.prev,
++                self.w1, self.w1.stride(0), emb_next, self.emb.stride(0), self.rank,
++                WRITE_EMB=nxt, NP=self._np, RP=self._rp, num_warps=1,
++            )
++        return self.emb[:n]
+--- /dev/null
++++ b/vllm_exl3_moe/l2pf_draft.py
+@@ -0,0 +1,144 @@
++# SPDX-License-Identifier: Apache-2.0
++"""dsv41 patch 0066: paced L2 prefetch inside the DSpark drafter pass (VLLM_DSV41_DRAFT_L2PF, default off).
++
++l2pf.py's chain serves the backbone only: the drafter's dense modules are built with prefetch=False (config.py),
++because a drafter layer (index >= num_hidden_layers) in that chain would move its "last layer", so the backbone's last
++MoE would fork a prefetch of drafter weights that nothing inside the captured target forward joins (a graph that ends
++with side-stream work does not capture), and the drafter's own pass is a separate graph. This module is a second,
++independent chain over the drafter's three blocks, with the kernel, chunking and pacing of l2pf.py (csrc/exl3_l2pf.cu,
++TensorFold's design): a point first joins the previous prefetch, then forks the next one on its own side stream; the
++last block's "next" point and the end of the drafter forward join without forking, so the drafter graph ends with
++nothing in flight. TensorFold's batched drafter graph forks the same way (dspark.py BatchDraftGraph, l2_fork).
++
++Points (comma list in VLLM_DSV41_DRAFT_L2PF):
++  next  after block j's MoE -> block j+1's mHC attention mix (EXL3_L2PF_HC=1), fused wq_a+wkv and wq_b. Window: the
++        MoE all-reduce, the mHC boundary and block j+1's hc_pre (no DRAM reader of size runs there; ~60-100 us at one
++        stream in the F15 trace).
++  attn  after block j's wq_b -> block j's wo_a (FP8 Marlin, 4 head groups) and wo_b. Window: Q/KV insert and the sparse
++        attention (~22 us); the rest streams under the wo_a GEMMs, which read the same bytes in the same order.
++Why it does not compete with the target MoE: the drafter graph runs after the target forward and the sampler on the
++same stream, its forks wait for the drafter's own preceding kernels, and everything is joined before the drafter graph
++ends; the target's MoE readers (patch 0063's 4-stream slowdown) never run at the same time. Inside the drafter the
++"next" fork starts after the drafter MoE (it waits for it), so it does not share DRAM with the drafter's experts
++either. A prefetch writes nothing: every output keeps its bits.
++EXL3_DRAFT_L2PF_MAX_ROWS (default 16, l2pf.MAX_ROWS): drafter passes with more rows (4 streams = 20) prefetch nothing.
++Budget, pacing and delay: EXL3_L2PF_MB / EXL3_L2PF_RATE_GBPS / EXL3_L2PF_DELAY_NS as for the backbone chain.
++"""
++
++from __future__ import annotations
++
++import os
++
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++POINTS = {p for p in os.environ.get("VLLM_DSV41_DRAFT_L2PF", "0").replace(" ", "").split(",")
++          if p and p != "0"} & {"attn", "next"}
++MAX_ROWS = int(os.environ.get("EXL3_DRAFT_L2PF_MAX_ROWS") or 16)
++HC = os.environ.get("EXL3_L2PF_HC", "0") == "1"
++
++# What each point prefetches: (block offset, module) in the order the drafter reads them.
++PLAN = {
++    "attn": ((0, "attn.wo_a"), (0, "attn.wo_b")),
++    "next": ((1, "hc_attn_fn"),) * HC + ((1, "attn.fused_wqa_wkv"), (1, "attn.wq_b")),
++}
++
++_reg: dict[tuple[int, str], list[torch.Tensor]] = {}
++_first_layer = 1 << 30
++_last_layer = -1
++_stream: torch.cuda.Stream | None = None
++_pending = False
++_announced = False
++
++
++def enabled() -> bool:
++    return bool(POINTS)
++
++
++def register(layer: int, module: str, tensors) -> None:
++    """The weight tensors a drafter module streams, in the order its kernel reads them (largest first for FP8)."""
++    global _first_layer, _last_layer
++    if not enabled():
++        return
++    _reg[(layer, module)] = [t for t in tensors if t is not None and t.is_cuda and t.is_contiguous()]
++    _first_layer = min(_first_layer, layer)
++    _last_layer = max(_last_layer, layer)
++
++
++def register_drafter(model, first_layer: int) -> None:
++    """After the drafter's weights load (DSparkDeepseekV4ForCausalLM): each block's wo_a (FP8, not an EXL3 module,
++    so dense.py does not register it) and, with EXL3_L2PF_HC=1, its mHC attention mix. Blocks are numbered
++    first_layer + i, the layer index their EXL3 modules carry."""
++    if not enabled():
++        return
++    n = 0
++    for i, layer in enumerate(model.layers):
++        idx = first_layer + i
++        wo_a = getattr(getattr(layer, "attn", None), "wo_a", None)
++        if wo_a is not None:
++            ts = sorted((p.data for p in wo_a.parameters() if p.is_cuda), key=lambda t: -t.numel() * t.element_size())
++            register(idx, "attn.wo_a", ts)
++            n += 1
++        t = getattr(layer, "hc_attn_fn", None)
++        if HC and t is not None:
++            register(idx, "hc_attn_fn", [t.data])
++            n += 1
++    logger.info("dsv41 0066 drafter L2 prefetch: points %s, %d drafter tensors registered (blocks %d-%d), rows <= %d",
++                ",".join(sorted(POINTS)), n, first_layer, first_layer + len(model.layers) - 1, MAX_ROWS)
++
++
++def _ranges(layer: int, point: str) -> tuple[list[int], list[int]]:
++    from . import l2pf
++
++    ptrs, sizes, left = [], [], l2pf.BUDGET
++    for off, module in PLAN[point]:
++        for t in _reg.get((layer + off, module), ()):
++            n = min(t.numel() * t.element_size(), left) // 16 * 16
++            p = t.data_ptr()
++            if n <= 0 or p % 16:
++                continue
++            ptrs.append(p)
++            sizes.append(n)
++            left -= n
++            if left < 16:
++                break
++    return ptrs[:24], sizes[:24]                   # PMAX in csrc/exl3_l2pf.cu
++
++
++def join() -> None:
++    global _pending
++    if _pending:
++        torch.cuda.current_stream().wait_stream(_stream)
++        _pending = False
++
++
++def point(name: str, layer: int, rows: int) -> None:
++    """Prefetch point `name` after drafter block `layer` (a drafter pass with `rows` rows); no-op when off."""
++    global _stream, _pending, _announced
++    if not POINTS or layer < _first_layer:
++        return                                     # off, or a backbone layer (moe_method.py calls every MoE layer)
++    join()
++    if name not in POINTS or not 0 < rows <= MAX_ROWS:
++        return
++    if name == "next" and layer >= _last_layer:
++        return                                     # the last block: the drafter pass ends with nothing in flight
++    ptrs, sizes = _ranges(layer, name)
++    if not ptrs:
++        return
++    from . import l2pf
++
++    cur = torch.cuda.current_stream()
++    if _stream is None:
++        _stream = torch.cuda.Stream()
++    _stream.wait_stream(cur)
++    with torch.cuda.stream(_stream):
++        wave_ns = int(128 * l2pf.CHUNK / l2pf.RATE_GBPS) if l2pf.RATE_GBPS > 0 else 0
++        l2pf.ext().l2pf(ptrs, sizes, l2pf.CHUNK, 4, l2pf.DELAY_NS, wave_ns)
++    _pending = True
++    if not _announced:
++        _announced = True
++        logger.info("dsv41 0066 drafter L2 prefetch on: %d MiB a fork, %.0f GB/s pacing, %d tensors registered",
++                    l2pf.BUDGET >> 20, l2pf.RATE_GBPS, sum(len(v) for v in _reg.values()))

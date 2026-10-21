@@ -1,0 +1,158 @@
+dsv41 patch 0064 (21.10.2026): the routed experts of 33-63-row calls as exl3_smoe row chunks, without host syncs. In
+use (VLLM_EXL3_MOE_SPLIT_MAX_TOKENS=63, image v16 and later). Base: the plugin vllm_exl3_moe as in image v12
+(forward.py, smoe.py).
+Why: calls with more rows than the plugin's decode range (coop.rows_max = 32) and fewer than TensorFold's prompt
+kernels take (64) ran on exllamav3's prefill tiers, which read the expert counts back to the host once per layer:
+mixed steps under load (3 decode streams x 6 verify rows + 20-45 prompt tokens = 38-63 rows), short prompts and last
+prompt chunks. In the profile of 19.10. (4 streams) a 43-row mixed step took 706 ms (CPU 699 ms, ~320 ms of it blocked
+in the 40 copies; routed experts 175 ms), a 29-row prompt step on exl3_smoe 243 ms. Captured, the same sizes would take
+exl3_moe's atomic tier (arrival-order sums). exl3_smoe takes at most 42 rows in one call (MAX_SLOTS = 256 picks at
+top-k 6); a larger table would be a kernel change.
+How: VLLM_EXL3_MOE_SPLIT_MAX_TOKENS=N: a call with coop.rows_max < m <= N rows, bf16 input and an exl3_smoe layer runs
+its routed experts as exl3_smoe launches on row chunks of at most MAX_SLOTS // top_k = 42 rows, full chunks first, each
+writing its rows of one bf16 output (SmoeLayer.into). Eager and under capture (static grids from m, no host read).
+Calls of <= 32 rows are untouched (decode branch, moe_method.py, smoe.__call__ and the CUDA sources unchanged, so the
+JIT modules keep their hash); TensorFold keeps the eager calls of >= 64 rows it serves. The shared expert keeps its
+path on vLLM's aux stream; exl3_smoe has its own counters, so the chunks need no join with that stream.
+Bits: exl3_smoe computes every row on its own (separate rows of the mma fragments with a whole-K fp32 chain, per-row
+epilogues, a token's picks summed in pick order), so a row's output does not depend on its chunk and equals what the
+row gets in a decode step; deterministic run to run. Against v12, steps with 33..N rows now round as exl3_smoe does
+instead of exllamav3's tiers: T=0 texts whose prompt or last prompt chunk falls in the band can differ.
+Measured (21.10.2026, GB10, 2000 MHz, image v16 = v12 + 0064 together with EXL3_CPU_PIN=5-9,15-19, the plugin switch
+that pins every thread of the vLLM processes to the Cortex-X925 cores; two fresh starts, decode cells against the stored
+reference run of the production setup without both, kit_bench against that setup running in the same window):
+kit_bench sustained (4 streams, 90 s) 118.5 -> 129.1 tok/s (+8.9 %), repeated 128.7 (+9 % against the day's reference
+runs 117.8-118.5); concurrent 2 / 4 streams 73.5 / 118.3 -> 76.8 / 116.2 (concurrent 4 moved by +-4 % between two
+reference runs); cost per verify round -0.62 / -0.24 % (geometric mean, two runs); T=0 texts of two runs identical to
+each other and 7 of 8 identical to the reference, as expected for short prompts with 33-63 prefill rows (the JSON cell
+at T=0 wrote another text: tokens per round -16.7 % at -2.6 % ms per round, which takes the tok/s geometric mean to
+-2.6 / -3.1 %); corruption test (30K/100K, 2 each) 0 hits; lowest free memory under load 2,300 MiB head / 3,515 MiB
+worker. The shares of 0064 and of the pin were not measured separately.
+Switch: VLLM_EXL3_MOE_SPLIT_MAX_TOKENS=63 (0 / unset = off = v12; values >= 64 also take captured calls of >= 64 rows,
+never TensorFold's eager ones).
+
+--- a/vllm_exl3_moe/forward.py
++++ b/vllm_exl3_moe/forward.py
+@@ -7,6 +7,8 @@
+ Paths, chosen by batch rows m (static per CUDA-graph capture size):
+   0. m <= coop.rows_max and bf16 input with an exl3_smoe layer (smoe.py, VLLM_EXL3_MOE_SMOE, default on): our kernel,
+      every K group in one launch set (rot, gate/up, down), no side streams. Deterministic, no host sync.
++  0b. coop.rows_max < m <= VLLM_EXL3_MOE_SPLIT_MAX_TOKENS (dsv41 patch 0064, default off), bf16 input, exl3_smoe layer:
++     exl3_smoe on row chunks of <= 42 rows, eager or captured; no host sync, each row's bits as in one smoe call.
+   1. m <= coop.rows_max (decode, DSpark verify, every capture size): exl3_moe_coop per K group,
+      chained through sh_out. No sort, no host sync, deterministic.
+   2. capturing with m > coop.rows_max, or decode_kernel == "fused": exl3_moe per K group with
+@@ -19,6 +21,7 @@
+ from __future__ import annotations
+ 
+ import json
++import logging
+ import os
+ 
+ import torch
+@@ -47,6 +50,21 @@
+ _SMOE_CHECK = int(os.environ.get("VLLM_EXL3_MOE_SMOE_CHECK", "0") or 0)
+ _SMOE_CHECK_LOG = os.environ.get("VLLM_EXL3_MOE_SMOE_CHECK_LOG", "/root/.cache/smoe_check.jsonl")
+ _SMOE_CHECKED = [0]
++# VLLM_EXL3_MOE_SPLIT_MAX_TOKENS=N (dsv41 patch 0064, default 0 = off; 63 = every row count below TensorFold's prompt
++# path): a call with coop.rows_max < m <= N rows, bf16 input and an exl3_smoe layer runs its routed experts as
++# exl3_smoe launches on row chunks of at most smoe.MAX_SLOTS // top_k rows (42 at top_k 6), full chunks first, instead
++# of exllamav3's prefill tiers (_run_prefill_det: one host read of the expert counts a layer) or, under CUDA graph
++# capture, exl3_moe's atomic tier. exl3_smoe computes every row on its own (a run's rows are separate rows of the mma
++# fragments, each with a whole-K fp32 chain; the epilogues are per row and a token's picks are summed in pick order:
++# csrc/exl3_smoe.cu gu_item / down_item), so each row gets the bits one exl3_smoe call over all m rows would give, and
++# the chunks need no host read (graph-safe). Calls of <= coop.rows_max rows are not touched (the branch sits behind
++# the decode branch and needs m > rows_max). The shared expert keeps its path for m > rows_max (moe_method.py
++# _apply_with_shared: the runner, on vLLM's aux stream); exl3_smoe keeps its own counters, so no join with that stream
++# is needed (run_prefill's join guards exllamav3's shared locks buffer). Against exllamav3's tiers those steps' rows
++# get exl3_smoe's rounding, as in decode steps. TensorFold's prompt path (VLLM_EXL3_MOE_TF_PROMPT) keeps the eager
++# calls it serves (m >= tf_prompt.MIN_ROWS).
++_SPLIT_MAX = max(0, int(os.environ.get("VLLM_EXL3_MOE_SPLIT_MAX_TOKENS", "0") or 0))
++_SPLIT_LOGGED = [False]
+ 
+ 
+ def _record_stats(m: int, phys: torch.Tensor, valid: torch.Tensor) -> None:
+@@ -62,6 +80,44 @@
+                                 "mean_routed_slots": {k: round(v[2] / v[0], 2) for k, v in sorted(_STATS.items())}}) + "\n")
+ 
+ 
++def split_rows(m: int, cap: int) -> list[tuple[int, int]]:
++    """dsv41 patch 0064: row ranges [a, b) covering 0..m in chunks of at most cap rows, full chunks first. An expert
++    picked in several chunks is read once per chunk; a short last chunk shares the fewest experts with the others."""
++    if m < 1 or cap < 1:
++        raise ValueError(f"split_rows: m={m}, cap={cap}")
++    return [(a, min(a + cap, m)) for a in range(0, m, cap)]
++
++
++def smoe_split_ok(m: int, x: torch.Tensor, decode_kernel: str, coop: K.CoopScratch, smoe) -> bool:
++    """dsv41 patch 0064: whether this call's routed experts run as exl3_smoe row chunks (see _SPLIT_MAX)."""
++    if not (_SPLIT_MAX and smoe is not None and decode_kernel == "coop" and x.dtype == torch.bfloat16
++            and coop.rows_max < m <= _SPLIT_MAX):
++        return False
++    if _TF_PROMPT and not torch.cuda.is_current_stream_capturing():
++        from . import tf_prompt
++        if m >= tf_prompt.MIN_ROWS:
++            return False                     # TensorFold's prompt kernels keep the eager calls they serve
++    return True
++
++
++def smoe_split(smoe, x: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor, perm: torch.Tensor,
++               act_limit: float, pad: torch.Tensor | None = None) -> torch.Tensor:
++    """dsv41 patch 0064: this rank's routed partial sum, bf16 [m, H], as exl3_smoe launches on row chunks of at most
++    smoe.max_rows() rows, each writing its rows of one output tensor (no host read, no copy)."""
++    m, hidden = x.shape
++    cap = smoe.max_rows()
++    if not _SPLIT_LOGGED[0]:
++        _SPLIT_LOGGED[0] = True
++        logging.getLogger(__name__).info(
++            "EXL3 routed experts: a %d-row call runs exl3_smoe on row chunks of <= %d rows (dsv41 patch 0064, "
++            "VLLM_EXL3_MOE_SPLIT_MAX_TOKENS=%d)", m, cap, _SPLIT_MAX)
++    out = torch.empty((m, hidden), dtype=torch.bfloat16, device=x.device)
++    for a, b in split_rows(m, cap):
++        smoe.into(out[a:b], x[a:b], topk_ids[a:b], topk_weights[a:b], perm, act_limit,
++                  None if pad is None else pad[a:b])
++    return out
++
++
+ def routed_moe_forward(
+     x: torch.Tensor,                 # [m, H] bf16/fp16 (post-norm MoE input)
+     topk_weights: torch.Tensor,      # [m, top_k] fp32 (routed_scaling_factor already applied by vLLM's router)
+@@ -102,6 +158,9 @@
+                                     "ids_stride": list(topk_ids.stride()), "w_dtype": str(topk_weights.dtype),
+                                     "x_stride": list(x.stride())}) + "\n")
+         return out
++    if _SPLIT_MAX and smoe_split_ok(m, x, decode_kernel, coop, smoe):
++        # dsv41 patch 0064: m > coop.rows_max as exl3_smoe row chunks, no host read (see _SPLIT_MAX)
++        return smoe_split(smoe, x, topk_ids, topk_weights, perm, act_limit, pad)
+     if coop_path and _FUSED and x.dtype == torch.bfloat16:
+         # decode: one prep launch + (parallel groups) one sum launch instead of ~13 tiny torch ops (fused_ops.py)
+         from .fused_ops import moe_prep, sum_groups_bf16
+--- a/vllm_exl3_moe/smoe.py
++++ b/vllm_exl3_moe/smoe.py
+@@ -150,3 +150,26 @@
+         out = torch.empty((m, self.H), dtype=torch.bfloat16, device=x.device)
+         ext().run(self.handle, x, ids, w, perm, out, float(act_limit), *self.scratch, pad, int(shared))
+         return out
++
++    # dsv41 patch 0064: forward.smoe_split runs calls past coop.rows_max as row chunks of at most max_rows() rows, each
++    # writing its rows of one output through into(); __call__ (every decode call) stays as it was.
++    def max_rows(self, shared: bool = False) -> int:
++        """The most rows one call takes: MAX_SLOTS // picks a row (42 at top_k 6, 36 with the shared slot)."""
++        return MAX_SLOTS // (self.top_k + int(shared))
++
++    def into(self, out: torch.Tensor, x: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor,
++             perm: torch.Tensor, act_limit: float, pad: torch.Tensor | None = None,
++             shared: bool = False) -> torch.Tensor:
++        """__call__ writing into ``out`` (bf16 [m, H], unit column stride, row stride a multiple of 4 elements, 8-byte
++        aligned: e.g. a row slice of a contiguous [M, H] tensor; the extension checks it) instead of a fresh tensor;
++        the same input handling as __call__. Returns ``out``."""
++        if x.stride(-1) != 1 or x.data_ptr() % 16 or x.stride(0) % 8:
++            x = x.contiguous().clone()
++        w = topk_weights if topk_weights.dtype == torch.float32 else topk_weights.float()
++        ids = topk_ids if topk_ids.dtype in (torch.int32, torch.int64) else topk_ids.to(torch.int32)
++        if w.stride(-1) != 1:
++            w = w.contiguous()
++        if ids.stride(-1) != 1:
++            ids = ids.contiguous()
++        ext().run(self.handle, x, ids, w, perm, out, float(act_limit), *self.scratch, pad, int(shared))
++        return out

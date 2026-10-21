@@ -1,0 +1,46 @@
+dsv41 patch 0073 (21.10.2026): the prefill throttle (0031) also counts waiting foreground requests.
+In use (VLLM_DSV41_FG_WAIT_THROTTLE=1).
+Base: patch 0072's scheduler.py.
+Why: 0031 defers background prefill chunks only while a foreground request is running. A new foreground request first
+waits, and the steps scheduled meanwhile still carried background chunks.
+How: the throttle condition also holds while a request with priority below VLLM_PREFILL_THROTTLE_MIN_PRIO waits, so its
+admission step carries no background chunk. Background requests are unchanged otherwise; with the flag off the scheduler
+behaves as with 0072.
+Measured (21.10.2026, together with 0071/0072 and VLLM_PREFILL_EVERY_N_STEPS=100000, tests/fair_bench.py: a foreground
+stream of 600 tokens at T = 1 next to background streams with 60K-token uncached prompts and priority 10): first token
+of the foreground stream next to two background prefills 3.7-3.8 s with the throttle every 24th step and without
+0073, 1.3-2.4 s with VLLM_PREFILL_EVERY_N_STEPS=100000 and 0073 (both changed together, shares not separated); next to
+one background prefill it stayed at 2.1-4.0 s until patch 0074 (the background request alone prefilled with the full
+token budget).
+Switch: VLLM_DSV41_FG_WAIT_THROTTLE=1.
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -25,6 +25,10 @@
+ # (VLLM_DSPARK_DEPTH_FILE) token "bgpause=<P>" overrides it live (read every 256 steps; a line without the token falls
+ # back to the environment value).
+ _DSV41_BG_PAUSE_PRIO = int(_dsv41_os.environ.get("VLLM_DSV41_BG_PAUSE_PRIO", "0"))
++# dsv41 patch 0073 (21.10.2026): the 0031 prefill throttle also counts WAITING foreground requests (priority below
++# VLLM_PREFILL_THROTTLE_MIN_PRIO), so a new interactive request is admitted in a step without a background prefill chunk.
++# VLLM_DSV41_FG_WAIT_THROTTLE=1 turns it on (default off).
++_DSV41_FG_WAIT_THROTTLE = _dsv41_os.environ.get("VLLM_DSV41_FG_WAIT_THROTTLE", "0") == "1"
+ _DSV41_DEPTH_FILE = _dsv41_os.environ.get("VLLM_DSPARK_DEPTH_FILE") or None
+ 
+ 
+@@ -661,11 +665,15 @@
+         # all prefill compute unless saturated.
+         defer_prefills = (
+             throttle_prefills and not self.prefill_capacity_bound
+-        ) and any(
++        ) and (any(
+             r.priority < _DSV41_THROTTLE_MIN_PRIO
+             if _DSV41_THROTTLE_MIN_PRIO > 0 else not r.is_prefill_chunk
+             for r in self.running
+-        )  # dsv41 0031c: with a priority floor, throttle while a foreground request runs (decode OR prefill;
++        ) or (_DSV41_FG_WAIT_THROTTLE and _DSV41_THROTTLE_MIN_PRIO > 0 and any(
++            r.priority < _DSV41_THROTTLE_MIN_PRIO for r in self.waiting
++        )))  # dsv41 0073: also while a foreground request WAITS (its admission step then carries no background
++        # chunk; before, the in-flight steps each held a ~0.7 s background chunk and the first token took 3-5 s).
++        # dsv41 0031c: with a priority floor, throttle while a foreground request runs (decode OR prefill;
+         # 0031b counted only decoding ones, so background chunks also ate the budget of a foreground prefill).
+         # Admission of a WAITING foreground request needs budget left after the background chunks of a release
+         # step (else prefill_capacity_bound switches the throttle off and it starves: 150 s TTFT on 18.10.):

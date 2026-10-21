@@ -1,0 +1,99 @@
+dsv41 patch 0072 (21.10.2026): background decode pause. In use (VLLM_DSV41_BG_PAUSE_PRIO=10).
+Why: with patch 0071 a background request next to a foreground one verifies no drafts, but its anchor row still brings
+the routed experts of a second context into every round (the profile of 21.10.: a round costs 24.8 ms fixed + 3.6 ms per
+request + 2.8 ms per live row, the live-row part almost entirely routed experts). In our setup the background requests
+are the memory service's (priority 10 from our proxy) and they overlap nearly every interactive request, so the
+interactive stream decoded at 43 (prose) / 66 (code) tok/s instead of ~54 / ~83.
+How: in the scheduler's loop over the running requests, a decoding request with priority >= P is skipped while a
+request with priority < P is running (the same kind of skip as vLLM's V2 + PP decode cadence a few lines above). It keeps
+its KV blocks and its drafts and is scheduled again as soon as no foreground request runs. Prefill chunks are left to
+the prefill throttle (patch 0031). P comes from VLLM_DSV41_BG_PAUSE_PRIO (0 = off); the depth file
+(VLLM_DSPARK_DEPTH_FILE) token "bgpause=<P>" overrides it live, read by the scheduler every 256 steps (a line without the
+token falls back to the environment value). Outputs are unchanged: a paused request only waits.
+Measured (21.10.2026, GB10, image v20, live through the depth file, against 0071 with bg=0; one foreground request with
+priority 0, 384 tokens, T = 0, next to one or two background streams with priority 10, two runs per cell): foreground
+prose + 1 / 2 background 42.9 / 34.4 -> 53.9 / 53.8 tok/s, code + 1 / 2 background 66.4 / 57.5 -> 83.3 / 83.2 tok/s
+(+25 ... +56 %, geometric mean +38 %); first token unchanged (0.23-0.29 s); background 0 tokens/s while the foreground
+decodes; no errors. Against the state before 0071: prose + 2 background 22.2 -> 53.8, code + 2 background 40.2 -> 83.2.
+Switch: VLLM_DSV41_BG_PAUSE_PRIO=<P> (requests with priority >= P count as background), depth-file token bgpause=<P>.
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -17,6 +17,31 @@
+ # two regimes: a request whose EMA is at least AK_HI (code, JSON: ~3 accepted drafts a round, bursty) keeps the full
+ # schedule; below it (prose: ~1) the window follows the EMA. Default 99 = one regime (window always follows the EMA).
+ _DSV41_AK_HI = float(_dsv41_os.environ.get("VLLM_DSV41_AK_HI", "99"))
++# dsv41 patch 0072 (21.10.2026): background decode pause. While a foreground request (priority < P) runs, decoding
++# background requests (priority >= P; the sampling proxy gives Hermes 0, subagents 5, Hindsight 10) are not scheduled.
++# They keep their KV blocks and drafts and go on as soon as no foreground request runs: background work only in idle
++# time, the foreground round no longer carries their rows (routed experts of a second context are most of what a second
++# request adds to a round). Prefill chunks are left to 0031. P = VLLM_DSV41_BG_PAUSE_PRIO, 0 = off; the depth file
++# (VLLM_DSPARK_DEPTH_FILE) token "bgpause=<P>" overrides it live (read every 256 steps; a line without the token falls
++# back to the environment value).
++_DSV41_BG_PAUSE_PRIO = int(_dsv41_os.environ.get("VLLM_DSV41_BG_PAUSE_PRIO", "0"))
++_DSV41_DEPTH_FILE = _dsv41_os.environ.get("VLLM_DSPARK_DEPTH_FILE") or None
++
++
++def _dsv41_bgpause_from(text, default):
++    """0072: the "bgpause=<P>" token of a depth-file text (tokens after the policy), else default."""
++    for tok in (text or "").strip().lower().split()[1:]:
++        if tok.startswith("bgpause="):
++            try:
++                return int(tok.split("=", 1)[1])
++            except ValueError:
++                return default
++    return default
++
++
++def _dsv41_bg_paused(request, pause_prio, fg_running):
++    """0072: whether a running request waits this step (a decoding background request next to a foreground one)."""
++    return pause_prio > 0 and fg_running and request.priority >= pause_prio and not request.is_prefill_chunk
+ import itertools
+ import math
+ import time
+@@ -663,6 +688,10 @@
+                 long_prefill_token_threshold, input_budget // num_eligible_reqs
+             )
+ 
++        # dsv41 patch 0072: background decodes wait while a foreground request runs
++        bg_pause = self._dsv41_pause_prio()
++        fg_running = bg_pause > 0 and any(r.priority < bg_pause for r in self.running)
++
+         # First, schedule the RUNNING requests.
+         req_index = 0
+         while req_index < len(self.running) and token_budget > 0:
+@@ -698,6 +727,12 @@
+                 req_index += 1
+                 continue
+ 
++            if _dsv41_bg_paused(request, bg_pause, fg_running):
++                # dsv41 patch 0072: this background decode waits (keeps its KV and drafts) while a
++                # foreground request runs, like a decode skipped for the V2+PP cadence above.
++                req_index += 1
++                continue
++
+             if (
+                 self.ec_connector is not None
+                 and request.mm_features
+@@ -2022,6 +2057,22 @@
+             structured_output_request_ids, bitmask, num_acceptable_drafts
+         )
+ 
++    def _dsv41_pause_prio(self) -> int:
++        """0072: the background pause floor, from the depth file every 256 steps (else the environment)."""
++        n = getattr(self, "_dsv41_bgp_n", 0)
++        self._dsv41_bgp_n = n + 1
++        if _DSV41_DEPTH_FILE is not None and n % 256 == 0:
++            try:
++                with open(_DSV41_DEPTH_FILE) as f:
++                    new = _dsv41_bgpause_from(f.read(), _DSV41_BG_PAUSE_PRIO)
++            except OSError:
++                new = _DSV41_BG_PAUSE_PRIO
++            if new != getattr(self, "_dsv41_bgp", None):
++                logger.info("dsv41 0072: background decode pause %s",
++                            f"for priority >= {new} next to a foreground request" if new > 0 else "off")
++            self._dsv41_bgp = new
++        return getattr(self, "_dsv41_bgp", _DSV41_BG_PAUSE_PRIO)
++
+     def _dsv41_adaptive_k(self, num_scheduled_tokens, cap: int) -> int:
+         """0047: the next step's draft count from the decode requests' accepted-draft EMA."""
+         want = _DSV41_AK_MIN

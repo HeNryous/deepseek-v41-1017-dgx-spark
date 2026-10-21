@@ -11,6 +11,7 @@ import torch.nn as nn
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_dp_group
 from vllm.forward_context import DPMetadata, create_forward_context
+from vllm.models.deepseek_v41.common.ops import swa_fused  # dsv41 patch 0067
 from vllm.models.deepseek_v41.decoder_replay_layers import DecoderReplayLayers
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadataBuilder
@@ -204,6 +205,15 @@ class DeepseekV41ModelState(DefaultModelState):
         # The replay window and the indices of the prefix-cacheable groups, from
         # the KV cache config on first use; None until then.
         self._replay: tuple[int, torch.Tensor] | None = None
+        # dsv41 patch 0067 (VLLM_DSV41_VOR_FUSED, default off): upload replay_start
+        # only when it changes, and one launch for the decode SWA metadata of all
+        # sliding-window groups (common/ops/swa_fused.py); None when off.
+        self._replay_start_mirror = (
+            swa_fused.ReplayStartMirror(self.max_num_reqs)
+            if swa_fused.REPLAY_COPY_SKIP
+            else None
+        )
+        self._swa_plan = swa_fused.SWADecodePlan() if swa_fused.SWA_FUSED else None
 
         self.decoder_replay_layers: DecoderReplayLayers | None = getattr(
             model, "decoder_replay_layers", None
@@ -314,9 +324,16 @@ class DeepseekV41ModelState(DefaultModelState):
                 self._replay_start_np[input_batch.idx_mapping_np[:num_reqs]],
                 0,
             ).astype(np.int32)
-            replay_start = self._replay_start_staging.copy_to_gpu(
-                replay_start_np, out=self._replay_start[:num_reqs]
-            )
+            mirror = self._replay_start_mirror
+            if mirror is not None and mirror.holds(replay_start_np):
+                # patch 0067: the buffer holds these values already
+                replay_start = self._replay_start[:num_reqs]
+            else:
+                replay_start = self._replay_start_staging.copy_to_gpu(
+                    replay_start_np, out=self._replay_start[:num_reqs]
+                )
+                if mirror is not None:
+                    mirror.wrote(replay_start_np)
             if replay_start_np.any():
                 # The replayed tokens rebuild window KV only: their slots in the
                 # prefix-cacheable groups are padded so the cached KV stays as is.
@@ -334,17 +351,36 @@ class DeepseekV41ModelState(DefaultModelState):
                 )
             assert model_specific_attn_metadata is None
             model_specific_attn_metadata = ReplayAttnMetadata(replay_start)
-        attn_metadata = super().prepare_attn(
-            input_batch,
-            cudagraph_mode,
-            block_tables,
-            slot_mappings,
-            attn_groups,
-            kv_cache_config,
-            for_capture=for_capture,
-            ubatch_idx=ubatch_idx,
-            model_specific_attn_metadata=model_specific_attn_metadata,
-        )
+        plan = self._swa_plan
+        if plan is not None and not for_capture and ubatch_idx == 0:
+            # patch 0067: the first sliding-window builder writes every group's
+            # decode metadata in one launch, the others skip their launches
+            plan.arm(
+                swa_fused.swa_plan_entries(
+                    attn_groups,
+                    block_tables,
+                    slot_mappings,
+                    DeepseekSparseSWAMetadataBuilder,
+                    ubatch_idx,
+                )
+            )
+        else:
+            plan = None
+        try:
+            attn_metadata = super().prepare_attn(
+                input_batch,
+                cudagraph_mode,
+                block_tables,
+                slot_mappings,
+                attn_groups,
+                kv_cache_config,
+                for_capture=for_capture,
+                ubatch_idx=ubatch_idx,
+                model_specific_attn_metadata=model_specific_attn_metadata,
+            )
+        finally:
+            if plan is not None:
+                plan.disarm()
         if self.decoder_replay_layers is not None:
             assert replay_start is not None
             self._prepare_replay_batch(
