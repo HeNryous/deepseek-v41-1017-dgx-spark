@@ -86,15 +86,15 @@ unchanged), image v5 with the switches of `serve/serve_example.sh`. Each cell is
 bench runs (20.10.). The TensorFold numbers are their own from thread 386125; their clock is not recorded and their logs
 show ~2.4 GHz:
 
-| tok/s, median | v5, 2000 MHz | v5, 2400 MHz | TensorFold, ~2.4 GHz | v5 vs TensorFold |
-|---|---|---|---|---|
-| prose, 1 stream (suite) | 54.6 | 56.6 | 56.8 | −0.4 % at 2400 MHz |
-| code, 1 stream (suite) | 91.5 | 88.9 | 92.2 | −0.8 % at 2000 / −3.6 % at 2400 MHz ¹ |
-| prose, aggregate 2 / 3 / 4 streams (bench) | 71.9 / 85.3 / 94.4 | – ² | – / 82 / 94 | +4.0 / +0.4 % at 2000 MHz |
-| code, aggregate 2 / 3 / 4 streams (bench) | 112.6 / 136.1 / 155.9 | – ² | – / 124 / 140 | +9.8 / +11.4 % at 2000 MHz |
-| prose / code, 1 stream (bench) | 49.4 / 84.8 | – ² | – | |
-| prefill, cold 8K / 32K | 2,203 ³ / 2,270 ⁴ | | 2,166 / 2,179 | +1.7 % at 2000 MHz / – |
-| decode with thinking on, prose / code (suite) | 52.8 / 78.8 | 54.6 / 59.2 | | |
+| tok/s, median | v5, 2000 MHz | v5, 2400 MHz | v12, 2400 MHz ⁵ | TensorFold, ~2.4 GHz | vs TensorFold |
+|---|---|---|---|---|---|
+| prose, 1 stream (suite) | 54.6 | 56.6 | 56.0 | 56.8 | −0.4 % (v5) / −1.4 % (v12) at 2400 MHz |
+| code, 1 stream (suite) | 91.5 | 88.9 | 91.1 | 92.2 | −0.8 % at 2000 / −1.2 % (v12) at 2400 MHz ¹ |
+| prose, aggregate 2 / 3 / 4 streams (bench) | 71.9 / 85.3 / 94.4 | – ² | 71.5 / 85.1 / 95.3 | – / 82 / 94 | +3.7 / +1.4 % (v12, 2400 MHz) |
+| code, aggregate 2 / 3 / 4 streams (bench) | 112.6 / 136.1 / 155.9 | – ² | 117.0 / 135.4 / 154.0 | – / 124 / 140 | +9.2 / +10.0 % (v12, 2400 MHz) |
+| prose / code, 1 stream (bench) | 49.4 / 84.8 | – ² | 51.5 / 86.1 | – | |
+| prefill, cold 8K / 32K | 2,203 ³ / 2,270 ⁴ | | 2,470 ³ / – | 2,166 / 2,179 | +1.7 % at 2000 / +14 % at 2400 MHz / – |
+| decode with thinking on, prose / code (suite) | 52.8 / 78.8 | 54.6 / 59.2 | 52.2 / 64.6 | | |
 
 ¹ Single-stream code at T = 1 moves by up to ±10 % between runs (the three 2400 MHz runs: 88.4 / 88.9 / 94.4).
 ² At 2400 MHz the repeated bench runs heated the GPUs to 76 °C, and our thermal guard (80 °C GPU / 90 °C board sensor)
@@ -104,6 +104,9 @@ run at 2400 MHz, before the guard engaged, gave prose 83.8 / 98.0 and code 134.4
 same morning gave 2,326.
 ⁴ The suite's 32K run starts with its 8K prompt and hits the prefix cache; 2,270 tok/s is our cold measurement of 19.10.
 (image v4i, fresh `cache_salt` per request).
+⁵ 21.10. at night, image v12 (= v5 + KV patches, same decode path): before each run both GPUs cooled to ≤ 56 °C, the
+clock logged every 5 s; all five runs stayed at ≥ 2,366 MHz without the thermal guard, so this is a clean 2400 MHz
+measurement (three suite / two bench runs). Single-stream code at T = 1 again moved by ±5 % between runs.
 
 The scripts sample at T = 1, so single-stream numbers move by several percent between runs. Our production image of
 19.10. (v4i + 0040–0046, not published) reached 87.7 (prose) and 143.7 (code) tok/s at 4 streams with the same scripts
@@ -190,9 +193,9 @@ The serving image of the [sudoingX recipe](https://github.com/sudoingX/dgx-spark
 | 0053 | KV cache backed by the GB10 display reservation (1,792 MiB per node, DRM dumb buffer + `cuMemHostRegister`) with pinned ordinary memory behind it (`VLLM_DSV41_DISPLAY_KV_MIB`) | off: KV pool +47 %, but ~1 GB less free memory under load and +1.5 % per round (see "Tried") |
 | 0054 | token embedding (631 MiB per rank) and the DSpark Markov cache (505 MiB) in the display reservation, copied bit-exact (`VLLM_DSV41_DISPLAY_TENSORS=1`) | off: decode −1.7 % (geometric mean), 64K code −6.7 % |
 | 0055 | draft mode per request from the 0047 regime: requests that plan the full window draft probabilistically, the others greedy with a one-hot draft distribution, so their verification stays exact (`VLLM_DSV41_HYBRID_DRAFT=1`) | off: +0.75 % at T=1 (code at 1 stream +5.0 %), but prose at 1 stream −1.6 % |
-| 0056 | CRC-32 sidecar for every block of vLLM's file-system KV offload tier, checked after each load; a bad block is deleted and recomputed (`VLLM_DSV41_KV_CRC=1`) | off; offline test passed, live window still to run |
+| 0056 | CRC-32 sidecar for every block of vLLM's file-system KV offload tier, checked after each load; a bad block is deleted and recomputed (`VLLM_DSV41_KV_CRC=1`) | off; live (21.10., image v12, with 0058): reload of a 57K-token prompt from the file-system tier after a restart 32.3 → 3.6 s, a corrupted block detected and recomputed, decode −0.3 %, corruption test 0 hits; not adopted because the 1 GiB CPU tier left the head node at 1.9 GiB free under load (our gate: 2.0) |
 | 0057 | paired KV pages: the ratio-1 compressed-KV group takes 128-token blocks made of two 64-state kernel pages and stops paying the ratio-2 group's block stride (`VLLM_DSV41_KV_PAIR=1`; `VLLM_DSV41_KV_SWA_FILL=1` fills the sliding-window groups up to the stride) | KV pool 989,460 → 1,346,928 tokens (+36 %), live 3,267 → 2,187 B per token, cost per round −0.3 %, T=0 identical 8/8, corruption test 0 hits |
-| 0058 | vLLM's OffloadingConnector next to `expandable_segments:True` (`VLLM_DSV41_OFFLOAD_EXPANDABLE_OK=1`) | needed for 0056; live window still to run |
+| 0058 | vLLM's OffloadingConnector next to `expandable_segments:True` (`VLLM_DSV41_OFFLOAD_EXPANDABLE_OK=1`) | needed for 0056; works (see 0056) |
 | 0059 | NVFP4 KV records on GB10: FlashInfer's 384 B SM120 record (e2m1 with an e4m3 scale per 16, RoPE in BF16) for the window and the compressed KV, written with FlashInfer's own quantize-append; SWA indices padded to 512 for DSpark's 192-wide non-causal verify (`VLLM_DSV41_KV_NVFP4=1`) | off: KV pool +49.5 %, but KV-KLD 0.028 / top-1 95.0 % against FP8 records (see "KV cache capacity") |
 | 0060 | three 64-state kernel pages per manager block for the ratio-1 KV group: 3 × 46,080 B = the ratio-2 block stride, no padding left (`VLLM_DSV41_KV_PAIR=3`, on top of 0057) | **in use:** KV pool 1,346,928 → 1,531,258 tokens (+13.7 %), live 2,187 → 1,827 B per token, cost per round −0.5 %, T=0 identical 8/8, corruption test 0 hits |
 | 0061 | FP8 sliding window + NVFP4 compressed KV (as vLLM's SM100 format does): two FlashInfer calls with `return_lse`, merged in Triton (base-2 LSE, sink in the merge) (`VLLM_DSV41_KV_NVFP4=2`) | off: KV pool 1,837,489 with 0060, but KV-KLD 0.0146 / top-1 96.6 % and tok/s −2.8 % (fewer drafts accepted) |
@@ -216,7 +219,10 @@ field (lower first).
 run one after the other, live-switchable ones (depth policy) interleaved as A/B/…/B/A. Gates are written down before the
 run (no cell below −1.5 %, 1 stream not worse on average; ranking by the geometric mean over all cells), then a
 corruption test on the winner. Single-stream cells at T = 1 move by several percent between runs because a different
-sample writes a different text; for those we compare tokens per round or use T = 0.
+sample writes a different text; for those we compare tokens per round or use T = 0. T = 0 texts are only reproducible for
+short contexts: from position 128 on (the first ratio-128 compressed entries) two identical requests to the same
+process differ by KL ~0.008 / top-1 ~97.5 % in their prompt logprobs, with the change of the actual token's NLL
+centred on zero. Above that we compare logprobs against this floor, not texts.
 
 **Round cost by verify depth** (all requests at the same fixed depth, short context, ms per decode round, before
 0040–0050):
