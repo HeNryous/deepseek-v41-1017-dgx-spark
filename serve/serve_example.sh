@@ -17,7 +17,8 @@ export IMAGE=ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v22
 export MODEL_DIR=$HOME/models/DeepSeek-V4.1-Flash-1017-EXL3-2.75bpw-DGX-Spark   # incl. the two 1017 Engram shards (scripts/download_model.sh)
 export SERVED=DeepSeek-V4.1-Flash-1017-EXL3-Spark-TP2
 export TEXT_ONLY=0 MAX_LEN=327680 MAX_SEQS=4 MAX_BATCH=4096 UTIL=0.86
-export KV_BYTES=4026531840                       # 3.75 GiB per rank -> 1,531,258 tokens with 0057 + 0060 (v5: 989,460); UTIL then only gates the startup check
+export KV_BYTES=3758096384                       # 3.5 GiB per rank -> 1,429,164 tokens with 0057 + 0060 (3.75 GiB without the SSD offload
+                                                 # below: 1,531,258); UTIL then only gates the startup check
 # 0040: DSpark k = 5 at 1-4 streams (at most 24 verify rows, kept on exl3_mrow by 0042b; until 21.10. k = 4 at 3-4)
 export SPEC='{"method":"dspark","num_speculative_tokens":5,"num_speculative_tokens_per_batch_size":[[1,4,5]]}'
 # keep the background long-prefill threshold <= MAX_BATCH / 4, otherwise background prefills can fill a whole step and a
@@ -25,6 +26,11 @@ export SPEC='{"method":"dspark","num_speculative_tokens":5,"num_speculative_toke
 # ordered by the request field `priority` (lower first); --enable-prompt-tokens-details: usage reports cached prompt tokens.
 export EXTRA="--limit-mm-per-prompt '{\"image\":4}' --mm-processor-cache-gb 0 --long-prefill-token-threshold $((MAX_BATCH / 4)) \
 --scheduling-policy priority --enable-prompt-tokens-details"
+# SSD KV offload (since 22.10.; 0056 CRC per block, 0058 next to expandable_segments): vLLM's OffloadingConnector, a 256 MiB
+# CPU tier (taken from the KV pool above) and a file-system tier under ~/.cache/dsv41-serve/kv_offload that survives
+# restarts. Prune it yourself (we delete blocks older than a day and cap the folder at 40 GB, hourly). Remove the line
+# (and set KV_BYTES=4026531840) to serve without it.
+export EXTRA="$EXTRA --kv-transfer-config '{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"spec_name\":\"TieringOffloadingSpec\",\"cpu_bytes_to_use\":268435456,\"secondary_tiers\":[{\"type\":\"fs\",\"root_dir\":\"/root/.cache/kv_offload\",\"n_read_threads\":8,\"n_write_threads\":4}]}}'"
 # 0031: requests with priority >= 5 count as background; with VLLM_PREFILL_EVERY_N_STEPS=100000 (until 21.10.: 24) their
 # prefill runs only while no foreground request runs. 0073: also not while a foreground request waits for admission;
 # 0074: background prefill chunks keep the long-prefill threshold when they run alone.
@@ -59,7 +65,7 @@ VLLM_DSV41_AK_MAX_REQS=$AK_MAX_REQS \
 VLLM_DSV41_KV_PAIR=3 VLLM_DSV41_KV_SWA_FILL=1 \
 VLLM_DSV41_INDEXER_DEFER=1 VLLM_EXL3_MOE_SPLIT_MAX_TOKENS=63 EXL3_CPU_PIN=5-9,15-19 \
 VLLM_DSV41_MARKOV_FUSED=1 VLLM_DSV41_VOR_FUSED=1 VLLM_DSV41_BG_DEPTH=0 VLLM_DSV41_BG_PAUSE_PRIO=10 \
-VLLM_DSV41_FG_WAIT_THROTTLE=1 VLLM_DSV41_BG_LPT_SOLO=1"
+VLLM_DSV41_FG_WAIT_THROTTLE=1 VLLM_DSV41_BG_LPT_SOLO=1 VLLM_DSV41_KV_CRC=1 VLLM_DSV41_OFFLOAD_EXPANDABLE_OK=1"
 # The plugin's JIT kernels (TensorFold experts, exl3_mrow, RDMA ring, mHC boundary, router, routed-expert decode, L2
 # prefetch) on both nodes before the model loads; once built for this image, this only loads them. Building them next to
 # the loaded weights can run a node out of memory. EXL3_SMOE_FLAGS is the launcher's (part of the module name).
