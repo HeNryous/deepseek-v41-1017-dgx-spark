@@ -16,9 +16,9 @@ export FAB_IF=${FAB_IF:-enp1s0f0np0} FAB_HCA=${FAB_HCA:-rocep1s0f0}   # fabric n
 export IMAGE=ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v22
 export MODEL_DIR=$HOME/models/DeepSeek-V4.1-Flash-1017-EXL3-2.75bpw-DGX-Spark   # incl. the two 1017 Engram shards (scripts/download_model.sh)
 export SERVED=DeepSeek-V4.1-Flash-1017-EXL3-Spark-TP2
-export TEXT_ONLY=0 MAX_LEN=327680 MAX_SEQS=4 MAX_BATCH=4096 UTIL=0.86
-export KV_BYTES=3758096384                       # 3.5 GiB per rank -> 1,429,164 tokens with 0057 + 0060 (3.75 GiB without the SSD offload
-                                                 # below: 1,531,258); UTIL then only gates the startup check
+export TEXT_ONLY=0 MAX_LEN=524288 MAX_SEQS=4 MAX_BATCH=4096 UTIL=0.86   # 512K context since 22.10. (needle at 479K 3/3)
+export KV_BYTES=3758096384                       # 3.5 GiB per rank -> 1,620,922 tokens at MAX_LEN 524288 with 0057 + 0060 (1,429,164 at
+                                                 # 327680); UTIL then only gates the startup check
 # 0040: DSpark k = 5 at 1-4 streams (at most 24 verify rows, kept on exl3_mrow by 0042b; until 21.10. k = 4 at 3-4)
 export SPEC='{"method":"dspark","num_speculative_tokens":5,"num_speculative_tokens_per_batch_size":[[1,4,5]]}'
 # keep the background long-prefill threshold <= MAX_BATCH / 4, otherwise background prefills can fill a whole step and a

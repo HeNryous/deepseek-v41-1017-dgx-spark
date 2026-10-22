@@ -1,9 +1,9 @@
-# DeepSeek-V4.1-Flash-1017 on 2× DGX Spark (GB10) — EXL3 2.75 bpw, 320K context
+# DeepSeek-V4.1-Flash-1017 on 2× DGX Spark (GB10) — EXL3 2.75 bpw, 512K context
 
 A ready-to-run setup for **[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)** on
 **two DGX Spark / GB10** nodes with tensor parallelism 2: our EXL3 quantization
 ([HeNryous/DeepSeek-V4.1-Flash-1017-EXL3-2.75bpw-DGX-Spark](https://huggingface.co/HeNryous/DeepSeek-V4.1-Flash-1017-EXL3-2.75bpw-DGX-Spark),
-**KLD 0.0201** against the native 1017 on sudoingX's KLD panel), a complete vLLM serving image, 320K context, image
+**KLD 0.0201** against the native 1017 on sudoingX's KLD panel), a complete vLLM serving image, 512K context, image
 input, tool calling and DSpark speculative decoding. Every number below was measured on this exact setup.
 
 ## Hardware
@@ -110,7 +110,7 @@ measurement (three suite / two bench runs). Single-stream code at T = 1 again mo
 
 The scripts sample at T = 1, so single-stream numbers move by several percent between runs. Our production image of
 19.10. (v4i + 0040–0046, not published) reached 87.7 (prose) and 143.7 (code) tok/s at 4 streams with the same scripts
-at 2000 MHz (single runs). Not measured: contexts above 320K (TensorFold goes to 1M).
+at 2000 MHz (single runs). Contexts above 320K: see "512K context" below.
 
 Image v12 (21.10.) = v5 + patches 0051–0061, of which only the KV page layout (0057 + 0060) is switched on. Each of
 them was A/B-tested against the image before it (cost per decode round within ±0.5 %), so the decode rows above stand
@@ -476,7 +476,12 @@ from 3.98 to 3.49 tokens per round. At 1.6, JSON keeps 4.05 of 4.11 tokens per r
 - **1M context:** max-model-len 1,048,576 starts (pool 1,664,407 tokens with 0057), but the indexers' shared K gather
   buffer (max-model-len × `VLLM_INDEXER_PREFILL_BUFFER_FACTOR` × 132 B) and the longer RoPE cache leave the head node
   with 1.3–1.9 GiB free under the first long prompts, below our 1.5 GiB watchdog, also with buffer factor 2 instead of 8.
-  We stay at 320K.
+  **512K context (in use since 22.10.):** max-model-len 524,288 with image v22 and the SSD offload, KV 3.5 GiB per rank =
+  1,620,922 tokens (3.09 full 512K requests). A needle test at 478,817 tokens (three codes at 10 / 50 / 90 % depth, T = 0)
+  found 3 of 3; the prefill took 224.6 s (2,132 tok/s at 2190 MHz) and the cached re-ask 1.6 s. Lowest free memory on the
+  head / worker node: 2,022 / 3,204 MiB during the needle, 2,309 / 3,274 MiB in the corruption test (30K/100K, 0 hits).
+  For comparison, MiaAI-Lab's README for the Zig engine reports ~1,710 tok/s for a 479K-token needle prefill on the same
+  hardware.
 - **NVFP4 KV (0059, 0061):** see "KV cache capacity". Keeping the sliding window in FP8 halves the KLD of NVFP4
   everywhere, but the rest is still above the run-to-run floor and costs accepted drafts.
 - **An exact verify width per round** (verify only the drafts the depth policy keeps, the way TensorFold sizes its
