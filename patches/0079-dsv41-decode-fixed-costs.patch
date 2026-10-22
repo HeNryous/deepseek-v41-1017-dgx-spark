@@ -1,0 +1,165 @@
+dsv41 patch 0079 (22.10.2026): decode fixed costs (global top-k reuse, shared-expert zeros). In the image, off.
+
+Base: image v23 (flashinfer_sparse.py, moe_method.py = gh_stage v22; neither touched by 0075-0078). All switches default
+off = v23 bit for bit. Both levers are exact (the same values reach the same kernels).
+
+What
+  0079a VLLM_DSV41_GTOPK_REUSE=1: decode calls compute_global_topk_indices_and_lens once a layer (38 a round, profile
+        P_D0: 4.0 us each). Layers sharing index source, KV source (block table) and block size get the same result:
+        the first of each group computes it and stores it in the step's metadata dict flashinfer_sparse_index_cache
+        (fresh per build(), cleared on draft updates, the dict upstream already uses for SWA-only layers); the rest
+        reuse the tensors (read only by FlashInfer / split_sparse_mla / the Triton verify path). 8 launches a round.
+  0079c VLLM_EXL3_MOE_SHARED_ZEROS=1: with the shared expert inside exl3_smoe, _apply_with_shared gives vLLM's runner a
+        zero shared output (the runner adds shared + routed). Today torch.zeros_like = one fill kernel a MoE layer
+        (FillFunctor<bf16>, 15 blocks, 1.5 us, 40 a round); on: a view of one persistent zero buffer (64 rows, allocated
+        outside graph capture, never written). The runner's add stays, so the sum is bit-identical.
+Why
+  Kernel census P_D0_n1 (loops/analyse): 70 of the ~1,400 launches a decode round are these two; raw profile shows the
+  fill + add pair after every smoe_down and the global-index kernel before every sparse-MLA decode call.
+Not built (and why)
+  D1 lm-head / drafter head on exl3_mrow at 9-24 rows: configuration only (EXL3_HEAD_MROW_MAX_ROWS), needs the
+     serve-off microbench first (fenster14/mb_dense_rows.py, MB_FORCE_MROW32=1, EXL3_MROW32_VARIANT=ring): head.py's
+     own numbers (before the ring kernel) had mrow slower than exl3 at 12-16 rows.
+  D2 ring sum folded into the 0048 mHC boundary: CUDA in exl3_rdma/exl3_mhc plus the two-rank protocol; no offline test.
+  Query padding (PLAN's "glue"): with 32 local heads FlashInfer needs no padding (_pad_to_supported_q_heads(32) = 32);
+     the fp8->bf16 cast per layer is needed by the SM120 kernel. The _qdq_ue8m0 fold and the o_proj copy would change
+     Triton/CUDA kernels of the 0032 parity path.
+Expected effect
+  ~70 launches less a round: ~0.18 ms (0.6 % at 1 stream, ~0.35 % at 4) - at the noise edge; measure together.
+Measured quantities
+  decode_ab cells 1/2/4 streams (ms/round geo), t0_ident 8/8, nsys census: compute_global_topk 38 -> 8, FillFunctor 40 -> 0.
+Test: v0079/test/test_0079.py (CPU, Mac): real _forward_decode / _apply_with_shared by AST extraction.
+
+Measured (22.10.2026, image v24): T=0 8/8 identical; decode -0.32 % (geometric mean of 12 cells, -4.6..+2.9 %)
+against the same configuration without it, inside the run-to-run noise (+-0.6 %). The estimated gain of 0.18 ms per
+round (0.35-0.6 %) is not measurable; not adopted.
+
+--- a/vllm_exl3_moe/moe_method.py
++++ b/vllm_exl3_moe/moe_method.py
+@@ -54,6 +54,29 @@
+ # at 4-6; LOG Oct 11 03:23)
+ _SMOE_FUSED_MIN_ROWS = K.env_int("VLLM_EXL3_MOE_FUSED_MIN_ROWS", 2)
+ _KINDS = ("trellis", "suh", "svh")
++# VLLM_EXL3_MOE_SHARED_ZEROS=1 (dsv41 patch 0079c, default 0): when exl3_smoe computes routed + shared experts in one
++# launch, _apply_with_shared hands vLLM's runner a zero tensor as the shared output (the runner adds shared + routed).
++# Off: torch.zeros_like(out) every MoE layer = one fill kernel a layer (40 a decode round). On: a [m, hidden] view of
++# one zero buffer per (device, dtype, hidden), allocated outside graph capture and never written (the runner only
++# reads it or reduces it in place, which keeps zeros), so the same add sees the same zeros without the fill.
++_SHARED_ZEROS = K.env_int("VLLM_EXL3_MOE_SHARED_ZEROS", 0)
++_SHARED_ZEROS_ROWS = 64  # >= coop rows_max (<= 32): the only calls that take this path
++_ZERO_BUFFERS: dict[tuple, torch.Tensor] = {}  # kept for the run: captured graphs read these addresses
++
++
++def _shared_zero_output(out: torch.Tensor) -> torch.Tensor:
++    """dsv41 patch 0079c: zeros shaped like `out` from the persistent buffer (see _SHARED_ZEROS)."""
++    if out.dim() != 2 or out.shape[0] > _SHARED_ZEROS_ROWS or not out.is_contiguous():
++        return torch.zeros_like(out)  # same shape and strides as before in every case the buffer cannot serve
++    key = (out.device, out.dtype, out.shape[1])
++    buf = _ZERO_BUFFERS.get(key)
++    if buf is None:
++        if torch.cuda.is_current_stream_capturing():
++            return torch.zeros_like(out)  # a buffer made inside a capture would hold zeros only after a replay
++        buf = _ZERO_BUFFERS[key] = torch.zeros(
++            (_SHARED_ZEROS_ROWS, out.shape[1]), dtype=out.dtype, device=out.device
++        )
++    return buf[: out.shape[0]]
+ 
+ 
+ def _unquantized_moe_quant_config():
+@@ -398,7 +421,9 @@
+                 and (shared_experts_input is None or shared_experts_input.data_ptr() == x.data_ptr())
+                 and self._attach_shared(shared_experts)):
+             out = self.smoe(x, topk_ids, topk_weights, self.perm, self.act_limit, _padding_rows(m), shared=True)
+-            shared_experts._output[shared_experts._output_idx] = torch.zeros_like(out)
++            shared_experts._output[shared_experts._output_idx] = (
++                _shared_zero_output(out) if _SHARED_ZEROS else torch.zeros_like(out)  # dsv41 patch 0079c
++            )
+             l2pf.point("next", self.layer_idx, m)
+             l2pf_draft.point("next", self.layer_idx, m)        # dsv41 patch 0066: drafter blocks only
+             return out
+--- a/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py
++++ b/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py
+@@ -97,6 +97,13 @@
+ # _FLAT_MAX_Q tokens a request) go to the EXL3 plugin's Triton sparse attention (vllm_exl3_moe/sparse_attn.py) instead
+ # of FlashInfer, whose GB10 calibration sends them to its multi-row prefill kernel (~49 us a layer at 6 rows)
+ _TRITON_VERIFY = os.environ.get("VLLM_DSV41_TRITON_VERIFY", "0") == "1"
++# VLLM_DSV41_GTOPK_REUSE=1 (dsv41 patch 0079a, default 0): in decode, every compressed layer maps the shared top-k buffer
++# to global KV slots (compute_global_topk_indices_and_lens, one launch a layer: 38 a round). Layers that read the same
++# top-k (same index-source layer), the same compressed block table (same KV source) and block size get the same
++# result, so the first of each group computes it for the step and the others reuse its tensors (8 launches a round
++# instead of 38 on V4.1: groups 2-7, 8-13, 14-19, 20-23, 24-27, 28-31, 32-35, 36-39). Consumers only read them.
++# The per-step dict is the metadata's flashinfer_sparse_index_cache (a fresh one per build(), cleared on updates).
++_GTOPK_REUSE = os.environ.get("VLLM_DSV41_GTOPK_REUSE", "0") == "1"
+ 
+ 
+ def _pad_to_supported_q_heads(num_heads: int) -> int:
+@@ -838,6 +845,42 @@
+             q = padded_query
+         return q.contiguous()
+ 
++    def _dsv41_global_topk(
++        self,
++        swa_metadata: "DeepseekSparseSWAMetadata",
++        attn_metadata: DeepseekV4FlashMLAMetadata,
++        num_decodes: int,
++        num_decode_tokens: int,
++        block_size: int,
++        is_valid: torch.Tensor,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """dsv41 patch 0079a: compute_global_topk_indices_and_lens once a step for the layers that share its inputs
++        (see _GTOPK_REUSE); the key holds everything the call reads besides the per-step metadata itself."""
++        assert self.topk_indices_buffer is not None
++        block_table = attn_metadata.block_table[:num_decodes]
++        key = (
++            "dsv41_gtopk",
++            self.index_source_layer_id,
++            self.compressed_cache_prefix,
++            block_size,
++            num_decode_tokens,
++            num_decodes,
++            block_table.data_ptr(),
++            self.topk_indices_buffer.data_ptr(),
++        )
++        cache = swa_metadata.flashinfer_sparse_index_cache
++        hit = cache.get(key)
++        if hit is None:
++            hit = compute_global_topk_indices_and_lens(
++                self.topk_indices_buffer[:num_decode_tokens],
++                swa_metadata.token_to_req_indices,
++                block_table,
++                block_size,
++                is_valid,
++            )
++            cache[key] = hit
++        return hit
++
+     def _forward_decode(
+         self,
+         q: torch.Tensor,
+@@ -868,13 +911,19 @@
+             # Local indices filled by the index-source layer's indexer.
+             is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
+             block_size = attn_metadata.block_size // self.compress_ratio
+-            global_indices, extra_sparse_lengths = compute_global_topk_indices_and_lens(
+-                self.topk_indices_buffer[:num_decode_tokens],
+-                swa_metadata.token_to_req_indices,
+-                attn_metadata.block_table[:num_decodes],
+-                block_size,
+-                is_valid,
+-            )
++            if _GTOPK_REUSE:
++                # dsv41 patch 0079a: once a step per (index source, KV source, block size)
++                global_indices, extra_sparse_lengths = self._dsv41_global_topk(
++                    swa_metadata, attn_metadata, num_decodes, num_decode_tokens, block_size, is_valid
++                )
++            else:
++                global_indices, extra_sparse_lengths = compute_global_topk_indices_and_lens(
++                    self.topk_indices_buffer[:num_decode_tokens],
++                    swa_metadata.token_to_req_indices,
++                    attn_metadata.block_table[:num_decodes],
++                    block_size,
++                    is_valid,
++                )
+             extra_sparse_indices = global_indices.view(num_decode_tokens, 1, -1)
+ 
+         swa_indices = swa_metadata.decode_swa_indices

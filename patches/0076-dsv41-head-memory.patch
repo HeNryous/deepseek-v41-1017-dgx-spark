@@ -1,0 +1,492 @@
+dsv41 patch 0076 (22.10.2026): head-node memory without functional change. In use from image v24 (VLLM_INDEXER_PREFILL_BUFFER_FACTOR=4 VLLM_DSV41_DROP_MTP_BUFFER=1 VLLM_EXL3_TF_PROMPT_TRANSIENT=1 VLLM_EXL3_TF_PROMPT_ALIAS=1).
+
+Base: image v22 (model.py/model_runner.py = gh_stage v22, tf_prompt.py/tf_experts.py = image v4 = src_v12).
+All switches default off = v22 bit for bit.
+
+0076a VLLM_DSV41_MEMPROBE=<prefix> (+ _LAYERS="2,14,20", _MIN_TOKENS, _MAX): per-worker JSONL of torch allocated /
+      reserved / peak per step, MemAvailable / RSS / AnonPages / SUnreclaim, per-phase peaks (attn / ffn / engram) of
+      chosen layers in big eager steps, Engram reader time per step (engram_disk spin_stats). Measurement windows only.
+0076b VLLM_DSV41_DROP_MTP_BUFFER=1: no [max_num_batched_tokens, hc_mult*hidden] bf16 MTP residual buffer for the DSpark
+      drafter (written every forward, never read: dflash propose() takes combine_hidden_states(cat(aux)) whenever aux
+      states exist). -160 MiB a rank at MAX_BATCH 4096 (-320 at 8192). Runner falls back to the plain hidden states.
+0076d VLLM_EXL3_TF_PROMPT_TRANSIENT=1: TensorFold prompt scratch (xg/xu/xd/z: 1,014 MiB a rank at 4096 rows, kept for
+      the whole run today) allocated per MoE call (torch.empty, call size) and released after it, so the other phases'
+      temporaries reuse it instead of stacking on top. Same kernels, same arguments, same bits.
+0076e VLLM_EXL3_TF_PROMPT_ALIAS=1 (with 0076d): the down's per-slot partials ([P, D] fp32) live in the storage of the
+      gate/up rotated rows (2 x [P, D] fp16, dead after the gate/up launch); gate/up sums get [2, P, I] fp32.
+      A call's peak 1,014 -> 750 MiB at 4096 rows. Same bits.
+Config only (no code): VLLM_INDEXER_PREFILL_BUFFER_FACTOR=4 (0033's 8 holds 2x what max_num_seqs=4 seats at full length
+      can gather; 4 changes no chunk split): indexer K-gather workspace 553 -> 277 MB a rank at MAX_LEN 524288.
+Tests: loops/kopfspeicher/test_kopfspeicher.py, test_tf_transient.py (CPU, Mac).
+
+Measured (22.10.2026, image v23, B1 factor 4 + 0076b + 0076d + 0076e, A/B on adjacent fresh starts):
+  - T=0 8/8 identical; decode +0.03 % (geometric mean, worst cell -1.3 %) against v22 under the same clock;
+  - lowest free memory on the head node under a 478K-token needle 2,493 -> 3,306 MiB (+813 MiB); after start
+    +714 MiB (first window); prefill unchanged;
+  - this is what makes max-model-len 1,048,576 fit: needle at 948,731 tokens 3/3 in 484 s, lowest free memory
+    2,048 / 2,348 MiB on the two nodes (without the switches the serve was killed at 1,333 MiB by our watchdog).
+
+--- /dev/null	2026-10-08 14:15:38.131226219 +0200
++++ b/vllm/v1/worker/gpu/dsv41_memprobe.py	2026-10-22 11:23:51.058703232 +0200
+@@ -0,0 +1,140 @@
++# SPDX-License-Identifier: Apache-2.0
++"""dsv41 patch 0076a (Entwurf 22.10.2026): memory probe for the head-node budget (measurement windows only).
++
++VLLM_DSV41_MEMPROBE=/root/.cache/memprobe  (prefix; empty = off, the default: every hook is one module-level bool test)
++writes one JSON line per logged step to <prefix>_r<rank>.jsonl from each worker:
++  step  : the step kind (prefill / mixed / decode / dummy), tokens, requests, torch allocated / reserved / peak since the
++          last logged step (MiB), allocator retries, MemAvailable and this process's RSS (MiB)
++  phase : with VLLM_DSV41_MEMPROBE_LAYERS="2,14,20" the attention / ffn / engram phases of those decoder layers in eager
++          steps of at least VLLM_DSV41_MEMPROBE_MIN_TOKENS rows (default 512): allocated before, peak and net growth of
++          the phase (MiB) - which phase of a prefill step sets the activation peak the caching allocator keeps.
++  engram: in every logged step record, per Engram disk table the reads served since the last record, their summed and
++          the running maximum serve time (ms) from the reader's own counters (engram_disk spin_stats): how long a
++          step's lookups took against how long the layers before them ran (layer 1's lookup is waited for after layer 0)
++Logged: every step of >= MIN_TOKENS tokens, the first 64 steps, then every 512th step; at most VLLM_DSV41_MEMPROBE_MAX
++lines (default 20000). Host bookkeeping only (torch's allocator statistics, /proc reads), no device sync, never under
++CUDA graph capture. Numerics untouched.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import time
++from contextlib import contextmanager
++
++import torch
++
++_PREFIX = os.environ.get("VLLM_DSV41_MEMPROBE", "").strip()
++ENABLED = bool(_PREFIX)
++_LAYERS = {int(x) for x in os.environ.get("VLLM_DSV41_MEMPROBE_LAYERS", "").replace(" ", "").split(",") if x}
++_MIN_TOKENS = int(os.environ.get("VLLM_DSV41_MEMPROBE_MIN_TOKENS", "512") or 512)
++_MAX_LINES = int(os.environ.get("VLLM_DSV41_MEMPROBE_MAX", "20000") or 20000)
++_MIB = 1 << 20
++_state = {"f": None, "lines": 0, "steps": 0, "peak": 0, "eng": None, "eng_last": None}
++
++
++def _file():
++    f = _state["f"]
++    if f is None:
++        rank = 0
++        try:
++            import torch.distributed as dist
++            if dist.is_available() and dist.is_initialized():
++                rank = dist.get_rank()
++        except Exception:  # noqa: BLE001
++            pass
++        f = _state["f"] = open(f"{_PREFIX}_r{rank}.jsonl", "a", buffering=1)
++    return f
++
++
++def _meminfo_mib() -> dict:
++    out = {}
++    try:
++        with open("/proc/meminfo") as fh:
++            for line in fh:
++                k, v = line.split(":", 1)
++                if k in ("MemAvailable", "MemFree", "Cached", "AnonPages", "Shmem", "SUnreclaim", "Mlocked"):
++                    out[k] = int(v.split()[0]) // 1024
++        with open("/proc/self/statm") as fh:
++            out["RSS"] = int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") // _MIB
++    except OSError:
++        pass
++    return out
++
++
++def _emit(rec: dict) -> None:
++    if _state["lines"] >= _MAX_LINES:
++        return
++    _state["lines"] += 1
++    rec["t"] = round(time.time(), 3)
++    _file().write(json.dumps(rec) + "\n")
++
++
++def _engram_tables(model):
++    if _state["eng"] is None:
++        tabs = []
++        try:
++            for mod in model.modules():
++                t = getattr(mod, "_disk", None)
++                if t is not None and hasattr(t, "spin_stats"):
++                    tabs.append(t)
++        except Exception:  # noqa: BLE001
++            pass
++        _state["eng"] = tabs
++        _state["eng_last"] = [list(t.spin_stats()) for t in tabs]
++    return _state["eng"]
++
++
++def _engram_delta(model) -> list:
++    tabs = _engram_tables(model) if model is not None else []
++    out = []
++    for i, t in enumerate(tabs):
++        cur = list(t.spin_stats())                 # served, serve_ns, serve_max_ns, errors
++        last = _state["eng_last"][i]
++        out.append([cur[0] - last[0], round((cur[1] - last[1]) / 1e6, 2), round(cur[2] / 1e6, 2), cur[3]])
++        _state["eng_last"][i] = cur
++    return out
++
++
++def step(kind: str, num_tokens: int, num_reqs: int, model=None) -> None:
++    """End of a worker step (after the forward is enqueued)."""
++    if not ENABLED or torch.cuda.is_current_stream_capturing():
++        return
++    n = _state["steps"] = _state["steps"] + 1
++    peak = max(_state["peak"], torch.cuda.max_memory_allocated())
++    if num_tokens >= _MIN_TOKENS or n <= 64 or n % 512 == 0:
++        stats = torch.cuda.memory_stats()
++        rec = {"ev": "step", "n": n, "kind": kind, "toks": int(num_tokens), "reqs": int(num_reqs),
++               "alloc": torch.cuda.memory_allocated() // _MIB, "reserved": torch.cuda.memory_reserved() // _MIB,
++               "peak": peak // _MIB, "retries": int(stats.get("num_alloc_retries", 0)),
++               "segments": int(stats.get("segment.all.current", 0))}
++        rec.update(_meminfo_mib())
++        eng = _engram_delta(model)
++        if eng:
++            rec["eng"] = eng
++        _emit(rec)
++        torch.cuda.reset_peak_memory_stats()
++        _state["peak"] = 0
++    else:
++        _state["peak"] = peak
++
++
++@contextmanager
++def phase(layer_idx: int, tag: str, num_tokens: int):
++    """Peak and net growth of one phase of a selected decoder layer in a large eager step."""
++    if (not ENABLED or layer_idx not in _LAYERS or num_tokens < _MIN_TOKENS
++            or torch.cuda.is_current_stream_capturing()):
++        yield
++        return
++    _state["peak"] = max(_state["peak"], torch.cuda.max_memory_allocated())
++    a0 = torch.cuda.memory_allocated()
++    torch.cuda.reset_peak_memory_stats()
++    try:
++        yield
++    finally:
++        pk = torch.cuda.max_memory_allocated()
++        _state["peak"] = max(_state["peak"], pk)
++        _emit({"ev": "phase", "layer": layer_idx, "tag": tag, "toks": int(num_tokens), "before": a0 // _MIB,
++               "peak_over": (pk - a0) // _MIB, "net": (torch.cuda.memory_allocated() - a0) // _MIB,
++               "reserved": torch.cuda.memory_reserved() // _MIB})
+--- a/vllm/models/deepseek_v41/nvidia/model.py	2026-10-22 11:12:43.847018432 +0200
++++ b/vllm/models/deepseek_v41/nvidia/model.py	2026-10-22 11:13:26.707813777 +0200
+@@ -97,6 +97,7 @@
+ from vllm.utils.math_utils import cdiv
+ from vllm.v1.attention.backends.registry import AttentionBackendEnum
+ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
++from vllm.v1.worker.gpu import dsv41_memprobe as _memprobe  # dsv41 patch 0076a
+ 
+ from ..common.engram import (
+     Engram,
+@@ -120,6 +121,17 @@
+ 
+ logger = init_logger(__name__)
+ 
++# dsv41 patch 0076b (22.10.2026): the DSpark drafter reads its target states from the aux hidden states of layers
++# 37-39 (dflash propose(): combine_hidden_states(cat(aux)) whenever aux states exist, last_hidden_states otherwise), so
++# the [max_num_batched_tokens, hc_mult * hidden] residual copy kept for DeepSeek-V4 MTP (4096 x 20480 bf16 = 160 MiB a
++# rank) is written every forward and never read. VLLM_DSV41_DROP_MTP_BUFFER=1 does not allocate it for method dspark
++# (get_mtp_target_hidden_states() then returns None and the runner hands the drafter its usual hidden states, which
++# it ignores the same way). Default 0 = unchanged.
++import os as _os
++_DROP_MTP_BUFFER = _os.environ.get("VLLM_DSV41_DROP_MTP_BUFFER", "0") == "1"
++import contextlib as _contextlib
++_NULLCTX = _contextlib.nullcontext()  # 0076a: reused when the memory probe is off
++
+ 
+ class DeepseekV4MoE(DeepseekV4MoEBase):
+     def __init__(
+@@ -302,6 +314,7 @@
+         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
+ 
+         self.engram: Engram | None = None
++        self.layer_idx = extract_layer_index(prefix)  # dsv41 patch 0076a (memory probe tags)
+         if engram_layout is not None:
+             layer_id = extract_layer_index(prefix)
+             if layer_id in engram_layout.layer_ids:
+@@ -539,11 +552,12 @@
+             previous_post = mhc_post_tilelang(x, residual, post_mix, res_mix)
+             if capture_previous_aux:
+                 previous_aux = previous_post.mean(dim=1)
+-            residual = self.engram(
+-                previous_post,
+-                engram_hashes[:, self.engram.layer_hash_index],
+-                engram_mask,
+-            )
++            with _memprobe.phase(self.layer_idx, "engram", positions.shape[0]) if _memprobe.ENABLED else _NULLCTX:
++                residual = self.engram(
++                    previous_post,
++                    engram_hashes[:, self.engram.layer_hash_index],
++                    engram_mask,
++                )
+             post_mix, res_mix, x, attn_pre = mhc_pre(
+                 residual,
+                 self.hc_attn_fn,
+@@ -587,7 +601,8 @@
+         if self.use_sequence_parallel:
+             x = sp_all_gather(x)[: positions.shape[0]]
+ 
+-        x = self.attn(positions, x, None)
++        with _memprobe.phase(self.layer_idx, "attn", positions.shape[0]) if _memprobe.ENABLED else _NULLCTX:
++            x = self.attn(positions, x, None)
+         # With GEMM-RS bound, the attention output is already this rank's
+         # sequence-parallel shard (see DeepseekV4Attention._wo_b_proj).
+         if self.use_sequence_parallel and self.attn.gemm_rs is None:
+@@ -614,11 +629,12 @@
+             stream=mhc_stream,
+             reduce_results=self.fuse_mhc_all_reduce,
+         )
+-        if self.fuse_mhc_all_reduce and self.ffn.defers_finalize(x.shape[0]):
+-            # The next layer's first boundary finalizes it with the all-reduce.
+-            x = self.ffn.forward_unfinalized(x, input_ids)
+-        else:
+-            x = self.ffn(x, input_ids, mega_gate_metadata)
++        with _memprobe.phase(self.layer_idx, "ffn", positions.shape[0]) if _memprobe.ENABLED else _NULLCTX:
++            if self.fuse_mhc_all_reduce and self.ffn.defers_finalize(x.shape[0]):
++                # The next layer's first boundary finalizes it with the all-reduce.
++                x = self.ffn.forward_unfinalized(x, input_ids)
++            else:
++                x = self.ffn(x, input_ids, mega_gate_metadata)
+         if mhc_stream is not None:
+             torch.cuda.current_stream().wait_stream(mhc_stream)
+         return x, residual, post_mix, res_mix, ffn_pre, previous_aux
+@@ -878,6 +894,10 @@
+         needs_mtp_hidden_states = spec_config is not None and (
+             spec_config.use_eagle() or spec_config.uses_draft_model()
+         )
++        if needs_mtp_hidden_states and _DROP_MTP_BUFFER and spec_config.use_dspark():
++            # dsv41 patch 0076b: DSpark never reads it (see _DROP_MTP_BUFFER)
++            needs_mtp_hidden_states = False
++            logger.info_once("dsv41 0076b: no MTP residual buffer for the DSpark drafter")
+         if get_pp_group().is_last_rank and needs_mtp_hidden_states:
+             self._mtp_hidden_buffer = torch.empty(
+                 vllm_config.scheduler_config.max_num_batched_tokens,
+--- a/vllm/v1/worker/gpu/model_runner.py	2026-10-22 11:12:43.851030357 +0200
++++ b/vllm/v1/worker/gpu/model_runner.py	2026-10-22 11:23:51.060031558 +0200
+@@ -83,6 +83,7 @@
+ from vllm.v1.worker.block_table import get_block_table_width
+ from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
+ from vllm.v1.worker.gpu import pcp_manager as pcp
++from vllm.v1.worker.gpu import dsv41_memprobe as _memprobe  # dsv41 patch 0076a
+ from vllm.v1.worker.gpu.async_utils import (
+     AsyncOutput,
+     AsyncPoolingOutput,
+@@ -981,7 +982,8 @@
+             spec_hidden_states = hidden_states
+             if hasattr(self.model, "get_mtp_target_hidden_states"):
+                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
++                if pre_hc_hidden_states is not None:  # dsv41 patch 0076b: None without the buffer
++                    spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+             if isinstance(self.sampler, GPUWatermarkSampler):
+                 self.speculator.prepare_watermarking(
+                     self.sampler, input_batch.idx_mapping
+@@ -2168,6 +2170,14 @@
+             cudagraph_stats=cudagraph_stats,
+         )
+ 
++        if _memprobe.ENABLED:
++            # dsv41 patch 0076a: memory probe (measurement windows only)
++            _memprobe.step(
++                "dummy" if dummy_run else ("prefill" if input_batch.has_prefill else "decode"),
++                input_batch.num_tokens,
++                input_batch.num_reqs,
++                model=self.model,
++            )
+         if not self.is_last_pp_rank:
+             # Non-last PP rank: return IntermediateTensors for sending.
+             assert output_intermediate_tensors is not None
+@@ -2343,7 +2353,8 @@
+             spec_hidden_states = draft_hidden_states
+             if hasattr(self.model, "get_mtp_target_hidden_states"):
+                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+-                spec_hidden_states = pre_hc_hidden_states[: draft_hidden_states.size(0)]
++                if pre_hc_hidden_states is not None:  # dsv41 patch 0076b: None without the buffer
++                    spec_hidden_states = pre_hc_hidden_states[: draft_hidden_states.size(0)]
+             if isinstance(self.sampler, GPUWatermarkSampler):
+                 self.speculator.prepare_watermarking(
+                     self.sampler, input_batch.idx_mapping
+--- a/vllm_exl3_moe/tf_prompt.py	2026-10-22 11:20:04.430708843 +0200
++++ b/vllm_exl3_moe/tf_prompt.py	2026-10-22 11:23:05.373912485 +0200
+@@ -24,6 +24,20 @@
+ 
+ ENABLED = os.environ.get("VLLM_EXL3_MOE_TF_PROMPT", "0") == "1"
+ MIN_ROWS = T.EXACT_ROWS          # below it the decode paths serve the rows (no host read per layer)
++# VLLM_EXL3_TF_PROMPT_TRANSIENT=1 (dsv41 patch 0076d, default 0): the prompt scratch's big buffers - gate/up's rotated
++# rows xg / xu, the down input xd and the partial sums z: 240 + 240 + 54 + 480 MiB = 1,014 MiB at 4,096 rows on a TP2
++# rank, twice that at 8,192 - live only for the duration of one call (torch.empty at the call's size, released after
++# it) instead of for the whole run. The attention / indexer / mHC temporaries of a prefill step's other phases then
++# reuse that memory from the caching allocator instead of stacking on top of it; the MoE phase's own peak is unchanged.
++# Same kernels, same arguments, same bits: every element a prompt call reads is written earlier in the same call
++# (rot_in -> xg / xu of the routed slots, grouped gate/up -> z, epilogue -> xd, down -> z, down_combine reads z), and
++# the persistent scratch already carries stale data from earlier calls in the slots a call does not use.
++TRANSIENT = os.environ.get("VLLM_EXL3_TF_PROMPT_TRANSIENT", "0") == "1"
++T.TRANSIENT_ALLOC = TRANSIENT
++# VLLM_EXL3_TF_PROMPT_ALIAS=1 (dsv41 patch 0076e, needs TRANSIENT): the down's partials reuse the rotated rows' storage
++# (tf_experts.ALIAS_ROT_DOWN): a call's peak 1,014 -> 750 MiB at 4,096 rows. Same bits.
++T.ALIAS_ROT_DOWN = TRANSIENT and os.environ.get("VLLM_EXL3_TF_PROMPT_ALIAS", "0") == "1"
++_TINY: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+ 
+ _tables: dict[int, T.Exl3RoutedExperts] = {}
+ _scratch: dict[tuple, T.Scratch] = {}
+@@ -71,6 +85,9 @@
+     s = _scratch.get(key)
+     if s is None or s.rows < rows:
+         s = T.Scratch(ex, -(-rows // 2048) * 2048, slots, device=device, prompt=True)
++        if TRANSIENT:
++            # dsv41 patch 0076d: the constructor's xd / z go straight back to the caching allocator
++            s.xd, s.z = _tiny(device)
+         _scratch[key] = s
+     return s
+ 
+@@ -85,5 +102,27 @@
+     wts = topk_weights.float().contiguous()
+     s = scratch(ex, m, k, x.device)
+     xb = x if x.is_contiguous() else x.contiguous()
+-    return T.routed(xb, pick, wts, ex, s, None, m, limit=float(act_limit) if act_limit else float("inf"),
+-                    act_mode=T.ACT_F32, group=True, prompt=True)
++    if not TRANSIENT:
++        return T.routed(xb, pick, wts, ex, s, None, m, limit=float(act_limit) if act_limit else float("inf"),
++                        act_mode=T.ACT_F32, group=True, prompt=True)
++    # dsv41 patch 0076d: this call's buffers only (routed() makes xg / xu and grows z with torch.empty)
++    s.xd = torch.empty((m * k, ex.width), dtype=torch.float16, device=x.device)
++    s.xg = s.xu = None
++    s.z = _tiny(x.device)[1]
++    try:
++        return T.routed(xb, pick, wts, ex, s, None, m, limit=float(act_limit) if act_limit else float("inf"),
++                        act_mode=T.ACT_F32, group=True, prompt=True)
++    finally:
++        tiny16, tiny32 = _tiny(x.device)
++        s.xg = s.xu = None
++        s.xd, s.z = tiny16, tiny32
++
++
++def _tiny(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
++    """dsv41 patch 0076d: placeholders the scratch keeps between calls (fp16 [1, 1], fp32 [1])."""
++    key = str(device)
++    t = _TINY.get(key)
++    if t is None:
++        t = _TINY[key] = (torch.empty((1, 1), dtype=torch.float16, device=device),
++                          torch.empty((1,), dtype=torch.float32, device=device))
++    return t
+--- a/vllm_exl3_moe/tf_experts.py	2026-10-22 11:20:04.430874250 +0200
++++ b/vllm_exl3_moe/tf_experts.py	2026-10-22 11:23:05.373404821 +0200
+@@ -2,7 +2,9 @@
+ # From TensorFold (github.com/bertholomus/TensorFold, branch deepseek-v41-tp2, commit 90b68e06,
+ # src/tensorfold/cuda/exl3/experts.py), Apache License 2.0; see csrc/NOTICE.tensorfold. Changed for vllm_exl3_moe
+ # (Apache-2.0 section 4(b)): _ext() builds csrc/tf_experts/ with the plugin's JIT loader (and csrc/tf_shim's stand-in
+-# for ATen/cuda/CUDAContext.h). Nothing else is changed.
++# for ATen/cuda/CUDAContext.h). dsv41 patch 0076d (22.10.2026): with TRANSIENT_ALLOC (set by tf_prompt.py) routed()
++# allocates a prompt call's rotated rows and partial sums with torch.empty at the call's size instead of torch.zeros at
++# the scratch's size. Nothing else is changed.
+ """Routed EXL3 experts of any codebook, a width per expert, one grouped launch a projection; rows never depend on the window."""
+ 
+ from __future__ import annotations
+@@ -23,6 +25,14 @@
+ 
+ # windows of this many rows or more (prompt chunks) size their member tiles to the busiest expert (a host read)
+ EXACT_ROWS = 64
++# dsv41 patch 0076d: tf_prompt.py sets this for VLLM_EXL3_TF_PROMPT_TRANSIENT=1 (every element a prompt call's kernels
++# read is written earlier in the same call, so the buffers need no zero fill and no size beyond the call's rows)
++TRANSIENT_ALLOC = False
++# dsv41 patch 0076e: with TRANSIENT_ALLOC, a prompt call whose down writes one split ([P, D] fp32 = 2 x [P, D] fp16)
++# puts the down's per-slot partials into the storage of gate/up's rotated rows, which are dead once the gate/up launch
++# has read them (same stream, plain launches: the down kernel starts after it), and gives gate/up's folded sums their
++# own [2, P, I] fp32 buffer: 1,014 -> 750 MiB at 4,096 rows on a TP2 V4.1 rank. Same kernels, same bits.
++ALIAS_ROT_DOWN = False
+ # (n tiles a block, warps, K splits, tiles in flight): GLM's settings, whose arithmetic order this keeps bit for bit
+ GLM_GATEUP = (8, 4, 4, 1)
+ GLM_DOWN = (8, 4, 1, 1)
+@@ -365,10 +375,19 @@
+             max(ex.k2_gu[1], ex.k2_d[1]) <= 10)
+     mma3 = (mma2 and kern == "mma3" and x.dtype == torch.bfloat16 and x.stride(1) == 1 and x.stride(0) % 4 == 0
+             and ex.k2_gu[1] <= 8)
++    # dsv41 patch 0076e: the down's partials in the rotated rows' storage (see ALIAS_ROT_DOWN)
++    alias = (ALIAS_ROT_DOWN and TRANSIENT_ALLOC and getattr(s, "prompt", False) and fast and not (mma2 or mma3)
++             and wts is not None and s.xg is None and s.cfg_d[2] == 1)
++    rot = None
+     if not mma3:                     # mma3 rotates gate/up's rows from x inside its programs
+-        if s.xg is None:
+-            s.xg = torch.zeros((s.rows * slots, D), dtype=torch.float16, device=x.device)
+-            s.xu = torch.zeros((s.rows * slots, D), dtype=torch.float16, device=x.device)
++        if alias:
++            rot = torch.empty((2 * P * D,), dtype=torch.float16, device=x.device)
++            s.xg, s.xu = rot[:P * D].view(P, D), rot[P * D:].view(P, D)
++        elif s.xg is None:
++            n_rot = P if TRANSIENT_ALLOC else s.rows * slots           # dsv41 patch 0076d
++            alloc = torch.empty if TRANSIENT_ALLOC else torch.zeros
++            s.xg = alloc((n_rot, D), dtype=torch.float16, device=x.device)
++            s.xu = alloc((n_rot, D), dtype=torch.float16, device=x.device)
+         ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E)
+     nt, w, sk, pf = s.cfg_gu
+     # mma per projection: a down whose K chains do not split into MMA_KB steps (a TP2 DeepSeek-V4.1 rank: I = 1152)
+@@ -394,8 +413,12 @@
+             need = P * max(2 * I + (D // 2 if mma3 else 0), D * (1 if (mma2 or mma3 or mma_d) else s.cfg_d[2]))
+         else:
+             need = P * max(2 * sk * I, s.cfg_d[2] * D)
+-        if s.z.numel() < need:
+-            s.z = torch.zeros((need,), dtype=torch.float32, device=x.device)
++        if not alias and s.z.numel() < need:
++            s.z = (torch.empty if TRANSIENT_ALLOC else torch.zeros)((need,), dtype=torch.float32, device=x.device)
++    z_gu = z_dn = s.z                # dsv41 patch 0076e: gate/up's sums and the down's partials (one buffer without it)
++    if alias:
++        z_gu = torch.empty((2 * P * I,), dtype=torch.float32, device=x.device)
++        z_dn = rot.view(torch.float32)
+     if mma3:
+         ext.grouped_mma3(x, x.stride(0), ex.suh_g, ex.suh_u, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids,
+                          s.count, members, s.z, D, I, P, slots, ex.cb, ex.k2_gu[0], ex.k2_gu[1], MMA3_NW)
+@@ -405,18 +428,18 @@
+                          I, P, slots, ex.cb, ex.k2_gu[0], ex.k2_gu[1])
+     elif mma:
+         # every split's chains in one program, their sum from 0 as the epilogue would add them
+-        ext.grouped_mma(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
++        ext.grouped_mma(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, z_gu, 2, D, I,
+                         P, sk, slots, ex.cb, w, ex.k2_gu[0], ex.k2_gu[1], 1 | _mma_steps() << 1, work_gu)
+     elif fast:
+         # one program runs the K splits in order and writes their sum from 0, as the epilogue would add them
+         pnt, ppf, pg = PROMPT_TILES["gateup"]
+-        ext.grouped_rows(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D,
++        ext.grouped_rows(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, z_gu, 2, D,
+                          I, P, sk, slots, ex.cb, pnt, w, ppf, pg, ex.k2_gu[0], ex.k2_gu[1], 1, work_gu)
+     else:
+         cp = DECODE_STAGES if (mode != "old" and ex.aligned16 and nt == 8 and w == 4) else 0
+-        ext.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
++        ext.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, z_gu, 2, D, I,
+                     P, sk, slots, ex.cb, nt, w, cp or pf, ex.k2_gu[0], ex.k2_gu[1], int(cp > 0))
+-    ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, 1 if fast else sk, slots, E,
++    ext.gateup_epilogue(z_gu, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, 1 if fast else sk, slots, E,
+                         float(limit), act_mode)
+     nt, w, sk, pf = s.cfg_d
+     dsk = sk                          # the down partials' splits as down_combine reads them
+@@ -436,25 +459,25 @@
+         dsk = 1
+     elif mma_d:
+         # one split is written as is; several are folded in order from 0 (down_combine's order) into one
+-        ext.grouped_mma(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1,
++        ext.grouped_mma(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, z_dn, 1,
+                         I, D, P, sk, slots, ex.cb, w, ex.k2_d[0], ex.k2_d[1], int(sk > 1) | _mma_steps() << 1, work_d)
+         dsk = 1
+     elif fast:
+         pnt, ppf, pg = PROMPT_TILES["down"]
+-        ext.grouped_rows(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1,
++        ext.grouped_rows(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, z_dn, 1,
+                          I, D, P, sk, slots, ex.cb, pnt, w, ppf, pg, ex.k2_d[0], ex.k2_d[1], 0, work_d)
+     else:
+         cp = DECODE_STAGES if (mode != "old" and ex.aligned16 and nt == 8 and w == 4) else 0
+-        ext.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I,
++        ext.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, z_dn, 1, I,
+                     D, P, sk, slots, ex.cb, nt, w, cp or pf, ex.k2_d[0], ex.k2_d[1], int(cp > 0))
+     if wts is None:
+-        ext.down_epilogue(s.z, pick, ex.svh_d, s.y, R, P, D, dsk, slots, E)
++        ext.down_epilogue(z_dn, pick, ex.svh_d, s.y, R, P, D, dsk, slots, E)
+         return s.y[:P]
+     if out is None:
+         out = torch.empty((R, D), dtype=torch.float32, device=x.device)
+     # the down epilogue and the combine in one launch (the same arithmetic in the same order as the two); a prompt
+     # chunk leaves the per-slot outputs unwritten (453 MB a layer at 2,048 rows that nothing reads)
+-    ext.down_combine(s.z, pick, ex.svh_d, s.no_y if fast else s.y, wts, s.no_y if add is None else add, out, R, P, D,
++    ext.down_combine(z_dn, pick, ex.svh_d, s.no_y if fast else s.y, wts, s.no_y if add is None else add, out, R, P, D,
+                      dsk, slots, E, 0 if fast else 1, int(add is not None))
+     return out
+ 

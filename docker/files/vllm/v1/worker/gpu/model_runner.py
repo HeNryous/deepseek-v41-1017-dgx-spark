@@ -83,6 +83,8 @@ from vllm.v1.watermarking.spec_decode import (
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
+from vllm.v1.worker.gpu import dsv41_memprobe as _memprobe  # dsv41 patch 0076a
+from vllm.v1.worker.gpu import dsv41_engram_lookahead as _engram_la  # dsv41 patch 0078
 from vllm.v1.worker.gpu.async_utils import (
     AsyncOutput,
     AsyncPoolingOutput,
@@ -981,7 +983,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_hidden_states = hidden_states
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+                if pre_hc_hidden_states is not None:  # dsv41 patch 0076b: None without the buffer
+                    spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
             if isinstance(self.sampler, GPUWatermarkSampler):
                 self.speculator.prepare_watermarking(
                     self.sampler, input_batch.idx_mapping
@@ -2168,6 +2171,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cudagraph_stats=cudagraph_stats,
         )
 
+        if _engram_la.ENABLED and not dummy_run and input_batch.has_prefill:
+            # dsv41 patch 0078: the next prompt chunk's Engram rows into the page cache while this step computes
+            _engram_la.after_forward(self.model, input_batch, self.req_states)
+        if _memprobe.ENABLED:
+            # dsv41 patch 0076a: memory probe (measurement windows only)
+            _memprobe.step(
+                "dummy" if dummy_run else ("prefill" if input_batch.has_prefill else "decode"),
+                input_batch.num_tokens,
+                input_batch.num_reqs,
+                model=self.model,
+            )
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
             assert output_intermediate_tensors is not None
@@ -2343,7 +2357,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_hidden_states = draft_hidden_states
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: draft_hidden_states.size(0)]
+                if pre_hc_hidden_states is not None:  # dsv41 patch 0076b: None without the buffer
+                    spec_hidden_states = pre_hc_hidden_states[: draft_hidden_states.size(0)]
             if isinstance(self.sampler, GPUWatermarkSampler):
                 self.speculator.prepare_watermarking(
                     self.sampler, input_batch.idx_mapping

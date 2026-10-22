@@ -13,12 +13,12 @@ AK_MAX_REQS=${AK_MAX_REQS:-4}
 RECIPE=${RECIPE:-$HOME/dgx-spark-deepseek-v41}      # git clone https://github.com/sudoingX/dgx-spark-deepseek-v41
 export HEAD=${HEAD:?set HEAD=<head node hostname>} WORKER=${WORKER:?set WORKER=<worker node hostname>}
 export FAB_IF=${FAB_IF:-enp1s0f0np0} FAB_HCA=${FAB_HCA:-rocep1s0f0}   # fabric netdev and its RoCE device (DGX Spark names)
-export IMAGE=ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v22
+export IMAGE=ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v24
 export MODEL_DIR=$HOME/models/DeepSeek-V4.1-Flash-1017-EXL3-2.75bpw-DGX-Spark   # incl. the two 1017 Engram shards (scripts/download_model.sh)
 export SERVED=DeepSeek-V4.1-Flash-1017-EXL3-Spark-TP2
-export TEXT_ONLY=0 MAX_LEN=524288 MAX_SEQS=4 MAX_BATCH=4096 UTIL=0.86   # 512K context since 22.10. (needle at 479K 3/3)
-export KV_BYTES=4026531840                       # 3.75 GiB per rank -> 1,736,715 tokens at MAX_LEN 524288 with 0057 + 0060 (1,531,258
-                                                 # at 327680); UTIL then only gates the startup check
+export TEXT_ONLY=0 MAX_LEN=1048576 MAX_SEQS=4 MAX_BATCH=4096 UTIL=0.86   # 1M context since 22.10. (needle at 949K 3/3, needs 0076)
+export KV_BYTES=3758096384                       # 3.5 GiB per rank (256 MiB of the head node go to the offload's CPU tier)
+                                                 # -> 1,824,938 tokens at MAX_LEN 1048576; UTIL then only gates the startup check
 # 0040: DSpark k = 5 at 1-4 streams (at most 24 verify rows, kept on exl3_mrow by 0042b; until 21.10. k = 4 at 3-4)
 export SPEC='{"method":"dspark","num_speculative_tokens":5,"num_speculative_tokens_per_batch_size":[[1,4,5]]}'
 # keep the background long-prefill threshold <= MAX_BATCH / 4, otherwise background prefills can fill a whole step and a
@@ -26,6 +26,13 @@ export SPEC='{"method":"dspark","num_speculative_tokens":5,"num_speculative_toke
 # ordered by the request field `priority` (lower first); --enable-prompt-tokens-details: usage reports cached prompt tokens.
 export EXTRA="--limit-mm-per-prompt '{\"image\":4}' --mm-processor-cache-gb 0 --long-prefill-token-threshold $((MAX_BATCH / 4)) \
 --scheduling-policy priority --enable-prompt-tokens-details"
+# KV offload (0056/0058 + 0077/0081, since 22.10.): vLLM's OffloadingConnector with a 256 MiB CPU tier and a file tier under
+# ~/.cache/dsv41-serve/kv_offload (on the head node only). 0077 keeps one copy per chunk on rank 0 and copies the chunks to
+# rank 1 over gloo before each load (GLOO_SOCKET_IFNAME must be the fabric NIC); 0081 caps a request's load at what fits
+# 45 % of the CPU tier (66,432 tokens here) and moves the file tier's I/O threads to the A725 cores. Prune the folder
+# yourself (we delete blocks older than a day and cap it at 40 GB, hourly), and remove stale /dev/shm/vllm_offload_*.mmap
+# before a start: the CPU tier's file stays there after every stop.
+export EXTRA="$EXTRA --kv-transfer-config '{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"spec_name\":\"TieringOffloadingSpec\",\"cpu_bytes_to_use\":268435456,\"secondary_tiers\":[{\"type\":\"fs\",\"root_dir\":\"/root/.cache/kv_offload\",\"n_read_threads\":8,\"n_write_threads\":4}]}}'"
 # 0031: requests with priority >= 5 count as background; with VLLM_PREFILL_EVERY_N_STEPS=100000 (until 21.10.: 24) their
 # prefill runs only while no foreground request runs. 0073: also not while a foreground request waits for admission;
 # 0074: background prefill chunks keep the long-prefill threshold when they run alone.
@@ -38,6 +45,8 @@ export EXTRA="--limit-mm-per-prompt '{\"image\":4}' --mm-processor-cache-gb 0 --
 # on through 0042b's ring kernel. Recipe switches: router GEMM before the shared-expert fork, shared expert inside the
 # routed-expert kernel. 0048: mHC boundary in one launch (bit-identical); 0050: mHC overlap path up to 24 rows.
 # 0047: adaptive verify window (needs the 0040 schedule in SPEC), values at the top.
+# v24 (22.10.): 0075 replay skip, 0078 Engram lookahead, 0076 head memory (indexer factor 4, no MTP buffer, TensorFold
+# prompt scratch per call / aliased), 0056/0058/0077/0081 KV offload across both nodes (see the EXTRA block above).
 # 0057 + 0060: the ratio-1 KV group in blocks of three 64-state kernel pages (no allocator padding);
 # VLLM_DSV41_KV_SWA_FILL=1 is part of the measured configuration and has no effect with FP8 records.
 # 0051: the indexer's weights GEMV off the main stream's critical path (bit-identical). 0064: MoE calls of 33-63 rows
@@ -60,7 +69,11 @@ VLLM_DSV41_AK_MAX_REQS=$AK_MAX_REQS \
 VLLM_DSV41_KV_PAIR=3 VLLM_DSV41_KV_SWA_FILL=1 \
 VLLM_DSV41_INDEXER_DEFER=1 VLLM_EXL3_MOE_SPLIT_MAX_TOKENS=63 EXL3_CPU_PIN=5-9,15-19 \
 VLLM_DSV41_MARKOV_FUSED=1 VLLM_DSV41_VOR_FUSED=1 VLLM_DSV41_BG_DEPTH=0 VLLM_DSV41_BG_PAUSE_PRIO=10 \
-VLLM_DSV41_FG_WAIT_THROTTLE=1 VLLM_DSV41_BG_LPT_SOLO=1"
+VLLM_DSV41_FG_WAIT_THROTTLE=1 VLLM_DSV41_BG_LPT_SOLO=1 \
+VLLM_DSV41_REPLAY_SKIP=1 VLLM_DSV41_ENGRAM_LOOKAHEAD=4096 \
+VLLM_INDEXER_PREFILL_BUFFER_FACTOR=4 VLLM_DSV41_DROP_MTP_BUFFER=1 VLLM_EXL3_TF_PROMPT_TRANSIENT=1 VLLM_EXL3_TF_PROMPT_ALIAS=1 \
+VLLM_DSV41_KV_CRC=1 VLLM_DSV41_OFFLOAD_EXPANDABLE_OK=1 VLLM_DSV41_OFFLOAD_MULTINODE=1 \
+VLLM_DSV41_OFFLOAD_LOAD_FRACTION=0.45 VLLM_DSV41_OFFLOAD_IO_CPUS=0-4,10-13"
 # The plugin's JIT kernels (TensorFold experts, exl3_mrow, RDMA ring, mHC boundary, router, routed-expert decode, L2
 # prefetch) on both nodes before the model loads; once built for this image, this only loads them. Building them next to
 # the loaded weights can run a node out of memory. EXL3_SMOE_FLAGS is the launcher's (part of the module name).

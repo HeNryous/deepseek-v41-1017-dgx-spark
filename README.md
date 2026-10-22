@@ -1,9 +1,9 @@
-# DeepSeek-V4.1-Flash-1017 on 2× DGX Spark (GB10) — EXL3 2.75 bpw, 512K context
+# DeepSeek-V4.1-Flash-1017 on 2× DGX Spark (GB10) — EXL3 2.75 bpw, 1M context
 
 A ready-to-run setup for **[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)** on
 **two DGX Spark / GB10** nodes with tensor parallelism 2: our EXL3 quantization
 ([HeNryous/DeepSeek-V4.1-Flash-1017-EXL3-2.75bpw-DGX-Spark](https://huggingface.co/HeNryous/DeepSeek-V4.1-Flash-1017-EXL3-2.75bpw-DGX-Spark),
-**KLD 0.0201** against the native 1017 on sudoingX's KLD panel), a complete vLLM serving image, 512K context, image
+**KLD 0.0201** against the native 1017 on sudoingX's KLD panel), a complete vLLM serving image, 1M context, image
 input, tool calling and DSpark speculative decoding. Every number below was measured on this exact setup.
 
 ## Hardware
@@ -16,7 +16,7 @@ input, tool calling and DSpark speculative decoding. Every number below was meas
 
 ```bash
 # 1) The serving image (linux/arm64, CUDA 13, ~25 GB unpacked) — on both nodes:
-docker pull ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v22
+docker pull ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v24
 
 # 2) Model + the two Engram shards into ONE folder (~402 GB). On the head node, then copy to the worker:
 git clone https://github.com/HeNryous/deepseek-v41-1017-dgx-spark && cd deepseek-v41-1017-dgx-spark
@@ -33,7 +33,7 @@ git -C ~/dgx-spark-deepseek-v41 checkout cc59c36
 #    it is part of the module name.
 mkdir -p ~/.cache/dsv41-serve && docker run --rm --gpus all -v $HOME/.cache/dsv41-serve:/root/.cache \
   -e TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions -e MAX_JOBS=4 -e EXL3_SMOE_FLAGS=-DSMOE_RUNFLAGS=1 \
-  --entrypoint python3 ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v22 \
+  --entrypoint python3 ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v24 \
   -c 'from vllm_exl3_moe import tf_experts as t, mrow, rdma, mhc, router, smoe, l2pf; t._ext(); mrow.ext(); rdma.ext(); mhc.ext(); router.ext(); smoe.ext(); l2pf.ext()'
 
 # 5) Start on the head node (network devices default to the DGX Spark names; see the script):
@@ -110,13 +110,14 @@ measurement (three suite / two bench runs). Single-stream code at T = 1 again mo
 
 The scripts sample at T = 1, so single-stream numbers move by several percent between runs. Our production image of
 19.10. (v4i + 0040–0046, not published) reached 87.7 (prose) and 143.7 (code) tok/s at 4 streams with the same scripts
-at 2000 MHz (single runs). Contexts above 320K: see "512K context" below.
+at 2000 MHz (single runs). Contexts above 320K: see "From v22 to v24" below (1M in use since 22.10.).
 
 Image v12 (21.10.) = v5 + patches 0051–0061, of which only the KV page layout (0057 + 0060) is switched on. Each of
 them was A/B-tested against the image before it (cost per decode round within ±0.5 %), so the decode rows above stand
 for v12 as well. Since the night of 21.10. we run image v22 = v12 + patches 0064, 0066, 0067, 0071, 0072, 0073 and
-0074, with the switches listed in "From v12 to v22" below. v6–v11 and v13–v21 were internal builds and are not
-published.
+0074, with the switches listed in "From v12 to v22" below. Since the evening of 22.10. we run image v24 = v22 +
+0075–0081 at max-model-len 1,048,576 with the KV offload across both nodes (see "From v22 to v24"). v6–v11, v13–v21
+and v23 were internal builds and are not published.
 
 **Long context, fairness and memory** (image v4i unless noted; the later changes are mainly in decode-time paths, the
 other rows were not re-measured)
@@ -258,6 +259,43 @@ A run on v20 under the same conditions gave the same numbers within noise: code 
 138.9, aggregate 2 / 4 streams 77.7 / 122.3, sustained 129.1, prefill 8K / 32K / 128K 2,165 / 2,164 / 2,149 (decode
 after a 128K prompt 73.7, see ³). kit_bench sends no `priority`, so 0071–0074 do not act there.
 
+**From v22 to v24** (22.10.). Each step ran from a fresh start against a fresh start of the setup before it, on
+adjacent starts in the same window. spark2's thermal guard caps its GPU at 2000 MHz under sustained prefill; in the
+last two windows it ran capped from the start, so both sides of every A/B had the same clock (the cap alone cost
+3.05 % decode, v22 against v22). Correctness of anything that touches prefill or the KV cache was checked with needle
+prompts: three codes in the context, the first answer token has p ~ 1, so the first-token KL between two fresh
+computes of the same prompt is 0.0009–0.0037, and a wrong KV shows up at once.
+
+| step (adopted) | what | result |
+|---|---|---|
+| 1. 0077 (`VLLM_DSV41_OFFLOAD_MULTINODE=1`) | KV offload across two nodes: one copy per chunk on rank 0, copied to rank 1 over gloo before each load (both ranks' CPU tiers were byte-identical after the same stores) | 3 × 75K-token prefixes from the file tier after a restart in 1.3–2.1 s instead of 33.8 s, codes right, first-token KL 0.0003–0.0035; two background requests with JSON schema next to it fine; decode +0.27 % against v22 measured right after; corruption test 0 hits |
+| 2. 0081 (`VLLM_DSV41_OFFLOAD_LOAD_FRACTION=0.45`, `VLLM_DSV41_OFFLOAD_IO_CPUS=0-4,10-13`) | per-request load cap from the CPU tier size (a prefix larger than the CPU tier used to hang forever), file-tier I/O threads on the A725 cores | a 252K-token prefix (the 256 MiB CPU tier holds ~148K tokens): 66,432 tokens from the file tier, the rest computed, 84.3 s instead of 111.2 s, codes right |
+| 3. 0075 (`VLLM_DSV41_REPLAY_SKIP=1`) | no decoder replay on intermediate prefill chunks | prefill of a 478K-token prompt +4.9 / +5.9 % (two windows), 949K tokens +6.5 %; first-token KL 0.0017 (noise 0.0015); 26K-token prompts unchanged |
+| 4. 0076 (B1–B4: indexer buffer factor 4, `VLLM_DSV41_DROP_MTP_BUFFER=1`, `VLLM_EXL3_TF_PROMPT_TRANSIENT=1`, `VLLM_EXL3_TF_PROMPT_ALIAS=1`) | head-node buffers that were never read or held for the whole run | +813 MiB free under a 478K-token needle; decode +0.03 %; T=0 identical |
+| 5. max-model-len 1,048,576 (with 4) | 1M context | needle at 948,733 tokens 3/3 in 454.7 s (2,087 tok/s), cached re-ask 2.5 s; lowest free memory 2,250 / 3,390 MiB (without step 4 the serve was killed by our watchdog at 1,333 MiB) |
+| 6. 0078 lookahead (`VLLM_DSV41_ENGRAM_LOOKAHEAD=4096`) | the next chunk's Engram rows read ahead by a second reader on the A725 cores | prefill +9.4 % (131K tokens, new text) / +8.3 % (32K, repeated text), 478K needle +1.3 %, decode −0.04 %, T=0 identical |
+| all of it (image v24) against v24 without switches | | decode −0.49 % (geometric mean, worst cell −2.7 %), T=0 8/8 identical, first-token KL 0.0016 |
+
+Tried on top of it, not adopted: 0078's reader pool on the A725 cores (+9.9 % prefill, but every decode round
+0.6–1.1 % slower), the pool on all 20 cores (prefill +2.7 %), 0079 (−0.32 %, inside the noise) and 0080 (the startup
+reservation lowers the floor instead of flattening it: 1,970 instead of 2,250 MiB under the 949K needle). A repeat of
+the reference at the end of that window moved decode by −0.58 % and prefill by +0.86 %: that is the noise of these
+comparisons. Prefill and decode were weighted equally; 0078's lookahead alone came out +2.5 % overall (prefill +9.0 %,
+decode −0.04 %).
+
+**KV offload across two nodes, what went wrong first.** With vLLM's OffloadingConnector and a file-system tier,
+each node has its own CPU tier (a shared-memory file), and the scheduler, which runs on the head node only, reads and
+writes the file tier through its own node's copy. vLLM allows the one-copy layout only for single-node TP, so with
+two nodes every rank kept a per-rank slot, both ranks used slot 0 (device index 0 on each node), the files held rank
+0's pages plus zeros, and after a load from disk rank 1 read whatever its CPU slot held last. On 22.10. that ran in
+production for nine hours (garbage text, NaN logits, finally an illegal memory access on rank 1) before we caught it;
+our first reload test had passed because rank 1's CPU tier was still zero after the restart and the model's summary
+of the 57K-token document stayed plausible. A second, independent failure: a prefix that needs more chunks than the
+CPU tier holds evicts its own promoted chunks and waits forever. 0077 and 0081 fix both. The CPU tier's
+shared-memory files also stay in /dev/shm after every stop; `serve_prod`-style scripts should remove unused ones
+before a start (ours does).
+
+
 ## What is in the image
 
 The serving image of the [sudoingX recipe](https://github.com/sudoingX/dgx-spark-deepseek-v41) v1.1 (vLLM pin
@@ -287,9 +325,9 @@ The serving image of the [sudoingX recipe](https://github.com/sudoingX/dgx-spark
 | 0053 | KV cache backed by the GB10 display reservation (1,792 MiB per node, DRM dumb buffer + `cuMemHostRegister`) with pinned ordinary memory behind it (`VLLM_DSV41_DISPLAY_KV_MIB`) | off: KV pool +47 %, but ~1 GB less free memory under load and +1.5 % per round (see "Tried") |
 | 0054 | token embedding (631 MiB per rank) and the DSpark Markov cache (505 MiB) in the display reservation, copied bit-exact (`VLLM_DSV41_DISPLAY_TENSORS=1`) | off: decode −1.7 % (geometric mean), 64K code −6.7 % |
 | 0055 | draft mode per request from the 0047 regime: requests that plan the full window draft probabilistically, the others greedy with a one-hot draft distribution, so their verification stays exact (`VLLM_DSV41_HYBRID_DRAFT=1`) | off: +0.75 % at T=1 (code at 1 stream +5.0 %), but prose at 1 stream −1.6 % |
-| 0056 | CRC-32 sidecar for every block of vLLM's file-system KV offload tier, checked after each load; a bad block is deleted and recomputed (`VLLM_DSV41_KV_CRC=1`) | off since 22.10. (in production 02:08–11:20, with 0058): with TP across two nodes, vLLM's tiering spec writes the file tier from, and loads it back into, the CPU tier on the scheduler's node only; rank 1's CPU tier on the second node is never filled, so after a load from disk rank 1 reads stale blocks (garbage text, NaN logits, finally an illegal memory access). The CRC cannot see this, the bytes on disk are fine. Our reload test (57K tokens after a restart, 29.2 → 1.2 s) had passed because rank 1's CPU tier was still zero after the restart and the summary stayed plausible. The tier's shared-memory files also stay in /dev/shm after every stop (268 MB per node and start). |
+| 0056 | CRC-32 sidecar for every block of vLLM's file-system KV offload tier, checked after each load; a bad block is deleted and recomputed (`VLLM_DSV41_KV_CRC=1`) | **in use again** since 22.10. with image v24, together with 0058, 0077 and 0081. Off 02:08–21:40 that day: with TP across two nodes vLLM's tiering spec kept rank 1's pages on a node nothing reads them back from, so a load from disk gave rank 1 stale blocks (garbage text, NaN logits, an illegal memory access); 0077 fixes that. The CRC cannot see such a case, the bytes on disk are fine; it guards the files themselves. |
 | 0057 | paired KV pages: the ratio-1 compressed-KV group takes 128-token blocks made of two 64-state kernel pages and stops paying the ratio-2 group's block stride (`VLLM_DSV41_KV_PAIR=1`; `VLLM_DSV41_KV_SWA_FILL=1` fills the sliding-window groups up to the stride) | KV pool 989,460 → 1,346,928 tokens (+36 %), live 3,267 → 2,187 B per token, cost per round −0.3 %, T=0 identical 8/8, corruption test 0 hits |
-| 0058 | vLLM's OffloadingConnector next to `expandable_segments:True` (`VLLM_DSV41_OFFLOAD_EXPANDABLE_OK=1`) | needed for 0056; off with it |
+| 0058 | vLLM's OffloadingConnector next to `expandable_segments:True` (`VLLM_DSV41_OFFLOAD_EXPANDABLE_OK=1`) | needed for 0056; in use with it |
 | 0059 | NVFP4 KV records on GB10: FlashInfer's 384 B SM120 record (e2m1 with an e4m3 scale per 16, RoPE in BF16) for the window and the compressed KV, written with FlashInfer's own quantize-append; SWA indices padded to 512 for DSpark's 192-wide non-causal verify (`VLLM_DSV41_KV_NVFP4=1`) | off: KV pool +49.5 %, but KV-KLD 0.028 / top-1 95.0 % against FP8 records (see "KV cache capacity") |
 | 0060 | three 64-state kernel pages per manager block for the ratio-1 KV group: 3 × 46,080 B = the ratio-2 block stride, no padding left (`VLLM_DSV41_KV_PAIR=3`, on top of 0057) | **in use:** KV pool 1,346,928 → 1,531,258 tokens (+13.7 %), live 2,187 → 1,827 B per token, cost per round −0.5 %, T=0 identical 8/8, corruption test 0 hits |
 | 0061 | FP8 sliding window + NVFP4 compressed KV (as vLLM's SM100 format does): two FlashInfer calls with `return_lse`, merged in Triton (base-2 LSE, sink in the merge) (`VLLM_DSV41_KV_NVFP4=2`) | off: KV pool 1,837,489 with 0060, but KV-KLD 0.0146 / top-1 96.6 % and tok/s −2.8 % (fewer drafts accepted) |
@@ -303,6 +341,13 @@ The serving image of the [sudoingX recipe](https://github.com/sudoingX/dgx-spark
 | 0072 | background decode pause: while a request with `priority` < `VLLM_DSV41_BG_PAUSE_PRIO` runs, the scheduler skips decoding requests at or above it; they keep their KV blocks and drafts and continue once no foreground request runs; prefill chunks stay with 0031; live through the depth file (`bgpause=`); outputs unchanged | **in use** (`VLLM_DSV41_BG_PAUSE_PRIO=10`): foreground decode next to one / two background streams +25…+56 % on top of 0071 `bg=0` (prose 34.4 → 53.8, code 57.5 → 83.2 tok/s next to two), first token unchanged |
 | 0073 | the 0031 prefill throttle also holds while a foreground request (`priority` below `VLLM_PREFILL_THROTTLE_MIN_PRIO`) waits, so the step that admits it carries no background chunk (`VLLM_DSV41_FG_WAIT_THROTTLE=1`) | **in use**, measured together with the 0031 cadence 100000: foreground next to two 60K-token background prefills 22.5 → 56.5 tok/s, first token 3.7–3.8 → 1.3–2.4 s (shares not separated) |
 | 0074 | background prefill chunks keep `--long-prefill-token-threshold` also when they are the only eligible request (vLLM drops it then); a foreground request alone still gets the whole budget (`VLLM_DSV41_BG_LPT_SOLO=1`) | **in use**: first token next to one background prefill 2.1–4.0 → 1.4 s; a 60K-token background prompt alone prefills in 112 instead of 92 s |
+| 0075 | no decoder replay on intermediate prefill chunks: layers 20–39 ran again on each prefilling request's last 128 rows in every step, read by nothing unless the chunk is the last one (`VLLM_DSV41_REPLAY_SKIP=1`) | **in use** (v24): prefill of a 478K-token prompt +4.9 / +5.9 %, 949K tokens +6.5 %; first-token KL against the same image without it 0.0017 (two fresh computes: 0.0015); 26K-token prompts unchanged |
+| 0076 | head-node memory: no MTP residual buffer for DSpark (`VLLM_DSV41_DROP_MTP_BUFFER=1`), TensorFold prompt scratch per call and aliased (`VLLM_EXL3_TF_PROMPT_TRANSIENT=1`, `VLLM_EXL3_TF_PROMPT_ALIAS=1`), memory probe (`VLLM_DSV41_MEMPROBE`), plus `VLLM_INDEXER_PREFILL_BUFFER_FACTOR=4` | **in use** (v24): +813 MiB free under a 478K-token needle, decode +0.03 %, T=0 identical; this makes 1M fit |
+| 0077 | KV offload with TP across two nodes: one copy per chunk (every offloaded layer is one latent head, identical on both ranks: the two CPU tiers were byte-identical after the same stores), rank 0 stores, before each load the chunks go from rank 0's CPU tier to rank 1's over a gloo group (`VLLM_DSV41_OFFLOAD_MULTINODE=1`) | **in use** (v24): 75K-token prefixes from the file tier after a restart in 1.3–2.1 s instead of 33.8 s, first-token KL 0.0003–0.0035 against a fresh compute, decode +0.27 % |
+| 0078 | Engram reads in prefill: lookahead reader for the next chunk's rows (`VLLM_DSV41_ENGRAM_LOOKAHEAD=4096`), reader pool CPUs (`VLLM_DSV41_ENGRAM_POOL_CPUS`) | lookahead **in use** (v24): prefill +9.4 % (131K tokens of new text), +8.3 % (32K repeated), decode −0.04 %; the pool on the A725 cores slows every decode round by 0.6–1.1 %: off |
+| 0079 | decode fixed costs: global top-k indices reused across layers with the same inputs, no zero output for the shared expert (`VLLM_DSV41_GTOPK_REUSE=1`, `VLLM_EXL3_MOE_SHARED_ZEROS=1`) | off: decode −0.32 % (noise ±0.6 %), the estimated 0.35–0.6 % not measurable |
+| 0080 | reserve the late memory peaks at startup (dummy prefill at full context, mixed step, vision encoder; `VLLM_DSV41_PREALLOC=1`) | off: the floor does not become flat; lowest free memory under a 949K-token needle 1,970 instead of 2,250 MiB |
+| 0081 | KV offload: per-request load cap from the CPU tier size (a prefix needing more chunks than the CPU tier holds evicted its own promoted chunks and waited forever) and the file tier's I/O threads off the decode cores (`VLLM_DSV41_OFFLOAD_LOAD_FRACTION=0.45`, `VLLM_DSV41_OFFLOAD_IO_CPUS=0-4,10-13`) | **in use** (v24): with a 256 MiB CPU tier (~148K tokens) at most 66,432 tokens per request come from the file tier; a 252K-token prefix: 84.3 s instead of 111.2 s, no hang |
 | recipe switches | `VLLM_MOE_GATE_FIRST=1` (recipe patch 0018: the router GEMM before the shared-expert fork) and `VLLM_EXL3_MOE_SMOE_SHARED=1` (the shared expert inside the routed-expert kernel as one more pick per token, instead of its own launches); since 21.10. also `EXL3_CPU_PIN=5-9,15-19` (the plugin pins every thread of the vLLM processes to the Cortex-X925 cores) | step 3; `EXL3_CPU_PIN`: with 0064 in step 3 of "From v12 to v22" |
 
 All new switches are off by default; without them the image behaves like v4i. `serve/serve_example.sh` sets the ones we
@@ -414,6 +459,10 @@ from 3.98 to 3.49 tokens per round. At 1.6, JSON keeps 4.05 of 4.11 tokens per r
 - **Measure A/B with a fixed clock** (`nvidia-smi -lgc 0,2000` on both nodes) and with no other clients on the server
   (`Running: 0` in the engine log).
 
+- **Watch the second node's temperature.** Under long prefills spark2 reaches the limits of our thermal guard
+  (GPU > 80 °C or board > 90 °C) and is capped at 2000 MHz; in TP2 the slower node sets the pace, which cost 3.05 %
+  decode (v22 against v22 on 22.10.). Airflow around that node is worth more than most kernel tweaks.
+
 ## Tried, and not tried
 
 - **Batch-aware depth à la TensorFold (0041 `confb`), confidence calibration for T > 0 (`cal=1`) and prompt-lookup drafts
@@ -473,16 +522,20 @@ from 3.98 to 3.49 tokens per round. At 1.6, JSON keeps 4.05 of 4.11 tokens per r
   the KV pool can grow by 1 GiB): decode −1.7 %, 64K code −6.7 %. Not adopted.
 - **Hybrid drafting (0055)**, probabilistic drafts only for requests that plan the full window, greedy for the rest:
   +0.75 % at T=1 overall and +5 % for code at 1 stream, but prose at 1 stream −1.6 %. Not adopted.
-- **1M context:** max-model-len 1,048,576 starts (pool 1,664,407 tokens with 0057), but the indexers' shared K gather
+- **1M context** (in use since 22.10. with 0076, see "From v22 to v24"; the attempt before it): max-model-len 1,048,576 starts (pool 1,664,407 tokens with 0057), but the indexers' shared K gather
   buffer (max-model-len × `VLLM_INDEXER_PREFILL_BUFFER_FACTOR` × 132 B) and the longer RoPE cache leave the head node
   with 1.3–1.9 GiB free under the first long prompts, below our 1.5 GiB watchdog, also with buffer factor 2 instead of 8.
-  **512K context (in use since 22.10.):** max-model-len 524,288 with image v22, KV 3.75 GiB per rank = 1,736,715
+  **512K context (22.10., replaced by 1M the same evening):** max-model-len 524,288 with image v22, KV 3.75 GiB per rank = 1,736,715
   tokens (3.31 full 512K requests). A needle test at 478,821 tokens (three codes at 10 / 50 / 90 % depth, T = 0) found
   3 of 3; the prefill took 221.6 s (2,161 tok/s at 2190 MHz) and the cached re-ask 1.6 s. Lowest free memory on the head
   / worker node during the needle: 2,957 / 3,457 MiB right after a boot of both nodes. The same test on a head node that
   had been through a day of restarts and one crash bottomed out at 1,658 MiB, close to our watchdog's 1,536 MiB.
   For comparison, MiaAI-Lab's README for the Zig engine reports ~1,710 tok/s for a 479K-token needle prefill on the same
   hardware.
+- **The whole KV pool in the display reservation** (the TensorFold "display-kv" shape, 22.10.): the same mapping as
+  our 0053. TensorFold's FP4 KV needs 890 B per position, ours ~2,320 B per token, so 1,792 MiB hold at most ~0.8M
+  tokens, and decode pays for registered memory (162 GB/s read against 237 for cudaMalloc in our 0053 runs). The
+  public A/B we found shows the same free memory (2.01 against 1.96 GiB) and a slower prefill. Not tried further.
 - **NVFP4 KV (0059, 0061):** see "KV cache capacity". Keeping the sliding window in FP8 halves the KLD of NVFP4
   everywhere, but the rest is still above the run-to-run floor and costs accepted drafts.
 - **An exact verify width per round** (verify only the drafts the depth policy keeps, the way TensorFold sizes its

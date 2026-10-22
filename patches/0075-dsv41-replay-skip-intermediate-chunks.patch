@@ -1,0 +1,247 @@
+dsv41 patch 0075 (22.10.2026): skip the decoder replay on intermediate prefill chunks. In use from image v24 (VLLM_DSV41_REPLAY_SKIP=1).
+
+Switch: VLLM_DSV41_REPLAY_SKIP=1 (both sides, worker + scheduler; default 0 = v22 behaviour, bit for bit).
+Base: image v22 (gh_stage/docker/files = v22: model_state.py = v0067/src, scheduler.py = v0074/src).
+
+What: with SWA bounded replay (0034 / vLLM #59894), every eager prefill step runs layers 20-39 again on each request's
+last 128 rows (layer 20 writes its KV for every row first). Layers 21-39 own only sliding-window KV, and a trimmed chunk
+reads replay-layer window KV only from its own kept rows (kv_start = max(replay_start, seq_len - window)). So the
+replay of an intermediate chunk is read by nothing if the next chunk trims too: no logits survive a partial prefill,
+the DSpark drafter attends over 128 positions of its own context, decode reads only the last chunk's window.
+The patch keeps ONE row (the chunk's last, window clamped to itself) for a prefill request whose chunk trims, leaves
+more than a window (remaining_after > window) and is text only without prompt logprobs; the scheduler never gives a
+text request with more than a window left a chunk of <= window rows (it waits a step; budget left <= 128 of 4096), so
+the chunk after a skipped one always trims. Last chunk, decode window KV, final logits: unchanged.
+Gain (estimate, GB10 TP2): ~0.1 s of ~1.9 s per intermediate 4096-token chunk (20 layers' MoE on 128 rows ~86 % of the
+experts + 5 indexers over the context) -> prefill +5-7 % for prompts > 4,224 tokens, 0 bytes of memory.
+Files: models/deepseek_v41/replay_skip.py (new, numpy only), nvidia/model_state.py (mask + kv_start clamp on the kept
+length, identical for kept_len == window), v1/core/sched/scheduler.py (inline rule, 2 call sites).
+Tests: loops/replay_skip/test_replay_skip.py (CPU: helpers, rule == helper, provenance simulation of the replay
+layers' window KV over 3000 random requests / 14,226 chunks / 7,688 skipped replays: final output + decode window
+identical; 4 mutations detected).
+
+Measured (22.10.2026, images v23/v24, 2x GB10, spark2 at 2000 MHz unless noted, A/B on adjacent fresh starts):
+  - needle prompt of 478,817 tokens: prefill 229.4 -> 218.7 s (+4.9 %, v23 window W2), 230.9 -> 218.1 s (+5.9 %, v24
+    window W3, together with 0076/0077/0081); first window at 2190 MHz: 224.4 -> 213.3 s (+5.2 %);
+  - 26K-token prompts: no gain (-0.6 to -2.8 %, within noise and the clock cap);
+  - first answer token of 50K-token needle questions (p ~ 1): KL 0.0017 mean / 0.0025 max against the same image
+    without the switch (two fresh computes: 0.0015 / 0.0037); T=0 short prompts 8/8 identical; memory unchanged.
+
+--- a/vllm/models/deepseek_v41/nvidia/model_state.py	2026-10-22 10:58:14.237864234 +0200
++++ b/vllm/models/deepseek_v41/nvidia/model_state.py	2026-10-22 10:59:29.240945433 +0200
+@@ -12,6 +12,7 @@
+ from vllm.distributed.parallel_state import get_dp_group
+ from vllm.forward_context import DPMetadata, create_forward_context
+ from vllm.models.deepseek_v41.common.ops import swa_fused  # dsv41 patch 0067
++from vllm.models.deepseek_v41 import replay_skip  # dsv41 patch 0075
+ from vllm.models.deepseek_v41.decoder_replay_layers import DecoderReplayLayers
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadataBuilder
+@@ -120,9 +121,14 @@
+     tl.store(kept_query_start_loc_ptr + req + 1, kept_end)
+ 
+     # A trimmed request holds no replay-layer window KV below its kept rows.
++    # dsv41 patch 0075: below its first kept row (kept_len == window for every
++    # trimmed request without the patch, so this is the old bound; a request whose
++    # replay is skipped keeps one row and reads no window KV but its own).
+     kv_start = tl.load(replay_start_ptr + req)
+     if kept_end - kept_begin < end - begin:
+-        kv_start = tl.maximum(kv_start, tl.load(seq_lens_ptr + req) - window)
++        kv_start = tl.maximum(
++            kv_start, tl.load(seq_lens_ptr + req) - (kept_end - kept_begin)
++        )
+     tl.store(kept_kv_start_ptr + req, kv_start)
+ 
+     first_row = end - (kept_end - kept_begin)
+@@ -221,6 +227,9 @@
+         if self.decoder_replay_layers is not None:
+             # Requests whose every prompt row is read (prompt logprobs) never trim.
+             self._keeps_rows_np = np.zeros(self.max_num_reqs, dtype=np.bool_)
++            # dsv41 patch 0075: requests with multimodal inputs never skip a replay
++            # (encoder boundaries can cut their chunks below the window).
++            self._has_mm_np = np.zeros(self.max_num_reqs, dtype=np.bool_)
+             self._dropped_before = UvaBufferPool(self.max_num_reqs + 1, torch.int32)
+             # The replay batch's inputs: its rows of the batch, query offsets,
+             # positions, slot mappings (sized with the KV cache groups on first
+@@ -252,6 +261,9 @@
+             self._keeps_rows_np[req_index] = (
+                 params is not None and params.prompt_logprobs is not None
+             )
++            self._has_mm_np[req_index] = bool(
++                getattr(new_req_data, "mm_features", None)
++            )
+ 
+     def prepare_inputs(
+         self, input_batch: InputBatch, req_states: RequestState
+@@ -461,10 +473,24 @@
+ 
+         num_reqs = input_batch.num_reqs
+         query_lens = np.diff(input_batch.query_start_loc_np[: num_reqs + 1])
+-        kept_lens = np.where(
+-            self._keeps_rows_np[input_batch.idx_mapping_np[:num_reqs]],
+-            query_lens,
+-            np.minimum(query_lens, layers.window),
++        idx = input_batch.idx_mapping_np[:num_reqs]
++        skip = None
++        if replay_skip.REPLAY_SKIP:
++            # dsv41 patch 0075: an intermediate chunk followed by a trimming chunk
++            # keeps only its last row (replay_skip.py; the scheduler guarantees the
++            # trimming successor with replay_skip.min_chunk).
++            skip = replay_skip.skip_mask(
++                query_lens,
++                input_batch.is_prefilling_np[:num_reqs],
++                input_batch.prefill_len_np[:num_reqs]
++                - input_batch.num_computed_prefill_tokens_np[:num_reqs]
++                - query_lens,
++                self._keeps_rows_np[idx],
++                self._has_mm_np[idx],
++                layers.window,
++            )
++        kept_lens = replay_skip.kept_lens(
++            query_lens, self._keeps_rows_np[idx], layers.window, skip
+         )
+         # Dummy batches (captures, an idle DP rank's) are not prefills: they
+         # keep their rows unless a rank trims.
+--- a/vllm/v1/core/sched/scheduler.py	2026-10-22 10:58:14.240745383 +0200
++++ b/vllm/v1/core/sched/scheduler.py	2026-10-22 11:00:08.664699510 +0200
+@@ -35,9 +35,28 @@
+ # the price of a slower background prefill in idle time. Only requests at or above VLLM_PREFILL_THROTTLE_MIN_PRIO are
+ # capped (0031), so a foreground request alone still uses the whole budget. VLLM_DSV41_BG_LPT_SOLO=1, default off.
+ _DSV41_BG_LPT_SOLO = _dsv41_os.environ.get("VLLM_DSV41_BG_LPT_SOLO", "0") == "1"
++# dsv41 patch 0075 (22.10.2026): the worker skips the decoder replay (layers past the last KV source) of a prefill chunk
++# that trims and leaves more than a window (models/deepseek_v41/replay_skip.py). That is exact only if the next chunk
++# trims too (more than prefix_replay_tokens rows), so a text request with more than a window left never gets a chunk
++# of a window or less: it waits a step instead (the budget left is then <= 128 tokens of 4096). The last chunk and
++# decodes are untouched; requests with encoder inputs keep vLLM's chunking (their worker side never skips).
++# VLLM_DSV41_REPLAY_SKIP=1 turns both sides on (default off).
++_DSV41_REPLAY_SKIP = _dsv41_os.environ.get("VLLM_DSV41_REPLAY_SKIP", "0") == "1"
+ _DSV41_DEPTH_FILE = _dsv41_os.environ.get("VLLM_DSPARK_DEPTH_FILE") or None
+ 
+ 
++def _dsv41_replay_min_chunk(num_new_tokens, remaining, window, has_encoder_inputs, enabled=None):
++    """0075: 0 (wait a step) for a chunk of <= window rows that leaves more than a window; else num_new_tokens.
++    Same rule as models/deepseek_v41/replay_skip.min_chunk (kept here so the scheduler imports no model code)."""
++    if enabled is None:
++        enabled = _DSV41_REPLAY_SKIP
++    if not enabled or window <= 0 or has_encoder_inputs or num_new_tokens <= 0:
++        return num_new_tokens
++    if remaining > window and num_new_tokens <= window:
++        return 0
++    return num_new_tokens
++
++
+ def _dsv41_bgpause_from(text, default):
+     """0072: the "bgpause=<P>" token of a depth-file text (tokens after the policy), else default."""
+     for tok in (text or "").strip().lower().split()[1:]:
+@@ -808,6 +827,13 @@
+             num_new_tokens = self._reserve_prefill_lookahead(
+                 request, request.num_computed_tokens, num_new_tokens
+             )
++            # dsv41 patch 0075: a chunk that leaves more than a window must trim.
++            num_new_tokens = _dsv41_replay_min_chunk(
++                num_new_tokens,
++                request.num_tokens - request.num_computed_tokens,
++                self.prefix_replay_tokens,
++                request.has_encoder_inputs,
++            )
+ 
+             if num_new_tokens == 0:
+                 # The request cannot be scheduled because one of the following
+@@ -1260,6 +1286,13 @@
+                     num_new_tokens = self._reserve_prefill_lookahead(
+                         request, num_computed_tokens, num_new_tokens
+                     )
++                    # dsv41 patch 0075: a chunk that leaves more than a window must trim.
++                    num_new_tokens = _dsv41_replay_min_chunk(
++                        num_new_tokens,
++                        request.num_tokens - num_computed_tokens,
++                        self.prefix_replay_tokens,
++                        request.has_encoder_inputs,
++                    )
+ 
+                     if num_new_tokens == 0:
+                         # The request cannot be scheduled.
+--- /dev/null	2026-10-08 14:15:38.131226219 +0200
++++ b/vllm/models/deepseek_v41/replay_skip.py	2026-10-22 10:59:06.793085431 +0200
+@@ -0,0 +1,81 @@
++# SPDX-License-Identifier: Apache-2.0
++"""dsv41 patch 0075 (Entwurf 22.10.2026): skip the decoder replay on intermediate prefill chunks.
++
++SWA bounded replay (decoder_replay_layers.py, patch 0034) runs the layers past the last KV source (20-39 on V4.1-Flash)
++on each prefill request's last ``window`` (= sliding window, 128) rows in every eager step. Those layers own only
++sliding-window KV, and a trimmed chunk (query_len > window) reads replay-layer window KV only from its own kept rows
++(model_state._gather_replay_batch_kernel: kv_start = max(replay_start, seq_len - kept_len)). So the replay of chunk N is
++read later only by an UNtrimmed chunk N+1 (query_len <= window, it reads up to window-1 positions back into chunk N),
++by the first decode tokens when chunk N is the last chunk, and by nothing else: no logits are kept for partial
++prefills, the DSpark drafter attends over a 128-token window of its own context KV, and the layers before the cut
++(incl. layer 20's KV for every row, write_batch_kv) run as before.
++
++The patch therefore keeps a single row (the chunk's last, with a window of itself) instead of ``window`` rows for a
++prefill request whose chunk
++  - trims (query_len > window),
++  - is not its last and leaves more than a window (remaining_after > window), and
++  - is text only and asks no prompt logprobs (those requests keep every row anyway),
++and the scheduler guarantees (min_chunk below) that a chunk which leaves more than a window always trims, so the chunk
++after a skipped one never reads the skipped window. Final outputs, the final chunk's window KV and everything the decode
++reads stay what they are without the patch; an intermediate chunk saves layers 20-39 on 127 of its 128 replay rows
++(MoE streaming of ~86 % of 20 layers' experts, attention, 5 long-context indexers: ~0.1 s of ~1.9 s per 4096-token chunk
++on GB10, estimate). Switch: VLLM_DSV41_REPLAY_SKIP=1 (default 0 = unchanged).
++
++Pure numpy, no vLLM import (CPU tests import this file directly).
++"""
++
++from __future__ import annotations
++
++import os
++
++import numpy as np
++
++REPLAY_SKIP = os.environ.get("VLLM_DSV41_REPLAY_SKIP", "0") == "1"
++
++
++def skip_mask(
++    query_lens: np.ndarray,
++    is_prefilling: np.ndarray,
++    remaining_after: np.ndarray,
++    keeps_rows: np.ndarray,
++    has_mm: np.ndarray,
++    window: int,
++) -> np.ndarray:
++    """[num_reqs] bool: requests whose replay rows of this step nothing will read (see module docstring).
++
++    query_lens: rows of each request in this step; remaining_after: prompt (prefill) tokens left after this step;
++    keeps_rows: requests that keep every row (prompt logprobs); has_mm: requests with multimodal inputs (their chunks
++    can end at encoder boundaries the scheduler rule below does not cover)."""
++    q = np.asarray(query_lens)
++    return (
++        np.asarray(is_prefilling, dtype=bool)
++        & ~np.asarray(keeps_rows, dtype=bool)
++        & ~np.asarray(has_mm, dtype=bool)
++        & (q > window)
++        & (np.asarray(remaining_after) > window)
++    )
++
++
++def kept_lens(
++    query_lens: np.ndarray, keeps_rows: np.ndarray, window: int, skip: np.ndarray | None = None
++) -> np.ndarray:
++    """Rows each request keeps for the replay layers: all (prompt logprobs), the last ``window`` (as before), or the
++    last one for a skipped request."""
++    q = np.asarray(query_lens)
++    kept = np.where(np.asarray(keeps_rows, dtype=bool), q, np.minimum(q, window))
++    if skip is not None:
++        kept = np.where(skip, np.minimum(kept, 1), kept)
++    return kept
++
++
++def min_chunk(
++    num_new_tokens: int, remaining: int, window: int, enabled: bool = REPLAY_SKIP, has_encoder_inputs: bool = False
++) -> int:
++    """Scheduler side: a prefill chunk that leaves more than a window must trim (more than ``window`` rows); otherwise
++    the request waits a step (0). The final chunk (num_new_tokens == remaining) is never touched, nor are decodes
++    (remaining <= window). Requests with encoder inputs keep vLLM's chunking (their worker side never skips)."""
++    if not enabled or window <= 0 or has_encoder_inputs or num_new_tokens <= 0:
++        return num_new_tokens
++    if remaining > window and num_new_tokens <= window:
++        return 0
++    return num_new_tokens

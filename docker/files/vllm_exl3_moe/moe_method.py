@@ -54,6 +54,29 @@ _SMOE_FUSED = K.env_int("VLLM_EXL3_MOE_FUSED", 0)
 # at 4-6; LOG Oct 11 03:23)
 _SMOE_FUSED_MIN_ROWS = K.env_int("VLLM_EXL3_MOE_FUSED_MIN_ROWS", 2)
 _KINDS = ("trellis", "suh", "svh")
+# VLLM_EXL3_MOE_SHARED_ZEROS=1 (dsv41 patch 0079c, default 0): when exl3_smoe computes routed + shared experts in one
+# launch, _apply_with_shared hands vLLM's runner a zero tensor as the shared output (the runner adds shared + routed).
+# Off: torch.zeros_like(out) every MoE layer = one fill kernel a layer (40 a decode round). On: a [m, hidden] view of
+# one zero buffer per (device, dtype, hidden), allocated outside graph capture and never written (the runner only
+# reads it or reduces it in place, which keeps zeros), so the same add sees the same zeros without the fill.
+_SHARED_ZEROS = K.env_int("VLLM_EXL3_MOE_SHARED_ZEROS", 0)
+_SHARED_ZEROS_ROWS = 64  # >= coop rows_max (<= 32): the only calls that take this path
+_ZERO_BUFFERS: dict[tuple, torch.Tensor] = {}  # kept for the run: captured graphs read these addresses
+
+
+def _shared_zero_output(out: torch.Tensor) -> torch.Tensor:
+    """dsv41 patch 0079c: zeros shaped like `out` from the persistent buffer (see _SHARED_ZEROS)."""
+    if out.dim() != 2 or out.shape[0] > _SHARED_ZEROS_ROWS or not out.is_contiguous():
+        return torch.zeros_like(out)  # same shape and strides as before in every case the buffer cannot serve
+    key = (out.device, out.dtype, out.shape[1])
+    buf = _ZERO_BUFFERS.get(key)
+    if buf is None:
+        if torch.cuda.is_current_stream_capturing():
+            return torch.zeros_like(out)  # a buffer made inside a capture would hold zeros only after a replay
+        buf = _ZERO_BUFFERS[key] = torch.zeros(
+            (_SHARED_ZEROS_ROWS, out.shape[1]), dtype=out.dtype, device=out.device
+        )
+    return buf[: out.shape[0]]
 
 
 def _unquantized_moe_quant_config():
@@ -398,7 +421,9 @@ class Exl3RoutedMoEMethod(FusedMoEMethodBase):
                 and (shared_experts_input is None or shared_experts_input.data_ptr() == x.data_ptr())
                 and self._attach_shared(shared_experts)):
             out = self.smoe(x, topk_ids, topk_weights, self.perm, self.act_limit, _padding_rows(m), shared=True)
-            shared_experts._output[shared_experts._output_idx] = torch.zeros_like(out)
+            shared_experts._output[shared_experts._output_idx] = (
+                _shared_zero_output(out) if _SHARED_ZEROS else torch.zeros_like(out)  # dsv41 patch 0079c
+            )
             l2pf.point("next", self.layer_idx, m)
             l2pf_draft.point("next", self.layer_idx, m)        # dsv41 patch 0066: drafter blocks only
             return out

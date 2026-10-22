@@ -1,0 +1,135 @@
+dsv41 patch 0076c (draft 22.10.2026, SIDE PATH, not used by production): expert tiles for exllamav3's deterministic
+prefill path (_run_prefill_det). Production runs prompt chunks of >= 64 rows through TensorFold's kernels
+(VLLM_EXL3_MOE_TF_PROMPT=1 in the recipe launcher's RECIPE_ENV), so this only matters with TF_PROMPT=0.
+VLLM_EXL3_MOE_DET_TILE_SLOTS=N: scratch [m*top_k, H] fp32 (480 MiB at 4096 tokens) -> one tile of <= N assignments,
+one exl3_moe_gather per tile. Rounding class (tile-wise fp32 association), deterministic.
+
+--- a/vllm_exl3_moe/forward.py	2026-10-22 11:12:43.855116967 +0200
++++ b/vllm_exl3_moe/forward.py	2026-10-22 11:14:41.609514944 +0200
+@@ -42,6 +42,16 @@
+ # prompts give identical bits run to run; 0 = exllamav3's atomic accumulation (arrival order). Decode is deterministic
+ # either way (exl3_smoe / coop).
+ _DET_PREFILL = os.environ.get("VLLM_EXL3_MOE_DET_PREFILL", "1") == "1"
++# VLLM_EXL3_MOE_DET_TILE_SLOTS=N (dsv41 patch 0076c, default 0 = off): the deterministic prefill path keeps one fp32 slot
++# per assignment for ALL of a step's assignments, [m * top_k, hidden] fp32 = 480 MiB at 4096 tokens (960 MiB at 8192),
++# the largest single activation of a prefill step's MoE, held by the caching allocator after the first long prompt.
++# With N > 0 and more than N assignments, the physical experts (K-sorted, each group a contiguous range) are cut into
++# tiles of at most N assignments (an expert with more stays whole) and the scratch holds one tile: the tile's experts
++# run with the same kernels and tiers, then one exl3_moe_gather adds the tile's slots in k order into out32. A token
++# whose experts all lie in one tile gets the bits of the untiled path; the others sum their slots tile by tile (other
++# fp32 association, still run-to-run deterministic): rounding class, like 0064. Extra traffic: one out32 read+write per
++# tile (~80 MiB a tile at 4096 tokens), extra launches per tile.
++_DET_TILE = max(0, int(os.environ.get("VLLM_EXL3_MOE_DET_TILE_SLOTS", "0") or 0))
+ # VLLM_EXL3_MOE_TF_PROMPT=1: prompt chunks of >= 64 rows through TensorFold's grouped EXL3 kernels (tf_prompt.py):
+ # deterministic too, other rounding than the path below; off until measured on the serve
+ _TF_PROMPT = os.environ.get("VLLM_EXL3_MOE_TF_PROMPT", "0") == "1"
+@@ -233,6 +243,9 @@
+     if wait is not None and wait != torch.cuda.current_stream():
+         torch.cuda.current_stream().wait_stream(wait)
+     if _DET_PREFILL:
++        if _DET_TILE and flat_p.numel() > _DET_TILE:
++            return _run_prefill_det_tiled(x16, out32, flat_p, flat_tok, flat_w, groups, bank, fused, act_limit, mcg,
++                                          mul1, _DET_TILE)
+         return _run_prefill_det(x16, out32, flat_p, flat_tok, flat_w, groups, bank, fused, act_limit, mcg, mul1)
+     R = fused.rows
+     for g in groups:
+@@ -344,6 +357,99 @@
+     _k_ext().exl3_moe_gather(out32, scratch, flat_p, inv_order, start_t, base_t, kind_t, w_sorted)
+ 
+ 
++def det_tiles(counts: list[int], cap: int) -> list[tuple[int, int]]:
++    """dsv41 patch 0076c: contiguous physical-expert ranges [lo, hi) with at most cap assignments each (an expert with
++    more than cap is a range of its own); experts without assignments ride along. Covers 0..len(counts)."""
++    tiles: list[tuple[int, int]] = []
++    lo, acc = 0, 0
++    for e, c in enumerate(counts):
++        if acc and acc + c > cap:
++            tiles.append((lo, e))
++            lo, acc = e, 0
++        acc += c
++    tiles.append((lo, len(counts)))
++    return tiles
++
++
++def _run_prefill_det_tiled(x16, out32, flat_p, flat_tok, flat_w, groups, bank: Exl3Bank, fused: K.FusedScratch,
++                           act_limit: float, mcg: bool, mul1: bool, cap: int) -> None:
++    """dsv41 patch 0076c: _run_prefill_det over expert tiles of <= cap assignments (see _DET_TILE). Same sort, same
++    kernels and tiers per expert, a scratch of one tile, one exl3_moe_gather per tile (it adds into out32)."""
++    import numpy as np
++    from .kernels import ext as _k_ext
++    m, hidden = x16.shape
++    A = flat_p.numel()
++    E = max(g.hi for g in groups)
++    dev = x16.device
++    order = torch.argsort(flat_p, stable=True)
++    inv_order = torch.empty_like(order).scatter_(0, order, torch.arange(A, device=dev))
++    counts_all = torch.zeros((E,), dtype=torch.long, device=dev).scatter_add_(0, flat_p, torch.ones_like(flat_p))
++    ch = counts_all.tolist()                                     # host sync (eager prefill only)
++    starts = np.concatenate(([0], np.cumsum(ch[:-1]))).astype(np.int64)
++    tok_sorted = flat_tok[order].contiguous()
++    w_sorted = flat_w[order].contiguous()
++    start_t = torch.from_numpy(starts).to(dev)
++    tiles = det_tiles(ch, cap)
++    rows_max = max(int(sum(ch[lo:hi])) for lo, hi in tiles)
++    scratch = torch.empty((max(rows_max, 1), hidden), dtype=torch.float32, device=dev)
++    R = fused.rows
++    for t_lo, t_hi in tiles:
++        s_lo = int(starts[t_lo])
++        if sum(ch[t_lo:t_hi]) == 0:
++            continue
++        base = np.zeros(E, dtype=np.int64)
++        base[t_lo:t_hi] = starts[t_lo:t_hi] - s_lo             # slot = sorted position - tile start
++        kind = np.zeros(E, dtype=np.int64)
++        kind[t_lo:t_hi] = (np.asarray(ch[t_lo:t_hi]) > 0).astype(np.int64)
++        base_t = torch.from_numpy(base).to(dev)
++        kind_t = torch.from_numpy(kind).to(dev)
++        for g in groups:
++            a, b = max(g.lo, t_lo), min(g.hi, t_hi)
++            if a >= b:
++                continue
++            cg = [ch[e] if a <= e < b else 0 for e in range(g.lo, g.hi)]
++            s0, s1 = int(starts[a]), int(starts[a]) + sum(cg)
++            if s1 == s0:
++                continue
++            counts = torch.tensor(cg + [0], dtype=torch.long, device=dev)
++            tok, w = tok_sorted[s0:s1], w_sorted[s0:s1]
++            fb = base_t[g.lo:g.hi]
++            fz = [c for c in cg if 0 < c <= R]
++            t2 = sum(1 for c in fz if c > K.MTILE_T2)
++            t1 = sum(1 for c in fz if K.MTILE_T1 < c <= K.MTILE_T2)
++            t0 = len(fz) - t1 - t2
++
++            def run(**kw):
++                K.run_exl3_moe(x16, out32, g, counts, tok, w, fused, act_limit, mcg, mul1,
++                               output_scratch=scratch, fused_base=fb, **kw)
++
++            if mul1 and (t1 or t2):
++                if t2:
++                    run(num_active=t2, count_lo=K.MTILE_T2 + 1, count_hi=R, m_tile=64)
++                if t1:
++                    run(num_active=t1, count_lo=K.MTILE_T1 + 1, count_hi=K.MTILE_T2, m_tile=32)
++                if t0:
++                    run(num_active=t0, count_lo=1, count_hi=K.MTILE_T1, m_tile=16)
++            elif fz:
++                run(num_active=len(fz))
++            start = 0
++            for e_loc in range(g.size):
++                c = cg[e_loc]
++                if c > R:
++                    rows = tok[start:start + c]
++                    wt = w[start:start + c].float().unsqueeze(1)
++                    w1, w3, w2 = bank.views(g.lo + e_loc)
++                    xe = x16.index_select(0, rows)
++                    gate = K.exl3_linear_reconstruct(xe, *w1, mcg, mul1)
++                    up = K.exl3_linear_reconstruct(xe, *w3, mcg, mul1)
++                    a16 = K.swiglu_limit(gate, up, act_limit).to(torch.float16)
++                    y = K.exl3_linear_reconstruct(a16, *w2, mcg, mul1)
++                    bb = int(base[g.lo + e_loc])
++                    torch.mul(y, wt, out=scratch[bb:bb + c])
++                start += c
++        _k_ext().exl3_moe_gather(out32, scratch, flat_p, inv_order, start_t, base_t, kind_t, w_sorted)
++
++
+ def reference_moe(x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor, bank: Exl3Bank,
+                   act_limit: float, mcg: bool, mul1: bool) -> torch.Tensor:
+     """Slow per-(token, expert) reference on exllamav3's reconstruct path (tests only), fp32 [m, H]."""

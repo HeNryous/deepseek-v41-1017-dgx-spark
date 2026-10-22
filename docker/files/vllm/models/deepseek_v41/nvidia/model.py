@@ -97,6 +97,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+from vllm.v1.worker.gpu import dsv41_memprobe as _memprobe  # dsv41 patch 0076a
 
 from ..common.engram import (
     Engram,
@@ -119,6 +120,17 @@ if typing.TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 logger = init_logger(__name__)
+
+# dsv41 patch 0076b (22.10.2026): the DSpark drafter reads its target states from the aux hidden states of layers
+# 37-39 (dflash propose(): combine_hidden_states(cat(aux)) whenever aux states exist, last_hidden_states otherwise), so
+# the [max_num_batched_tokens, hc_mult * hidden] residual copy kept for DeepSeek-V4 MTP (4096 x 20480 bf16 = 160 MiB a
+# rank) is written every forward and never read. VLLM_DSV41_DROP_MTP_BUFFER=1 does not allocate it for method dspark
+# (get_mtp_target_hidden_states() then returns None and the runner hands the drafter its usual hidden states, which
+# it ignores the same way). Default 0 = unchanged.
+import os as _os
+_DROP_MTP_BUFFER = _os.environ.get("VLLM_DSV41_DROP_MTP_BUFFER", "0") == "1"
+import contextlib as _contextlib
+_NULLCTX = _contextlib.nullcontext()  # 0076a: reused when the memory probe is off
 
 
 class DeepseekV4MoE(DeepseekV4MoEBase):
@@ -302,6 +314,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
 
         self.engram: Engram | None = None
+        self.layer_idx = extract_layer_index(prefix)  # dsv41 patch 0076a (memory probe tags)
         if engram_layout is not None:
             layer_id = extract_layer_index(prefix)
             if layer_id in engram_layout.layer_ids:
@@ -539,11 +552,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             previous_post = mhc_post_tilelang(x, residual, post_mix, res_mix)
             if capture_previous_aux:
                 previous_aux = previous_post.mean(dim=1)
-            residual = self.engram(
-                previous_post,
-                engram_hashes[:, self.engram.layer_hash_index],
-                engram_mask,
-            )
+            with _memprobe.phase(self.layer_idx, "engram", positions.shape[0]) if _memprobe.ENABLED else _NULLCTX:
+                residual = self.engram(
+                    previous_post,
+                    engram_hashes[:, self.engram.layer_hash_index],
+                    engram_mask,
+                )
             post_mix, res_mix, x, attn_pre = mhc_pre(
                 residual,
                 self.hc_attn_fn,
@@ -587,7 +601,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         if self.use_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
 
-        x = self.attn(positions, x, None)
+        with _memprobe.phase(self.layer_idx, "attn", positions.shape[0]) if _memprobe.ENABLED else _NULLCTX:
+            x = self.attn(positions, x, None)
         # With GEMM-RS bound, the attention output is already this rank's
         # sequence-parallel shard (see DeepseekV4Attention._wo_b_proj).
         if self.use_sequence_parallel and self.attn.gemm_rs is None:
@@ -614,11 +629,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             stream=mhc_stream,
             reduce_results=self.fuse_mhc_all_reduce,
         )
-        if self.fuse_mhc_all_reduce and self.ffn.defers_finalize(x.shape[0]):
-            # The next layer's first boundary finalizes it with the all-reduce.
-            x = self.ffn.forward_unfinalized(x, input_ids)
-        else:
-            x = self.ffn(x, input_ids, mega_gate_metadata)
+        with _memprobe.phase(self.layer_idx, "ffn", positions.shape[0]) if _memprobe.ENABLED else _NULLCTX:
+            if self.fuse_mhc_all_reduce and self.ffn.defers_finalize(x.shape[0]):
+                # The next layer's first boundary finalizes it with the all-reduce.
+                x = self.ffn.forward_unfinalized(x, input_ids)
+            else:
+                x = self.ffn(x, input_ids, mega_gate_metadata)
         if mhc_stream is not None:
             torch.cuda.current_stream().wait_stream(mhc_stream)
         return x, residual, post_mix, res_mix, ffn_pre, previous_aux
@@ -878,6 +894,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         needs_mtp_hidden_states = spec_config is not None and (
             spec_config.use_eagle() or spec_config.uses_draft_model()
         )
+        if needs_mtp_hidden_states and _DROP_MTP_BUFFER and spec_config.use_dspark():
+            # dsv41 patch 0076b: DSpark never reads it (see _DROP_MTP_BUFFER)
+            needs_mtp_hidden_states = False
+            logger.info_once("dsv41 0076b: no MTP residual buffer for the DSpark drafter")
         if get_pp_group().is_last_rank and needs_mtp_hidden_states:
             self._mtp_hidden_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,

@@ -12,6 +12,7 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_dp_group
 from vllm.forward_context import DPMetadata, create_forward_context
 from vllm.models.deepseek_v41.common.ops import swa_fused  # dsv41 patch 0067
+from vllm.models.deepseek_v41 import replay_skip  # dsv41 patch 0075
 from vllm.models.deepseek_v41.decoder_replay_layers import DecoderReplayLayers
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadataBuilder
@@ -120,9 +121,14 @@ def _gather_replay_batch_kernel(
     tl.store(kept_query_start_loc_ptr + req + 1, kept_end)
 
     # A trimmed request holds no replay-layer window KV below its kept rows.
+    # dsv41 patch 0075: below its first kept row (kept_len == window for every
+    # trimmed request without the patch, so this is the old bound; a request whose
+    # replay is skipped keeps one row and reads no window KV but its own).
     kv_start = tl.load(replay_start_ptr + req)
     if kept_end - kept_begin < end - begin:
-        kv_start = tl.maximum(kv_start, tl.load(seq_lens_ptr + req) - window)
+        kv_start = tl.maximum(
+            kv_start, tl.load(seq_lens_ptr + req) - (kept_end - kept_begin)
+        )
     tl.store(kept_kv_start_ptr + req, kv_start)
 
     first_row = end - (kept_end - kept_begin)
@@ -221,6 +227,9 @@ class DeepseekV41ModelState(DefaultModelState):
         if self.decoder_replay_layers is not None:
             # Requests whose every prompt row is read (prompt logprobs) never trim.
             self._keeps_rows_np = np.zeros(self.max_num_reqs, dtype=np.bool_)
+            # dsv41 patch 0075: requests with multimodal inputs never skip a replay
+            # (encoder boundaries can cut their chunks below the window).
+            self._has_mm_np = np.zeros(self.max_num_reqs, dtype=np.bool_)
             self._dropped_before = UvaBufferPool(self.max_num_reqs + 1, torch.int32)
             # The replay batch's inputs: its rows of the batch, query offsets,
             # positions, slot mappings (sized with the KV cache groups on first
@@ -251,6 +260,9 @@ class DeepseekV41ModelState(DefaultModelState):
             params = new_req_data.sampling_params
             self._keeps_rows_np[req_index] = (
                 params is not None and params.prompt_logprobs is not None
+            )
+            self._has_mm_np[req_index] = bool(
+                getattr(new_req_data, "mm_features", None)
             )
 
     def prepare_inputs(
@@ -461,10 +473,24 @@ class DeepseekV41ModelState(DefaultModelState):
 
         num_reqs = input_batch.num_reqs
         query_lens = np.diff(input_batch.query_start_loc_np[: num_reqs + 1])
-        kept_lens = np.where(
-            self._keeps_rows_np[input_batch.idx_mapping_np[:num_reqs]],
-            query_lens,
-            np.minimum(query_lens, layers.window),
+        idx = input_batch.idx_mapping_np[:num_reqs]
+        skip = None
+        if replay_skip.REPLAY_SKIP:
+            # dsv41 patch 0075: an intermediate chunk followed by a trimming chunk
+            # keeps only its last row (replay_skip.py; the scheduler guarantees the
+            # trimming successor with replay_skip.min_chunk).
+            skip = replay_skip.skip_mask(
+                query_lens,
+                input_batch.is_prefilling_np[:num_reqs],
+                input_batch.prefill_len_np[:num_reqs]
+                - input_batch.num_computed_prefill_tokens_np[:num_reqs]
+                - query_lens,
+                self._keeps_rows_np[idx],
+                self._has_mm_np[idx],
+                layers.window,
+            )
+        kept_lens = replay_skip.kept_lens(
+            query_lens, self._keeps_rows_np[idx], layers.window, skip
         )
         # Dummy batches (captures, an idle DP rank's) are not prefills: they
         # keep their rows unless a rank trims.

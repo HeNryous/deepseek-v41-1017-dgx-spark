@@ -13,11 +13,15 @@
 #   drafter L2 prefetch) · 0067 pre-round SWA metadata in one launch · 0071 background verify-depth cap
 #   0072 background decode pause · 0073 prefill throttle also for a waiting foreground request
 #   0074 background prefill chunks keep the long-prefill threshold when alone
-# 0062, 0063 and 0065 are in patches/ but not in the image. New switches are off by default (0040 is configuration only,
+#   0075 no decoder replay on intermediate prefill chunks · 0076 head-node memory (memory probe, no MTP buffer,
+#   transient/aliased TensorFold prompt scratch) · 0077 KV offload across two nodes (one copy on rank 0, gloo copy
+#   to rank 1) · 0078 Engram reads in prefill (lookahead; reader-pool CPUs) · 0079 decode fixed costs (off)
+#   0080 startup memory reservation (off) · 0081 offload load cap + file-tier I/O CPUs
+# 0062, 0063, 0065 and 0076c are in patches/ but not in the image. New switches are off by default (0040 is configuration only,
 # see serve/serve_example.sh). exl3_mrow, exl3_rdma, exl3_mhc and exl3_router have new sources: build the plugin's JIT
-# kernels before the first start (README, step 4). 0064-0074 change no CUDA source; the Triton kernels of 0066 and 0067
+# kernels before the first start (README, step 4). 0064-0081 change no CUDA source; the Triton kernels of 0066 and 0067
 # compile at the first start.
-# The image ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v22 has exactly these files.
+# The image ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v24 has exactly these files.
 ARG BASE=dsv41-serve:v4
 FROM ${BASE}
 LABEL org.opencontainers.image.source="https://github.com/HeNryous/deepseek-v41-1017-dgx-spark" \

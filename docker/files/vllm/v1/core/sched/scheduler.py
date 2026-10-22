@@ -35,7 +35,26 @@ _DSV41_FG_WAIT_THROTTLE = _dsv41_os.environ.get("VLLM_DSV41_FG_WAIT_THROTTLE", "
 # the price of a slower background prefill in idle time. Only requests at or above VLLM_PREFILL_THROTTLE_MIN_PRIO are
 # capped (0031), so a foreground request alone still uses the whole budget. VLLM_DSV41_BG_LPT_SOLO=1, default off.
 _DSV41_BG_LPT_SOLO = _dsv41_os.environ.get("VLLM_DSV41_BG_LPT_SOLO", "0") == "1"
+# dsv41 patch 0075 (22.10.2026): the worker skips the decoder replay (layers past the last KV source) of a prefill chunk
+# that trims and leaves more than a window (models/deepseek_v41/replay_skip.py). That is exact only if the next chunk
+# trims too (more than prefix_replay_tokens rows), so a text request with more than a window left never gets a chunk
+# of a window or less: it waits a step instead (the budget left is then <= 128 tokens of 4096). The last chunk and
+# decodes are untouched; requests with encoder inputs keep vLLM's chunking (their worker side never skips).
+# VLLM_DSV41_REPLAY_SKIP=1 turns both sides on (default off).
+_DSV41_REPLAY_SKIP = _dsv41_os.environ.get("VLLM_DSV41_REPLAY_SKIP", "0") == "1"
 _DSV41_DEPTH_FILE = _dsv41_os.environ.get("VLLM_DSPARK_DEPTH_FILE") or None
+
+
+def _dsv41_replay_min_chunk(num_new_tokens, remaining, window, has_encoder_inputs, enabled=None):
+    """0075: 0 (wait a step) for a chunk of <= window rows that leaves more than a window; else num_new_tokens.
+    Same rule as models/deepseek_v41/replay_skip.min_chunk (kept here so the scheduler imports no model code)."""
+    if enabled is None:
+        enabled = _DSV41_REPLAY_SKIP
+    if not enabled or window <= 0 or has_encoder_inputs or num_new_tokens <= 0:
+        return num_new_tokens
+    if remaining > window and num_new_tokens <= window:
+        return 0
+    return num_new_tokens
 
 
 def _dsv41_bgpause_from(text, default):
@@ -808,6 +827,13 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = self._reserve_prefill_lookahead(
                 request, request.num_computed_tokens, num_new_tokens
             )
+            # dsv41 patch 0075: a chunk that leaves more than a window must trim.
+            num_new_tokens = _dsv41_replay_min_chunk(
+                num_new_tokens,
+                request.num_tokens - request.num_computed_tokens,
+                self.prefix_replay_tokens,
+                request.has_encoder_inputs,
+            )
 
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
@@ -1259,6 +1285,13 @@ class Scheduler(SchedulerInterface):
                     # num_prefill_lookahead of the prefill end.
                     num_new_tokens = self._reserve_prefill_lookahead(
                         request, num_computed_tokens, num_new_tokens
+                    )
+                    # dsv41 patch 0075: a chunk that leaves more than a window must trim.
+                    num_new_tokens = _dsv41_replay_min_chunk(
+                        num_new_tokens,
+                        request.num_tokens - num_computed_tokens,
+                        self.prefix_replay_tokens,
+                        request.has_encoder_inputs,
                     )
 
                     if num_new_tokens == 0:

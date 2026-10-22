@@ -1020,6 +1020,14 @@ class Worker(WorkerBase):
             else:
                 self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
 
+        if self.use_v2_model_runner:
+            # dsv41 patch 0080 (VLLM_DSV41_PREALLOC, default off): after capture, reserve the long-context, mixed-step
+            # and vision peaks now instead of at the first such request (gpu/dsv41_prealloc.py)
+            from vllm.v1.worker.gpu import dsv41_prealloc
+
+            if dsv41_prealloc.ENABLED:
+                dsv41_prealloc.run(self)
+
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)

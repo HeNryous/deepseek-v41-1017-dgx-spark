@@ -1,0 +1,126 @@
+dsv41 patch 0081 (22.10.2026): KV offload, per-request load cap and file-tier I/O threads off the decode cores.
+In use from image v24 (VLLM_DSV41_OFFLOAD_LOAD_FRACTION=0.45, VLLM_DSV41_OFFLOAD_IO_CPUS=0-4,10-13).
+Why (cap): vLLM's tiering manager pins a CPU-tier chunk only when the load is prepared, not when it is promoted from
+the file tier. A prefix that needs more chunks than the CPU tier holds evicts its own promoted chunks, its lookup
+returns "pending" forever and the request never runs (seen 22.10.: a 76K-token prefix against a 963-chunk CPU tier,
+EngineCore at 100 % CPU for 10 minutes). With the cap every request loads at most what fits the given share of the
+CPU tier (computed from the number of CPU chunks and the offloaded groups' tokens per chunk); the rest is computed.
+On DSv4.1 the offloaded groups have 128 and 192 tokens per chunk (0.0130 chunks per token): a 256 MiB CPU tier
+(1,927 chunks with 0077) holds ~148K tokens, the cap at 0.45 is 66,432 tokens per request, so two large reloads fit
+at once.
+Why (I/O CPUs): the file tier's read/write threads live in the scheduler process and inherit its affinity (the X925
+cores, with the launch threads); pread/pwrite and the CRC of 0056 then compete with decode.
+Switches: VLLM_DSV41_OFFLOAD_LOAD_FRACTION (0 = off), VLLM_DSV41_OFFLOAD_IO_CPUS (empty = off).
+diff -ru a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py	2026-10-22 16:16:35.740271492 +0200
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py	2026-10-22 16:16:56.280548234 +0200
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ import time
+ from collections.abc import Iterable, Sequence
+ from dataclasses import dataclass, field, replace
+@@ -61,6 +62,14 @@
+ 
+ logger = init_logger(__name__)
+ 
++# dsv41 patch 0081: per-request load cap. The tiering manager pins a chunk only when
++# the load is prepared, not when it is promoted from a secondary tier, so a prefix
++# that needs more chunks than the CPU tier holds evicts its own promoted chunks and
++# the request stays deferred forever (seen 22.10.: 76K tokens against 963 chunks,
++# EngineCore at 100 % CPU, the request never scheduled). With a fraction > 0 every
++# request loads at most what fits that share of the CPU tier; the rest is computed.
++_DSV41_LOAD_FRACTION = float(os.environ.get("VLLM_DSV41_OFFLOAD_LOAD_FRACTION", "0") or 0)
++
+ KV_LOAD_TIERS_KEY = "kv_load_tiers"
+ MATCHER_MEDIUM_KEY = "medium"
+ MATCHER_LOCALITY_KEY = "locality"
+@@ -630,6 +639,28 @@
+ 
+         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
+ 
++        # dsv41 patch 0081: default max_load_tokens from the CPU tier and the groups
++        self._dsv41_load_cap: int | None = None
++        num_cpu_chunks = int(getattr(spec, "num_chunks", 0) or 0)
++        full = [g for g in self.config.kv_group_configs if g.sliding_window_size_in_chunks is None]
++        windowed = [g for g in self.config.kv_group_configs if g.sliding_window_size_in_chunks is not None]
++        chunks_per_token = sum(1.0 / g.tokens_per_chunk for g in full)
++        window_chunks = sum((g.sliding_window_size_in_chunks or 0) + 1 for g in windowed)
++        if _DSV41_LOAD_FRACTION > 0 and num_cpu_chunks > 0 and chunks_per_token > 0:
++            budget = _DSV41_LOAD_FRACTION * num_cpu_chunks - window_chunks
++            step = max(g.tokens_per_chunk for g in self.config.kv_group_configs)
++            cap = (int(max(budget, 0) / chunks_per_token) // step) * step
++            self._dsv41_load_cap = cap
++        logger.info(
++            "dsv41 patch 0081: CPU tier %d chunks; groups %s (tokens per chunk, window "
++            "chunks); %.5f chunks per token -> load cap %s tokens per request (fraction %.2f)",
++            num_cpu_chunks,
++            [(g.tokens_per_chunk, g.sliding_window_size_in_chunks) for g in self.config.kv_group_configs],
++            chunks_per_token,
++            self._dsv41_load_cap,
++            _DSV41_LOAD_FRACTION,
++        )
++
+     def _maybe_observe_lookup_async_delay(
+         self, req_status: RequestOffloadState
+     ) -> None:
+@@ -1028,6 +1059,8 @@
+             req_context=req_context,
+             offloading_context=offloading_context,
+         )
++        if req_status.max_load_tokens is None and self._dsv41_load_cap is not None:
++            req_status.max_load_tokens = self._dsv41_load_cap  # dsv41 patch 0081
+         self._req_status[request.request_id] = req_status
+ 
+     def get_num_new_matched_tokens(
+diff -ru a/vllm/v1/kv_offload/tiering/fs/thread_pool.py b/vllm/v1/kv_offload/tiering/fs/thread_pool.py
+--- a/vllm/v1/kv_offload/tiering/fs/thread_pool.py	2026-10-22 16:16:35.746222323 +0200
++++ b/vllm/v1/kv_offload/tiering/fs/thread_pool.py	2026-10-22 16:16:56.284261746 +0200
+@@ -7,6 +7,7 @@
+ Load jobs are enqueued to the load queue; store jobs to the store queue.
+ """
+ 
++import os
+ import threading
+ import time
+ from collections import deque
+@@ -17,6 +18,26 @@
+ 
+ logger = init_logger(__name__)
+ 
++# dsv41 patch 0081: CPUs for the file-tier I/O threads, e.g. "0-4,10-14" (the A725 cores
++# on GB10, away from the X925 cores that run the launch and scheduling threads). The
++# threads otherwise inherit the process affinity; their pread/pwrite and the CRC of 0056
++# then compete with decode on the same cores. Empty = unchanged.
++_DSV41_IO_CPUS = os.environ.get("VLLM_DSV41_OFFLOAD_IO_CPUS", "").strip()
++
++
++def _dsv41_parse_cpus(spec: str) -> set[int]:
++    cpus: set[int] = set()
++    for part in spec.split(","):
++        part = part.strip()
++        if not part:
++            continue
++        if "-" in part:
++            a, b = part.split("-", 1)
++            cpus.update(range(int(a), int(b) + 1))
++        else:
++            cpus.add(int(part))
++    return cpus
++
+ 
+ class JobState:
+     """Thread-safe completion tracker for a set of per-block I/O tasks.
+@@ -160,6 +181,11 @@
+                 t.join()
+ 
+     def _worker(self, load_priority: bool) -> None:
++        if _DSV41_IO_CPUS:  # dsv41 patch 0081: this thread only (Linux, pid 0 = caller)
++            try:
++                os.sched_setaffinity(0, _dsv41_parse_cpus(_DSV41_IO_CPUS))
++            except (OSError, ValueError):
++                logger.warning("dsv41 patch 0081: cannot pin I/O thread to %s", _DSV41_IO_CPUS)
+         # Wait for tasks, process from primary queue first, fall back to secondary.
+         while True:
+             with self._condition:

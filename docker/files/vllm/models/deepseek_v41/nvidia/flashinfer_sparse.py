@@ -97,6 +97,13 @@ _FLAT_MAX_Q = 8
 # _FLAT_MAX_Q tokens a request) go to the EXL3 plugin's Triton sparse attention (vllm_exl3_moe/sparse_attn.py) instead
 # of FlashInfer, whose GB10 calibration sends them to its multi-row prefill kernel (~49 us a layer at 6 rows)
 _TRITON_VERIFY = os.environ.get("VLLM_DSV41_TRITON_VERIFY", "0") == "1"
+# VLLM_DSV41_GTOPK_REUSE=1 (dsv41 patch 0079a, default 0): in decode, every compressed layer maps the shared top-k buffer
+# to global KV slots (compute_global_topk_indices_and_lens, one launch a layer: 38 a round). Layers that read the same
+# top-k (same index-source layer), the same compressed block table (same KV source) and block size get the same
+# result, so the first of each group computes it for the step and the others reuse its tensors (8 launches a round
+# instead of 38 on V4.1: groups 2-7, 8-13, 14-19, 20-23, 24-27, 28-31, 32-35, 36-39). Consumers only read them.
+# The per-step dict is the metadata's flashinfer_sparse_index_cache (a fresh one per build(), cleared on updates).
+_GTOPK_REUSE = os.environ.get("VLLM_DSV41_GTOPK_REUSE", "0") == "1"
 
 
 def _pad_to_supported_q_heads(num_heads: int) -> int:
@@ -838,6 +845,42 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             q = padded_query
         return q.contiguous()
 
+    def _dsv41_global_topk(
+        self,
+        swa_metadata: "DeepseekSparseSWAMetadata",
+        attn_metadata: DeepseekV4FlashMLAMetadata,
+        num_decodes: int,
+        num_decode_tokens: int,
+        block_size: int,
+        is_valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """dsv41 patch 0079a: compute_global_topk_indices_and_lens once a step for the layers that share its inputs
+        (see _GTOPK_REUSE); the key holds everything the call reads besides the per-step metadata itself."""
+        assert self.topk_indices_buffer is not None
+        block_table = attn_metadata.block_table[:num_decodes]
+        key = (
+            "dsv41_gtopk",
+            self.index_source_layer_id,
+            self.compressed_cache_prefix,
+            block_size,
+            num_decode_tokens,
+            num_decodes,
+            block_table.data_ptr(),
+            self.topk_indices_buffer.data_ptr(),
+        )
+        cache = swa_metadata.flashinfer_sparse_index_cache
+        hit = cache.get(key)
+        if hit is None:
+            hit = compute_global_topk_indices_and_lens(
+                self.topk_indices_buffer[:num_decode_tokens],
+                swa_metadata.token_to_req_indices,
+                block_table,
+                block_size,
+                is_valid,
+            )
+            cache[key] = hit
+        return hit
+
     def _forward_decode(
         self,
         q: torch.Tensor,
@@ -868,13 +911,19 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             # Local indices filled by the index-source layer's indexer.
             is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
             block_size = attn_metadata.block_size // self.compress_ratio
-            global_indices, extra_sparse_lengths = compute_global_topk_indices_and_lens(
-                self.topk_indices_buffer[:num_decode_tokens],
-                swa_metadata.token_to_req_indices,
-                attn_metadata.block_table[:num_decodes],
-                block_size,
-                is_valid,
-            )
+            if _GTOPK_REUSE:
+                # dsv41 patch 0079a: once a step per (index source, KV source, block size)
+                global_indices, extra_sparse_lengths = self._dsv41_global_topk(
+                    swa_metadata, attn_metadata, num_decodes, num_decode_tokens, block_size, is_valid
+                )
+            else:
+                global_indices, extra_sparse_lengths = compute_global_topk_indices_and_lens(
+                    self.topk_indices_buffer[:num_decode_tokens],
+                    swa_metadata.token_to_req_indices,
+                    attn_metadata.block_table[:num_decodes],
+                    block_size,
+                    is_valid,
+                )
             extra_sparse_indices = global_indices.view(num_decode_tokens, 1, -1)
 
         swa_indices = swa_metadata.decode_swa_indices
