@@ -357,7 +357,7 @@ use. `docker/Dockerfile` rebuilds the image from a locally built recipe image; `
 what, why, measurements and switches in its header.
 
 **Rule for 0031:** keep `long-prefill-token-threshold × (max-num-seqs − 1) < max-num-batched-tokens` (we use
-max-num-batched-tokens / 4 with 4 seqs). vLLM stops throttling once a request is left waiting after a release step
+max-num-batched-tokens / 8 with 8 seqs since 23.10., / 4 with 4 seqs before). vLLM stops throttling once a request is left waiting after a release step
 (`prefill_capacity_bound`). If background chunks can fill a whole step, a new foreground request starves until the
 background prefill is done (we measured 150 s). Without priorities from your clients everything is foreground. Since
 19.10. we also start vLLM with `--scheduling-policy priority`, so its waiting queue is ordered by the same `priority`
@@ -490,6 +490,51 @@ be simulated offline against the same rounds. Live counters of our own client ov
 
 Without a better-trained drafter or tree verification, prose decode is at its limit on this stack. 0082 and 0083 are
 in `patches/` (both off, not in the published image, which stays v24).
+
+## Eight slots with strict priority (23.10.)
+
+Goal: no client should time out while it waits, and several agents should be able to work at once. We tried two ways.
+
+**Fair sharing does not work on GB10.** With the strict separation off (8 slots, `VLLM_PREFILL_EVERY_N_STEPS=1`, no 0071
+cap, no 0072 pause, `VLLM_DSV41_BG_LPT_SOLO=0`), background prefill chunks run in every step next to the foreground
+decode. A 512-token chunk costs ~240 ms, a decode round ~40 ms, so the foreground waits for a chunk on every token.
+`bench/fair_bench.py`: one priority-0 stream (three 600-token answers) next to background jobs that each summarize ~60K
+uncached tokens:
+
+| foreground tok/s | strict (v24) | background priority 10, no separation | everything priority 0 |
+|---|---|---|---|
+| alone | 58.2 | 57.5 | 55.9 |
+| next to 1 background job | 57.7 | 8.5 | 7.2 (first token up to 55 s) |
+| next to 2 background jobs | 56.1 | 5.4 | 3.4 (first token up to 47 s) |
+
+The background finishes 3–5× more jobs in the same time, but the interactive stream becomes unusable.
+
+**Priority does not free a slot.** vLLM's priority policy orders the waiting queue and preempts the lowest-priority
+request only when KV blocks run out. Once `max-num-seqs` requests are running, the waiting loop stops
+(`if num_running >= self.max_num_active_reqs: break` in `v1/core/sched/scheduler.py`). With 4 slots full of background
+prefills, a priority-0 request waited 228 s for its first token.
+
+**What we run now:** the strict separation unchanged (0071 `bg=0`, 0072 `bgpause=10`, 0073, 0074,
+`VLLM_PREFILL_EVERY_N_STEPS=100000`) with 8 slots: `MAX_SEQS=8`, DSpark k = 5 at 1–4 and k = 3 at 5–8 streams, long-prefill
+threshold `MAX_BATCH / 8` (`serve/serve_example.sh`). Same load on both, `bench/par_test.py`: one priority-0 stream with
+six 500-token turns and 3 s pauses, plus 7 priority-10 requests with ~30K uncached tokens and 300-token answers, all
+started together, thinking off:
+
+| | 4 slots | 8 slots |
+|---|---|---|
+| foreground decode | 56.9 tok/s | 56.3 tok/s |
+| foreground first token, worst turn | 228 s | 3.2 s |
+| background requests finished | 7 / 7 | 7 / 7 |
+| longest gap without data on a background stream | 390 s | 283 s |
+| wall time | 392 s | 287 s |
+
+Next to 1 / 2 background jobs the foreground keeps 56.5 / 57.7 tok/s (`bench/fair_bench.py`). 8 streams reach 141.8 tok/s
+together (`bench/tput.py`; 4 streams 107–112). Lowest free memory under this load: 2,380 MiB on the head node; the 1M
+needle with 8 slots: 3/3 found, 3,103 MiB free. GPU clock 2000–2200 MHz (thermal guard), not locked.
+
+A background stream's longest gap is roughly its prefill time behind everything else, so set client and proxy inactivity
+timeouts above it (we use 1,800 s for background). If a proxy in front caps background concurrency (ours did, at 1),
+raise the cap together with `max-num-seqs` and keep slots free for interactive requests (we allow 4 background requests).
 
 ## Tips that helped on GB10
 

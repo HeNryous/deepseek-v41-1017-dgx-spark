@@ -16,15 +16,17 @@ export FAB_IF=${FAB_IF:-enp1s0f0np0} FAB_HCA=${FAB_HCA:-rocep1s0f0}   # fabric n
 export IMAGE=ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v24
 export MODEL_DIR=$HOME/models/DeepSeek-V4.1-Flash-1017-EXL3-2.75bpw-DGX-Spark   # incl. the two 1017 Engram shards (scripts/download_model.sh)
 export SERVED=DeepSeek-V4.1-Flash-1017-EXL3-Spark-TP2
-export TEXT_ONLY=0 MAX_LEN=1048576 MAX_SEQS=4 MAX_BATCH=4096 UTIL=0.86   # 1M context since 22.10. (needle at 949K 3/3, needs 0076)
+export TEXT_ONLY=0 MAX_LEN=1048576 MAX_SEQS=8 MAX_BATCH=4096 UTIL=0.86   # 1M context since 22.10. (needle at 949K 3/3, needs 0076);
+                                                 # 8 slots since 23.10. (README: "Eight slots with strict priority")
 export KV_BYTES=3758096384                       # 3.5 GiB per rank (256 MiB of the head node go to the offload's CPU tier)
                                                  # -> 1,824,938 tokens at MAX_LEN 1048576; UTIL then only gates the startup check
-# 0040: DSpark k = 5 at 1-4 streams (at most 24 verify rows, kept on exl3_mrow by 0042b; until 21.10. k = 4 at 3-4)
-export SPEC='{"method":"dspark","num_speculative_tokens":5,"num_speculative_tokens_per_batch_size":[[1,4,5]]}'
-# keep the background long-prefill threshold <= MAX_BATCH / 4, otherwise background prefills can fill a whole step and a
+# 0040: DSpark k = 5 at 1-4 streams (at most 24 verify rows, kept on exl3_mrow by 0042b; until 21.10. k = 4 at 3-4),
+# k = 3 at 5-8 streams (at most 32 rows)
+export SPEC='{"method":"dspark","num_speculative_tokens":5,"num_speculative_tokens_per_batch_size":[[1,4,5],[5,8,3]]}'
+# keep long-prefill threshold x (MAX_SEQS - 1) < MAX_BATCH (MAX_BATCH / 8 with 8 slots), otherwise background prefills can fill a whole step and a
 # new foreground request waits for them (see patches/0031c). --scheduling-policy priority: vLLM's waiting queue is
 # ordered by the request field `priority` (lower first); --enable-prompt-tokens-details: usage reports cached prompt tokens.
-export EXTRA="--limit-mm-per-prompt '{\"image\":4}' --mm-processor-cache-gb 0 --long-prefill-token-threshold $((MAX_BATCH / 4)) \
+export EXTRA="--limit-mm-per-prompt '{\"image\":4}' --mm-processor-cache-gb 0 --long-prefill-token-threshold $((MAX_BATCH / 8)) \
 --scheduling-policy priority --enable-prompt-tokens-details"
 # KV offload (0056/0058 + 0077/0081, since 22.10.): vLLM's OffloadingConnector with a 256 MiB CPU tier and a file tier under
 # ~/.cache/dsv41-serve/kv_offload (on the head node only). 0077 keeps one copy per chunk on rank 0 and copies the chunks to
