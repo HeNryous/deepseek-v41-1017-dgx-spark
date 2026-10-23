@@ -1,0 +1,358 @@
+dsv41 patch 0082 (23.10.2026): DSpark round trace for measurements. Off by default (unset = v24 code path).
+Why: the prose campaign needs, per verify round and request, the verify window, the depth the policy chose, the
+confidence head's per-position values, the drafts, the target's argmax and p_T of every draft, the kept tokens and the
+GPU time of the round. vLLM's counters only give sums; the depth log only histograms.
+What: VLLM_DSV41_SPEC_TRACE=<prefix> makes TP rank 0 append JSON lines to <prefix>.rank0.jsonl while the control
+file <prefix>.on exists (so one serve can be timed with and without the trace). The hooks read logits, drafts,
+confidences and depths; a few extra kernels (top-2, logsumexp, gather on a float copy of the verify rows' logits) and
+small copies into pinned host buffers run behind a CUDA event, a writer thread waits for it, so the host never blocks.
+Outputs are unchanged with the trace on or off. VLLM_DSV41_SPEC_TRACE_PROMPT=1 adds the prompt token ids per request.
+Switches: VLLM_DSV41_SPEC_TRACE (unset/0 = off), VLLM_DSV41_SPEC_TRACE_PROMPT.
+diff -ruN a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+--- a/vllm/v1/worker/gpu/model_runner.py	2026-10-23 00:17:25.713061122 +0200
++++ b/vllm/v1/worker/gpu/model_runner.py	2026-10-23 00:17:25.716490823 +0200
+@@ -161,6 +161,8 @@
+     DSparkDepthPolicy,
+     depth_policy_requested,
+ )
++# dsv41 patch 0082: DSpark round trace for measurements (VLLM_DSV41_SPEC_TRACE), off by default
++from vllm.v1.worker.gpu.spec_decode import dsv41_spec_trace as _dsv41_trace
+ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+     set_eagle3_aux_hidden_state_layers,
+     verify_supports_aux_hidden_states_over_pp,
+@@ -1250,6 +1252,8 @@
+                 self.depth_policy.set_priority(req_index, getattr(new_req_data, "priority", 0))
+             if self.prompt_lookup is not None:
+                 self.prompt_lookup.reset(req_index)
++            if _dsv41_trace.ENABLED:
++                _dsv41_trace.add_request(req_id, req_index, new_req_data, sampling_params)
+ 
+             if self.pooling_runner is not None:
+                 assert new_req_data.pooling_params is not None
+@@ -1720,6 +1724,14 @@
+             # Rejection sampling for spec decoding.
+             assert self.rejection_sampler is not None
+             assert self.speculator is not None
++            if _dsv41_trace.ENABLED:
++                _dsv41_trace.verify(
++                    logits,
++                    input_batch,
++                    self.req_states.prefill_len.gpu,
++                    self.sampler.sampling_states.temperature.gpu,
++                    self.depth_policy,
++                )
+             sampler_output = self.rejection_sampler(
+                 logits,
+                 input_batch,
+@@ -2413,6 +2425,17 @@
+                     decoding=num_sampled[: input_batch.num_reqs] > 0,
+                     lookup_from=lookup_from,
+                 )
++            if _dsv41_trace.ENABLED:
++                _dsv41_trace.step_end(
++                    input_batch,
++                    num_sampled,
++                    sampler_output.sampled_token_ids,
++                    draft_tokens,
++                    self.speculator.draft_token_confidence_probs
++                    if getattr(self.speculator, "use_confidence_head", False)
++                    else None,
++                    self.depth_policy,
++                )
+ 
+         if self.num_speculative_steps > 0:
+             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
+diff -ruN a/vllm/v1/worker/gpu/spec_decode/dsv41_spec_trace.py b/vllm/v1/worker/gpu/spec_decode/dsv41_spec_trace.py
+--- a/vllm/v1/worker/gpu/spec_decode/dsv41_spec_trace.py	1970-01-01 01:00:00.000000000 +0100
++++ b/vllm/v1/worker/gpu/spec_decode/dsv41_spec_trace.py	2026-10-23 00:17:25.716164936 +0200
+@@ -0,0 +1,290 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""dsv41 patch 0082 (23.10.2026): DSpark round trace for measurements. Off by default.
++
++VLLM_DSV41_SPEC_TRACE=<file prefix> turns it on (unset / "" / "0": ENABLED is False and model_runner.py only tests
++that module global, nothing else here runs). TP rank 0 then appends JSON lines to <prefix>.rank0.jsonl, but only while
++the control file <prefix>.on exists (looked up at most every 0.25 s), so one serve can be measured with and without
++the trace. Rank 1 never traces (both ranks compute the same drafts, depths and acceptances).
++
++Nothing here writes to a tensor the engine reads: the hooks read logits, drafts, confidences and depths, launch a few
++extra kernels on copies (top-2, logsumexp and a gather over the verify rows' logits) and copy small results into
++pinned host buffers behind a CUDA event; a writer thread waits for the event and writes the line, so the host does not
++block on the GPU. Outputs are unchanged with the trace on or off; the extra kernels cost ~0.1-0.2 ms a verify round
++(time A/B arms with the control file absent).
++
++Lines (all token ids are target vocabulary ids):
++  {"ev": "req", "req": id, "slot": s, "plen": prompt tokens, "temp": T, "top_p": p, "prio": priority,
++   "max": max_tokens, "prompt": [ids]}                          (prompt only with VLLM_DSV41_SPEC_TRACE_PROMPT=1)
++  {"ev": "step", "i": step, "ms": GPU ms since the previous traced step end (null after a gap), "t": host time,
++   "slots": [...], "reqs": [...],
++   verify rounds only ("ver": true):
++     "win": drafts scheduled per request (the verify window), "cu": logits row offsets per request,
++     "dep": verify depth per request (DSpark depth policy, rows past it are dead; null without the policy),
++     "x": token of each logits row (row 0 of a request = its last accepted token, row j = draft j),
++     "am": target argmax per row, "px": p_T(x of the NEXT row) per row (the probability that row j accepts draft
++     j+1 at the request's temperature T; T = 0 requests use T = 1), "p1"/"p2": p_T(top-1)/p_T(top-2) per row,
++     "ns": tokens kept per request (accepted drafts + 1), "out": the kept tokens,
++   every round: "conf": confidence per draft position of the drafts just proposed (null without the head),
++     "d": those drafts, "nd": the depth chosen for them (null without the policy)}
++"""
++
++import json
++import os
++import queue
++import threading
++import time
++
++import torch
++
++_PREFIX = os.environ.get("VLLM_DSV41_SPEC_TRACE", "").strip()
++ENABLED = _PREFIX not in ("", "0")
++_WITH_PROMPT = os.environ.get("VLLM_DSV41_SPEC_TRACE_PROMPT", "0") == "1"
++_CHECK_S = 0.25
++_QUEUE_MAX = 20000
++
++
++def _tp_rank() -> int:
++    try:
++        from vllm.distributed.parallel_state import get_tp_group
++
++        return int(get_tp_group().rank_in_group)
++    except Exception:  # no model parallel group (single-process tests)
++        return 0
++
++
++class _Tracer:
++    def __init__(self, prefix: str):
++        self.path = prefix + ".rank0.jsonl"
++        self.control = prefix + ".on"
++        d = os.path.dirname(self.path)
++        if d:
++            os.makedirs(d, exist_ok=True)
++        self._active = False
++        self._checked = -1e9
++        self._step = 0
++        self._last_traced = -2
++        self._pending = None
++        self._q: queue.Queue = queue.Queue(maxsize=_QUEUE_MAX)
++        self._dropped = 0
++        self._writer = threading.Thread(target=self._run, name="dsv41-spec-trace", daemon=True)
++        self._writer.start()
++
++    # --- host side ---------------------------------------------------------------------------------------------
++
++    def active(self) -> bool:
++        now = time.monotonic()
++        if now - self._checked >= _CHECK_S:
++            self._checked = now
++            self._active = os.path.exists(self.control)
++        return self._active
++
++    def _put(self, item) -> None:
++        try:
++            self._q.put_nowait(item)
++        except queue.Full:
++            self._dropped += 1
++
++    @staticmethod
++    def _pinned(t: torch.Tensor) -> torch.Tensor:
++        t = t.detach()
++        if t.device.type == "cpu":
++            return t.clone()
++        out = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=True)
++        out.copy_(t, non_blocking=True)
++        return out
++
++    def add_request(self, req_id, req_index, new_req_data, sampling_params) -> None:
++        if not self.active():
++            return
++        rec = {
++            "ev": "req",
++            "req": str(req_id),
++            "slot": int(req_index),
++            "plen": int(getattr(new_req_data, "prompt_len", 0) or 0),
++            "prio": int(getattr(new_req_data, "priority", 0) or 0),
++            "t": round(time.time(), 4),
++        }
++        if sampling_params is not None:
++            rec["temp"] = float(getattr(sampling_params, "temperature", 0.0) or 0.0)
++            rec["top_p"] = float(getattr(sampling_params, "top_p", 1.0) or 1.0)
++            rec["max"] = getattr(sampling_params, "max_tokens", None)
++        if _WITH_PROMPT:
++            ids = getattr(new_req_data, "prompt_token_ids", None)
++            if ids is not None:
++                rec["prompt"] = [int(x) for x in ids]
++        self._put(("req", rec, None, None))
++
++    def verify(self, logits, input_batch, prefill_len, temperature, depth_policy) -> None:
++        """Before the rejection sampler of a verify round: per logits row the row's token, the target argmax and
++        p_T of the next row's token, of the top-1 and the top-2 token."""
++        self._pending = None
++        if not self.active() or logits.shape[0] == 0:
++            return
++        from vllm.v1.worker.gpu.spec_decode.rejection_sampler import gather_draft_sampled
++
++        n = int(input_batch.num_reqs)
++        x, _pos = gather_draft_sampled(
++            input_batch.input_ids,
++            input_batch.positions,
++            input_batch.logits_indices,
++            input_batch.expanded_idx_mapping,
++            input_batch.expanded_local_pos,
++            prefill_len,
++        )
++        temp = temperature[input_batch.expanded_idx_mapping.long()].float()
++        temp = torch.where(temp > 0, temp, torch.ones_like(temp))
++        lg = logits.float() / temp[:, None]
++        lse = torch.logsumexp(lg, dim=-1)
++        top = torch.topk(lg, 2, dim=-1)
++        nxt = torch.roll(x, -1).clamp(min=0).long()
++        lx = lg.gather(1, nxt[:, None]).squeeze(1)
++        stats = torch.stack(
++            (torch.exp(lx - lse), torch.exp(top.values[:, 0] - lse), torch.exp(top.values[:, 1] - lse)), dim=0
++        )
++        dev = {"x": x, "am": top.indices[:, 0], "pp": stats}
++        if depth_policy is not None:
++            dev["dep"] = depth_policy.depth[input_batch.idx_mapping[:n].long()]
++        win = getattr(input_batch, "num_draft_tokens_per_req", None)
++        self._pending = (
++            {
++                "win": [int(v) for v in win[:n]] if win is not None else None,
++                "cu": [int(v) for v in input_batch.cu_num_logits_np[: n + 1]],
++            },
++            {k: self._pinned(v) for k, v in dev.items()},
++        )
++
++    def step_end(self, input_batch, num_sampled, sampled, draft_tokens, confidence, depth_policy) -> None:
++        self._step += 1
++        if not self.active():
++            self._pending = None
++            return
++        n = int(input_batch.num_reqs)
++        rec = {
++            "ev": "step",
++            "i": self._step,
++            "gap": self._last_traced != self._step - 1,
++            "t": round(time.time(), 4),
++            "slots": [int(v) for v in input_batch.idx_mapping_np[:n]],
++            "reqs": [str(r) for r in list(input_batch.req_ids)[:n]],
++        }
++        self._last_traced = self._step
++        dev = {}
++        if num_sampled is not None:
++            dev["ns"] = num_sampled[:n]
++        if sampled is not None:
++            dev["out"] = sampled[:n]
++        if draft_tokens is not None:
++            dev["d"] = draft_tokens[:n]
++        if confidence is not None:
++            dev["conf"] = confidence[:n]
++        if depth_policy is not None:
++            dev["nd"] = depth_policy.depth[input_batch.idx_mapping[:n].long()]
++        cpu = {k: self._pinned(v) for k, v in dev.items()}
++        pend, self._pending = self._pending, None
++        if pend is not None:
++            rec["ver"] = True
++            rec.update(pend[0])
++            cpu.update(pend[1])
++        else:
++            rec["ver"] = False
++        ev = None
++        if torch.cuda.is_available() and any(v.is_pinned() for v in cpu.values()):
++            ev = torch.cuda.Event(enable_timing=True)
++            ev.record()
++        self._put(("step", rec, cpu, ev))
++
++    # --- writer thread -----------------------------------------------------------------------------------------
++
++    @staticmethod
++    def _round(v):
++        return [round(float(a), 5) for a in v]
++
++    def _encode(self, rec: dict, cpu: dict) -> dict:
++        if "ns" in cpu:
++            ns = [int(a) for a in cpu["ns"].tolist()]
++            rec["ns"] = ns
++            if "out" in cpu:
++                out = cpu["out"].tolist()
++                rec["out"] = [[int(t) for t in row[: max(0, k)]] for row, k in zip(out, ns)]
++        if "d" in cpu:
++            rec["d"] = [[int(t) for t in row] for row in cpu["d"].tolist()]
++        if "conf" in cpu:
++            rec["conf"] = [self._round(row) for row in cpu["conf"].float().tolist()]
++        if "nd" in cpu:
++            rec["nd"] = [int(a) for a in cpu["nd"].tolist()]
++        if "x" in cpu:
++            rec["x"] = [int(a) for a in cpu["x"].tolist()]
++            rec["am"] = [int(a) for a in cpu["am"].tolist()]
++            pp = cpu["pp"].tolist()
++            rec["px"], rec["p1"], rec["p2"] = (self._round(r) for r in pp)
++        if "dep" in cpu:
++            rec["dep"] = [int(a) for a in cpu["dep"].tolist()]
++        return rec
++
++    def _run(self) -> None:
++        prev = None
++        f = open(self.path, "a", buffering=1 << 16)
++        last_flush = time.monotonic()
++        while True:
++            kind, rec, cpu, ev = self._q.get()
++            try:
++                if kind == "step":
++                    if ev is not None:
++                        ev.synchronize()
++                        rec["ms"] = (
++                            round(prev.elapsed_time(ev), 3) if (prev is not None and not rec["gap"]) else None
++                        )
++                        prev = ev
++                    else:
++                        rec["ms"] = None
++                    rec = self._encode(rec, cpu)
++                if self._dropped:
++                    rec["dropped"] = self._dropped
++                f.write(json.dumps(rec, separators=(",", ":")) + "\n")
++            except Exception as e:  # never take the engine down for a trace line
++                f.write(json.dumps({"ev": "error", "err": repr(e)[:300]}) + "\n")
++            now = time.monotonic()
++            if self._q.empty() or now - last_flush > 1.0:
++                f.flush()
++                last_flush = now
++
++
++_TRACER: "_Tracer | None | bool" = None
++
++
++def _get() -> "_Tracer | None":
++    global _TRACER
++    if _TRACER is None:
++        _TRACER = _Tracer(_PREFIX) if (ENABLED and _tp_rank() == 0) else False
++    return _TRACER or None
++
++
++def _guard(fn, *args) -> None:
++    """A trace hook never takes the engine down: the first exception is logged and the trace switches itself off."""
++    global _TRACER
++    t = _get()
++    if t is None:
++        return
++    try:
++        getattr(t, fn)(*args)
++    except Exception as e:  # noqa: BLE001
++        _TRACER = False
++        try:
++            from vllm.logger import init_logger
++
++            init_logger(__name__).warning("dsv41 0082: spec trace off after an error in %s: %r", fn, e)
++        except Exception:
++            pass
++
++
++def add_request(req_id, req_index, new_req_data, sampling_params) -> None:
++    _guard("add_request", req_id, req_index, new_req_data, sampling_params)
++
++
++def verify(logits, input_batch, prefill_len, temperature, depth_policy) -> None:
++    _guard("verify", logits, input_batch, prefill_len, temperature, depth_policy)
++
++
++def step_end(input_batch, num_sampled, sampled, draft_tokens, confidence, depth_policy) -> None:
++    _guard("step_end", input_batch, num_sampled, sampled, draft_tokens, confidence, depth_policy)

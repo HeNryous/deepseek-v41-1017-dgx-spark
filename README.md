@@ -348,6 +348,8 @@ The serving image of the [sudoingX recipe](https://github.com/sudoingX/dgx-spark
 | 0079 | decode fixed costs: global top-k indices reused across layers with the same inputs, no zero output for the shared expert (`VLLM_DSV41_GTOPK_REUSE=1`, `VLLM_EXL3_MOE_SHARED_ZEROS=1`) | off: decode −0.32 % (noise ±0.6 %), the estimated 0.35–0.6 % not measurable |
 | 0080 | reserve the late memory peaks at startup (dummy prefill at full context, mixed step, vision encoder; `VLLM_DSV41_PREALLOC=1`) | off: the floor does not become flat; lowest free memory under a 949K-token needle 1,970 instead of 2,250 MiB |
 | 0081 | KV offload: per-request load cap from the CPU tier size (a prefix needing more chunks than the CPU tier holds evicted its own promoted chunks and waited forever) and the file tier's I/O threads off the decode cores (`VLLM_DSV41_OFFLOAD_LOAD_FRACTION=0.45`, `VLLM_DSV41_OFFLOAD_IO_CPUS=0-4,10-13`) | **in use** (v24): with a 256 MiB CPU tier (~148K tokens) at most 66,432 tokens per request come from the file tier; a 252K-token prefix: 84.3 s instead of 111.2 s, no hang |
+| 0082 | DSpark round trace for measurements: per verify round and request the window, the chosen depth, the confidence head's values, the drafts, the target's argmax and p_T of each draft, the kept tokens and the round's GPU time; written by rank 0 behind a CUDA event (pinned buffers + writer thread), only while `<prefix>.on` exists (`VLLM_DSV41_SPEC_TRACE=<prefix>`) | off, not in the image; the measurement tool of "Prose decode" below; outputs are the same with it on |
+| 0083 | long-run depth rule: d = argmax (1 + S_d) − λ · ms(d) with λ = the stream's own rate (EMA of tokens kept / table ms), instead of each round's own rate (`VLLM_DSV41_DEPTH_LAMBDA=<alpha>`, depth-file token `lam=`) | off, not in the image: live code −0.4 / −0.5 %, JSON +0.2 / +0.4 % (two runs each, same texts; run-to-run ±0.7 %), simulated over all prose rounds ±0.5 % |
 | recipe switches | `VLLM_MOE_GATE_FIRST=1` (recipe patch 0018: the router GEMM before the shared-expert fork) and `VLLM_EXL3_MOE_SMOE_SHARED=1` (the shared expert inside the routed-expert kernel as one more pick per token, instead of its own launches); since 21.10. also `EXL3_CPU_PIN=5-9,15-19` (the plugin pins every thread of the vLLM processes to the Cortex-X925 cores) | step 3; `EXL3_CPU_PIN`: with 0064 in step 3 of "From v12 to v22" |
 
 All new switches are off by default; without them the image behaves like v4i. `serve/serve_example.sh` sets the ones we
@@ -445,6 +447,49 @@ gained 7.7 % at 1 stream (T = 0), but code lost 3.8 % (T = 0) and JSON 10.6 % (T
 accepted drafts, above which a request keeps the full window, code and JSON held at T = 0, but JSON at T = 1 still fell
 from 3.98 to 3.49 tokens per round. At 1.6, JSON keeps 4.05 of 4.11 tokens per round and prose gains 5.1 % at 1 stream
 (T = 0) and 9.3 % at 4 streams (step 5).
+
+## Prose decode: the limit is the drafter (23.10.)
+
+Prose is our slowest decode case (DSpark 1.9–2.0 tokens per round, code ~4). We measured why, with the round trace
+(0082) at 1 stream and 2000 MHz on synthetic prompts: English prose, German answers, German / English summaries of a
+given text, German / English thinking text (effort high), code, JSON; T = 0 and T = 1 (our agent client runs T 1.0,
+top_p 1.0, top_k 0). Arm A ran production rounds (0047 window + `conf` depth). Arm B verified all 5 drafts in every
+round (`VLLM_DSV41_ADAPTIVE_K=0`, depth `fixed:5`), which gives the outcome of every draft position, so depth rules can
+be simulated offline against the same rounds. Live counters of our own client over 4,195 rounds: 2.53 tokens per round.
+
+| prompts | T | tokens / round (A) | acceptance at draft position 0 / 1 / 2 / 3 | draft = target's top-1 | target's top-1 p (mean) | AUC of the confidence head (position 0) |
+|---|---|---|---|---|---|---|
+| English prose | 0 | 1.95 | 0.59 / 0.53 / 0.48 / 0.42 | (same) | 0.93 | 0.85 |
+| English prose | 1 | 2.03 | 0.62 / 0.59 / 0.55 / 0.57 | 0.62 / 0.59 / 0.57 | 0.93 | 0.85 |
+| German thinking text | 1 | 2.13 | 0.59 / 0.58 / 0.60 / 0.64 | 0.69 / 0.66 / 0.64 | 0.71 | 0.83 |
+| German summary | 1 | 3.36 | 0.87 / 0.77 / 0.72 / 0.76 | 0.88 / 0.77 / 0.72 | 0.98 | 0.89 |
+| code | 1 | 4.03 | 0.87 / 0.84 / 0.85 / 0.81 | 0.90 / 0.85 / 0.87 | 0.94 | 0.95 |
+
+(acceptance conditional on reaching the position)
+
+- **The drafter, not the temperature.** At prose positions the target is 93 % sure of its top token, and the drafter
+  matches that token in 59–62 % of cases. T = 1 costs nothing (position 0: 0.62 at T = 1, 0.59 at T = 0). Acceptance
+  falls only a little along the block (0.62 → 0.55), so the Markov part keeps the drafts consistent; the limit is the
+  single-token hit rate. The target's top-2 tokens together hold 0.99, so two candidates per position would have a
+  high ceiling, but that needs tree verification through the V4.1 sparse attention, indexer and compressor.
+- **Round cost** (1 stream, 2000 MHz): ms = 25.7 + 0.33 · (W + 1) + 3.34 · L, with W the verify window and L the live
+  rows (rows that run the routed experts); a live row costs ~3.3 ms, a dead row 0.3–0.6 ms. Prose spends ~0.9 live
+  rows per round on drafts that are then rejected, thinking text ~1.2: 8–11 % of a round.
+- **Depth policy headroom** (offline over Arm B's rounds, measured costs, against the production rule), prose at T = 1:
+  +15.8 % if the outcome were known, +11.2 % with the true acceptance probabilities, but every rule that has only the
+  information available at draft time stays within ±1 %: a re-measured cost table −0.1 %, isotonic calibration of the
+  confidence head ±0.0 %, the long-run rule 0083 +0.2 %, no 0047 window −0.3 % (live: prose 52.5 against 55.4 tok/s, so
+  the window stays). A second signal, the target's confidence at the anchor row from the round before, does not raise
+  the AUC (0.821 → 0.821). Thinking text: +10.7 / +7.5 % as the limits, the same ±1 % in practice.
+- **Prompt lookup (0043):** the oracle of the better chain (lookup vs DSpark) gives +9.2 % tokens per round on German
+  summaries, +2.8 % on German thinking text and 0 on English prose; realistic rules +1–2 %, against +0.6–1.3 % cost per
+  round. Live, 0043 gained nothing measurable.
+- **Measurement note:** at T = 0 two runs of the same prompt in the same serve diverge after ~128 positions (see the
+  KV-KLD floor in "KV cache capacity"), so paired T = 0 text comparisons only work for short outputs; the offline
+  simulation against fully verified rounds was the sharper tool here.
+
+Without a better-trained drafter or tree verification, prose decode is at its limit on this stack. 0082 and 0083 are
+in `patches/` (both off, not in the published image, which stays v24).
 
 ## Tips that helped on GB10
 

@@ -1,0 +1,166 @@
+dsv41 patch 0083 (23.10.2026): DSpark depth policy, long-run depth rule. Off by default (lam = 0 = the per-round rule).
+Why: the "conf" rule (TensorFold's _choose_k) picks each round's depth by that round's own rate, expected tokens /
+round ms. A stream's throughput is the long-run ratio sum(tokens) / sum(ms); its per-round optimum (Dinkelbach) is
+d = argmax (1 + S_d) - lam * ms(d) with lam = the stream's rate: a draft row pays when its survival is at least lam
+times its marginal cost. In weak rounds (prose) the round's own rate is below the stream's, so the per-round rule
+verifies rows with survival ~0.09-0.15 that the stream's rate does not pay for; in strong rounds it is the other way.
+What: per request lam = EMA(tokens kept) / EMA(table ms of the verified depth), weight alpha, updated in observe() on
+the device (no host sync, the same on both TP ranks); a new request starts at 1 / ms(0). Conf mode only; window cap,
+background cap and lookup confidences apply as before. The depth decides only how many drafts can be accepted.
+Switches: VLLM_DSV41_DEPTH_LAMBDA=<alpha> (0 = off), depth-file token "lam=<alpha>" (live).
+diff -ruN a/vllm/v1/worker/gpu/spec_decode/depth_policy.py b/vllm/v1/worker/gpu/spec_decode/depth_policy.py
+--- a/vllm/v1/worker/gpu/spec_decode/depth_policy.py	2026-10-23 00:27:46.217201610 +0200
++++ b/vllm/v1/worker/gpu/spec_decode/depth_policy.py	2026-10-23 00:27:46.220908810 +0200
+@@ -59,6 +59,15 @@
+ with the request (NewRequestData.priority); both TP ranks see the same priorities and
+ confidences, so they choose the same depths.
+ 
++dsv41 patch 0083 (23.10.2026), off by default: long-run depth rule ("lam=<alpha>", conf mode only). The rule
++above maximizes each round's own rate (expected tokens / round ms). For a stream the quantity to maximize is the
++long-run rate sum(tokens) / sum(ms), and the per-round optimum of that ratio is d = argmax (1 + S_d) - lam * ms(d)
++with lam = the stream's rate (Dinkelbach): a row is worth verifying when its survival is at least lam times its
++cost. The per-round ratio uses the round's own rate instead, which is low in weak rounds (prose), so it verifies rows
++the stream's rate does not pay for. lam is kept per request as EMA(tokens kept) / EMA(table ms of the verified
++depth) with weight alpha (observe(), device only); a new request starts at 1 / ms(0). The depth still decides only
++how many drafts can be accepted, never which tokens come out.
++
+ Environment:
+   VLLM_DSPARK_DEPTH_POLICY  "conf" (the rule above), "confb", "confr:<rows ms>",
+                             "fixed:<d>" (every request verifies d drafts) or unset / "0" (off)
+@@ -80,6 +89,8 @@
+                             request is in the step (-1 = off); depth-file token "bg=..."
+   VLLM_DSV41_BG_MIN_PRIO    0071: priority from which a request counts as background
+                             (default 10 = Hindsight); depth-file token "bgprio=..."
++  VLLM_DSV41_DEPTH_LAMBDA   0083: EMA weight alpha of the long-run depth rule (0 = off, the per-round rule);
++                            depth-file token "lam=..."
+ """
+ 
+ import os
+@@ -198,6 +209,20 @@
+     return torch.argmax(expected / cost_ms, dim=1).to(torch.int32)
+ 
+ 
++def choose_depth_lam(
++    confidence_probs: torch.Tensor, cost_ms: torch.Tensor, lam: torch.Tensor
++) -> torch.Tensor:
++    """0083: [n, k] acceptance probabilities, cost by depth, [n] stream rates (tokens per ms) -> [n] int32 depths
++    maximizing (1 + sum of survivals) - lam * cost."""
++    conf = confidence_probs.float().clamp(0.0, 1.0)
++    survival = torch.cumprod(conf, dim=1)
++    expected = torch.cat(
++        (torch.ones_like(conf[:, :1]), 1.0 + torch.cumsum(survival, dim=1)), dim=1
++    )
++    # argmax keeps the first (shallowest) depth among equal values.
++    return torch.argmax(expected - lam[:, None] * cost_ms[None, :], dim=1).to(torch.int32)
++
++
+ def choose_depth_joint(
+     conf: torch.Tensor,
+     rows_ms: torch.Tensor,
+@@ -276,10 +301,15 @@
+             "lookup": os.environ.get("VLLM_DSPARK_LOOKUP", "0"),
+             "bg": os.environ.get("VLLM_DSV41_BG_DEPTH", "-1"),
+             "bgprio": os.environ.get("VLLM_DSV41_BG_MIN_PRIO", "10"),
++            "lam": os.environ.get("VLLM_DSV41_DEPTH_LAMBDA", "0"),
+         }
+         # 0071: scheduling priority by request slot (NewRequestData.priority)
+         self.prio = torch.zeros((max_num_reqs,), dtype=torch.int32, device=device)
+         self.bg_depth, self.bg_min_prio = -1, 10
++        # 0083: long-run depth rule, per request EMA of tokens kept and of the verified depth's table ms
++        self.lam_alpha = 0.0
++        self._lam_num = torch.zeros((max_num_reqs,), dtype=torch.float32, device=device)
++        self._lam_den = torch.zeros((max_num_reqs,), dtype=torch.float32, device=device)
+         self._env_opts.update(_parse_options(text))
+         self.calib = False
+         self.lookup_opt = "0"
+@@ -306,6 +336,8 @@
+         if self.bg_depth >= 0:
+             logger.info("DSpark background depth cap (0071): requests with priority >= %d verify at most "
+                         "%d drafts while a foreground request is in the step", self.bg_min_prio, self.bg_depth)
++        if self.lam_alpha > 0:
++            logger.info("DSpark long-run depth rule (0083): alpha %.3f", self.lam_alpha)
+ 
+     def describe(self) -> str:
+         return f"fixed:{self.fixed}" if self.mode == "fixed" else self.mode
+@@ -318,6 +350,10 @@
+             self.bg_min_prio = int(opts.get("bgprio", "10"))
+         except ValueError:
+             self.bg_depth, self.bg_min_prio = -1, 10
++        try:
++            self.lam_alpha = min(max(float(opts.get("lam", "0") or 0.0), 0.0), 1.0)
++        except ValueError:
++            self.lam_alpha = 0.0
+         self.ctx_pts = _parse_ctx(opts.get("ctx"))
+         if self.ctx_pts:
+             dev = self.cost_ms.device
+@@ -328,6 +364,9 @@
+ 
+     def reset(self, req_index: int) -> None:
+         self.depth[req_index] = self.k
++        # 0083: a new request starts without history (lam = 1 / ms(0) until its first verify)
++        self._lam_num[req_index] = 0.0
++        self._lam_den[req_index] = 0.0
+ 
+     def set_priority(self, req_index: int, priority: int) -> None:
+         """0071: the request's scheduling priority (lower = earlier)."""
+@@ -390,12 +429,14 @@
+                                                     dtype=torch.float32, device=self.rows_ms.device))
+                     logger.info("DSpark depth cost table -> %s", [round(c, 2) for c in table[: self.k + 1]])
+         opts = {**self._env_opts, **_parse_options(text)}
+-        before = (self.calib, tuple(self.ctx_pts), self.lookup_opt, self.bg_depth, self.bg_min_prio)
++        before = (self.calib, tuple(self.ctx_pts), self.lookup_opt, self.bg_depth, self.bg_min_prio, self.lam_alpha)
+         self._apply_options(opts)
+-        if (self.calib, tuple(self.ctx_pts), self.lookup_opt, self.bg_depth, self.bg_min_prio) != before:
++        if (self.calib, tuple(self.ctx_pts), self.lookup_opt, self.bg_depth, self.bg_min_prio,
++                self.lam_alpha) != before:
+             logger.info("DSpark depth options -> calibration %s, context ms %s, lookup %s, background cap %s "
+-                        "(priority >= %d)", self.calib, self.ctx_pts, self.lookup_opt,
+-                        self.bg_depth if self.bg_depth >= 0 else "off", self.bg_min_prio)
++                        "(priority >= %d), long-run rule alpha %s", self.calib, self.ctx_pts, self.lookup_opt,
++                        self.bg_depth if self.bg_depth >= 0 else "off", self.bg_min_prio,
++                        self.lam_alpha if self.lam_alpha > 0 else "off")
+         if (mode, fixed) != (self.mode, self.fixed):
+             self.mode, self.fixed = mode, fixed
+             logger.info("DSpark depth policy -> %s", self.describe())
+@@ -479,7 +520,13 @@
+                 # 0071: capped background slots carry no confidence (a joint choice prices them as dead rows)
+                 conf = torch.where(bgc[:, None] & (self._pos[None, :] >= self.bg_depth),
+                                    torch.zeros_like(conf), conf)
+-            if self.mode == "conf":
++            if self.mode == "conf" and self.lam_alpha > 0:
++                # 0083: long-run rule with the request's running rate
++                den = self._lam_den[idx]
++                lam = torch.where(den > 0, self._lam_num[idx] / den.clamp_min(1e-6),
++                                  1.0 / self.cost_ms[0].clamp_min(1e-6))
++                depth = choose_depth_lam(conf, self.cost_ms, lam)
++            elif self.mode == "conf":
+                 depth = choose_depth(conf, self.cost_ms)
+             else:
+                 live = None
+@@ -530,7 +577,8 @@
+         """Count drafts verified and accepted; calibrate; log every VLLM_DSPARK_DEPTH_LOG steps."""
+         if num_reqs == 0 or num_drafts_per_req is None:
+             return
+-        if self.log_every <= 0 and not (self.calib and self.mode in ("conf", "confb", "confr")):
++        lam_on = self.lam_alpha > 0 and self.mode == "conf"
++        if self.log_every <= 0 and not (self.calib and self.mode in ("conf", "confb", "confr")) and not lam_on:
+             return
+         idx = idx_mapping[:num_reqs].long()
+         depth = self.depth[idx].long()
+@@ -539,6 +587,16 @@
+         ).to(depth.device, non_blocking=True)
+         live = torch.minimum(depth, drafts)
+         acc = (num_sampled[:num_reqs].long() - 1).clamp(min=0)
++        if lam_on:
++            # 0083: EMA of tokens kept and of the table ms of the verified depth, decoding requests only
++            a = self.lam_alpha
++            kept = num_sampled[:num_reqs].float()
++            dec = kept > 0
++            ms = self.cost_ms[live.clamp(0, self.k)]
++            self._lam_num.index_copy_(0, idx, torch.where(dec, (1 - a) * self._lam_num[idx] + a * kept,
++                                                          self._lam_num[idx]))
++            self._lam_den.index_copy_(0, idx, torch.where(dec, (1 - a) * self._lam_den[idx] + a * ms,
++                                                          self._lam_den[idx]))
+         if self.calib and self.mode in ("conf", "confb", "confr"):
+             self._calibrate(idx, torch.minimum(acc, live), live)
+         if self.log_every <= 0:
