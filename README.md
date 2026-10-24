@@ -557,15 +557,23 @@ cache empty, file tier kept), and compares the top-20 logprobs of the first 8 to
 | 943,928 tokens | 440 s | 770 s | 11.2 s (15 rounds) | 0.00001 | 8/8 |
 | 297,832 tokens | 136 s | 222 s | 4.0 s (5 rounds) | 0.00002 | 8/8 |
 
-**Several reloads at once.** Two 950K and one 300K reload started together at priority 10, with three interactive
-requests in between: the interactive requests got their first token after 0.6–1.5 s. Both 950K came back from the
-offload (37.8 / 44.7 s, KL ≤ 0.00001). The CPU tier holds two 66K loads at a time; a follow-up round that finds 0
-hits after a full round therefore waits up to 30 s for room instead of giving up (before that fix one 950K reload
-was computed again: 732 s). A third reload whose *first* lookup comes while two loads are in flight is still
-computed (correct output, 227 s for the 300K): the tiering manager returns MISS both for "not stored" and for
-"stored, but the CPU tier is full". Turning that MISS into a retry inside the manager livelocked three reloads (each
-partial promotion evicted the others' unpinned chunks), so we left it; the right fix is admission control before
-the lookup.
+**Several reloads at once.** The CPU tier holds two 66K loads at a time. Without care, a third reload whose first
+lookup came while two loads were in flight got MISS from the tiering manager (it returns MISS both for "not stored"
+and for "stored, but the CPU tier is full") and was computed again: 227 s for 300K. Retrying that MISS inside the
+manager livelocked three reloads (each partial promotion evicted the others' unpinned chunks). What works is
+admission control before the lookup: at most two requests may have offload work in flight
+(`VLLM_DSV41_OFFLOAD_MAX_LOADS`); another request whose next chunk sits in the file tier waits without promoting
+anything, priority first, for at most 120 s (`VLLM_DSV41_OFFLOAD_ADMIT_WAIT_S`); a fresh prompt never waits.
+Three 300K reloads started together at priority 10, interactive requests and a fresh 20K prompt in between:
+
+| | before admission control | with it |
+|---|---|---|
+| reloads back from the offload | 2 of 3 (third computed, 227 s) | 3 of 3, 5.3 / 5.3 / 7.0 s |
+| KL to cold, top-1 | ≤ 0.00001, 8/8 | ≤ 0.00012, 8/8 |
+| interactive first token | 0.6–1.5 s | 0.1 s |
+| fresh 20K prompt meanwhile | – | 8.8 s (its normal prefill) |
+
+The third reload waited 1.7 s for a slot.
 
 Aborting a request 5 s into its rounds leaves no request behind and the pool empty.
 
@@ -586,8 +594,8 @@ Two smaller changes in the same image, both switched by a file so they can be co
   The interactive request waits for up to two larger chunks already in flight (async scheduling). With four or more
   background requests the threshold applies as before.
 
-The three patches (`patches/0084-*`, `0085b-*`, `0074b-*`, all off by default) are not in the published v24 image
-yet. Our serve settings: `VLLM_DSV41_OFFLOAD_ROUNDS=1`, `VLLM_DSV41_RELEASE_FILE` with 131072,
+The three patches (`patches/0084-*`, `0085b-*`, `0074b-*`, all off by default) are in the image
+`ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v29` (= v24 + these three). Our serve settings: `VLLM_DSV41_OFFLOAD_ROUNDS=1`, `VLLM_DSV41_RELEASE_FILE` with 131072,
 `VLLM_DSV41_BG_IDLE_FILE` with 2048.
 
 ## Tips that helped on GB10

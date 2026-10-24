@@ -1,4 +1,4 @@
-dsv41 patch 0084 (23.–24.10.2026, v26f): KV offload, load a prefix larger than the per-request cap (0081) in rounds.
+dsv41 patch 0084 (23.–25.10.2026, v26h): KV offload, load a prefix larger than the per-request cap (0081) in rounds.
 Why: 0081 caps a load at 66,432 tokens (0.45 of the 256 MiB CPU tier) so that a large prefix cannot hang the tiering
 manager; everything past the cap was computed again. A 950K-token prefix after a restart therefore cost a full prefill
 (440 s at priority 0, 770 s at background priority with 0074) although all of it sat in the file tier.
@@ -12,19 +12,22 @@ round reserves only for running/loading prefills and block holders ahead of it, 
 (two reloads cannot wait for each other); a refused holder keeps new requests of the same or lower priority out of
 that pass, more urgent ones still go ahead. A follow-up lookup with 0 hits after a full round means the CPU tier is
 busy with other loads: retried for up to VLLM_DSV41_ROUND_ZERO_WAIT_S (30 s) before the rest is computed (v26f).
-Known limit: the CPU tier holds two 66K loads at a time. A third reload whose FIRST lookup comes while two loads are
-in flight gets MISS from the tiering manager (it cannot tell "not stored" from "stored, CPU tier full") and is
-computed as before: correct, but slow. Turning that MISS into a retry inside the manager livelocked three reloads
-(each partial promotion evicted the others' unpinned chunks), so the fix belongs into admission control instead.
+Admission control (v26h): at most N requests (default floor(1 / load fraction) = 2,
+VLLM_DSV41_OFFLOAD_MAX_LOADS) may have offload work in flight. Another request whose next chunk is offloaded waits
+without starting any promotion (the tiering manager is asked only whether the first chunk the CPU tier lacks sits
+in the file tier) for at most VLLM_DSV41_OFFLOAD_ADMIT_WAIT_S (120 s, absolute), priority first; a fresh prompt never
+waits. Without it a third simultaneous reload got MISS ("stored, but CPU tier full") and was computed; retrying
+inside the manager instead livelocked three reloads.
 Rounds continue only past the 0081 default cap, never past a max_load_tokens the client set.
 Measured (24.10., 2× GB10, 1M context): 950K prefix after a restart, first token 11.2 s instead of 440 s, 300K 4.0 s;
 KL of the first 8 tokens' top-20 against a cold computation (cache_salt) <= 0.00003 (cold vs cold 0.00025), top-1 8/8.
-Two 950K and one 300K reload at once: interactive requests got their first token after 0.64–0.86 s.
+Three 300K reloads at once: all three from the offload in 5.3–7.0 s (KL <= 0.00012, top-1 8/8; the third waited
+1.7 s for a slot), interactive first token 0.1 s, a fresh 20K prompt meanwhile 8.8 s (its normal prefill).
 Switch: VLLM_DSV41_OFFLOAD_ROUNDS=1 (default off = behaviour of 0081).
 diff -ru a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
---- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py	2026-10-24 20:53:26.839241397 +0200
-+++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py	2026-10-24 20:53:26.842232138 +0200
-@@ -70,6 +70,12 @@
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py	2026-10-25 01:09:05.435723804 +0200
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py	2026-10-25 01:09:05.442606077 +0200
+@@ -70,6 +70,36 @@
  # request loads at most what fits that share of the CPU tier; the rest is computed.
  _DSV41_LOAD_FRACTION = float(os.environ.get("VLLM_DSV41_OFFLOAD_LOAD_FRACTION", "0") or 0)
  
@@ -34,10 +37,34 @@ diff -ru a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py 
 +# vllm/v1/core/sched/scheduler.py) until a round comes back short. Off by default.
 +_DSV41_ROUNDS = os.environ.get("VLLM_DSV41_OFFLOAD_ROUNDS", "0") == "1"
 +
++# dsv41 patch 0084 v26h: admission control before promotion. At most this many requests have offload work in
++# flight (promotions from the file tier, an async load, or 0084 follow-up rounds). Default floor(1 / load
++# fraction) of 0081, so that their capped loads fit the CPU tier together; 0 = off. Active only with
++# VLLM_DSV41_OFFLOAD_ROUNDS=1.
++def _dsv41_env_number(name: str, default: float) -> float:
++    raw = os.environ.get(name, "").strip()
++    if not raw:
++        return default
++    try:
++        return float(raw)
++    except ValueError:
++        logger.warning("dsv41 patch 0084: ignoring %s=%r (not a number)", name, raw)
++        return default
++
++
++_DSV41_MAX_LOADS = int(
++    _dsv41_env_number(
++        "VLLM_DSV41_OFFLOAD_MAX_LOADS",
++        int(1.0 / _DSV41_LOAD_FRACTION + 1e-9) if _DSV41_LOAD_FRACTION > 0 else 0,
++    )
++)
++# absolute per-request limit of the admission wait (never reset); afterwards the request proceeds as in v24
++_DSV41_ADMIT_WAIT_S = _dsv41_env_number("VLLM_DSV41_OFFLOAD_ADMIT_WAIT_S", 120.0)
++
  KV_LOAD_TIERS_KEY = "kv_load_tiers"
  MATCHER_MEDIUM_KEY = "medium"
  MATCHER_LOCALITY_KEY = "locality"
-@@ -386,6 +392,14 @@
+@@ -386,6 +416,21 @@
      partial_tail_boundary: int | None = None
      # True once on_request_finished has been signaled to the manager.
      finished_signaled: bool = False
@@ -49,10 +76,17 @@ diff -ru a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py 
 +    dsv41_logged: int = -1
 +    # dsv41 patch 0084 (v26e): max_load_tokens is the 0081 default, not set by the client
 +    dsv41_default_cap: bool = False
++    # dsv41 patch 0084 v26h: result of the last real lookup (None = deferred by the backend, i.e. promotions
++    # running); set to None on admission, to 0 when the last round has arrived or the request was preempted
++    dsv41_last_hit: int | None = 0
++    # dsv41 patch 0084 v26h: first admission deferral (time.monotonic), never reset
++    dsv41_wait_since: float | None = None
++    # dsv41 patch 0084 v26h: the absolute admission wait ran out; proceeds as in v24 from now on
++    dsv41_gave_up: bool = False
  
      def __post_init__(self) -> None:
          self.group_states = tuple(
-@@ -641,6 +655,8 @@
+@@ -641,6 +686,8 @@
  
          # dsv41 patch 0081: default max_load_tokens from the CPU tier and the groups
          self._dsv41_load_cap: int | None = None
@@ -61,7 +95,27 @@ diff -ru a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py 
          num_cpu_chunks = int(getattr(spec, "num_chunks", 0) or 0)
          full = [g for g in self.config.kv_group_configs if g.sliding_window_size_in_chunks is None]
          windowed = [g for g in self.config.kv_group_configs if g.sliding_window_size_in_chunks is not None]
-@@ -1061,6 +1077,7 @@
+@@ -660,6 +707,19 @@
+             self._dsv41_load_cap,
+             _DSV41_LOAD_FRACTION,
+         )
++        # dsv41 patch 0084 v26h: admission control (0 = off)
++        self._dsv41_max_loads = max(0, _DSV41_MAX_LOADS) if _DSV41_ROUNDS else 0
++        # requests that may hold a slot; membership is re-checked against live state (_dsv41_holds)
++        self._dsv41_holders: set[ReqId] = set()
++        # requests waiting for a slot -> (priority, arrival_time), admitted in this order
++        self._dsv41_waiters: dict[ReqId, tuple[int, float]] = {}
++        if self._dsv41_max_loads > 0:
++            logger.info(
++                "dsv41 patch 0084 v26h: at most %d requests with offload work in flight; others whose next "
++                "chunk is offloaded wait up to %.0f s (absolute) for a slot",
++                self._dsv41_max_loads,
++                _DSV41_ADMIT_WAIT_S,
++            )
+ 
+     def _maybe_observe_lookup_async_delay(
+         self, req_status: RequestOffloadState
+@@ -1061,6 +1121,7 @@
          )
          if req_status.max_load_tokens is None and self._dsv41_load_cap is not None:
              req_status.max_load_tokens = self._dsv41_load_cap  # dsv41 patch 0081
@@ -69,10 +123,26 @@ diff -ru a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py 
          self._req_status[request.request_id] = req_status
  
      def get_num_new_matched_tokens(
-@@ -1119,10 +1136,40 @@
+@@ -1105,8 +1166,13 @@
+         req_status.num_locally_computed_tokens = num_computed_tokens
+ 
+         num_hit_tokens: int | None
++        dsv41_deferred = False  # dsv41 patch 0084 v26h
+         if request.skip_reading_prefix_cache:
+             num_hit_tokens = 0
++        elif self._dsv41_max_loads > 0 and not self._dsv41_admit(req_status):
++            # dsv41 patch 0084 v26h: waits for an admission slot. No lookup, so no promotion is started.
++            num_hit_tokens = None
++            dsv41_deferred = True
+         else:
+             lookup_start = time.monotonic()
+             num_hit_tokens = self._lookup(req_status, max_num_new_tokens)
+@@ -1119,10 +1185,192 @@
                      req_status.deferred_lookup_start_time = lookup_start
              else:
                  self._maybe_observe_lookup_async_delay(req_status)
++        if self._dsv41_max_loads > 0 and not dsv41_deferred:
++            self._dsv41_note_lookup(req_status, num_hit_tokens)  # dsv41 patch 0084 v26h
 +        if _DSV41_ROUNDS:  # dsv41 patch 0084
 +            # rounds only past the 0081 default cap, never past a cap the client set (v26e)
 +            cap = req_status.max_load_tokens if req_status.dsv41_default_cap else None
@@ -107,12 +177,201 @@ diff -ru a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py 
 +        req_status = self._req_status.get(request.request_id)
 +        return bool(req_status is not None and req_status.dsv41_more)
 +
++    # ---- dsv41 patch 0084 v26h: admission control before promotion ------------------------------------------
++    def _dsv41_alive(self, req_id: ReqId) -> bool:
++        req_status = self._req_status.get(req_id)
++        return (
++            req_status is not None
++            and not req_status.finished_signaled
++            and not req_status.req.is_finished()
++        )
++
++    def _dsv41_has_load_job(self, req_status: RequestOffloadState) -> bool:
++        for job_id in req_status.transfer_jobs:
++            job = self._jobs.get(job_id)
++            if job is not None and not job.is_store:
++                return True
++        return False
++
++    def _dsv41_holds(self, req_id: ReqId) -> bool:
++        """Whether the request has offload work in flight, from live state only: an async load not yet
++        finished, 0084 follow-up rounds pending, or (not running) a last lookup that was deferred by the
++        backend (promotions) or hit chunks not yet loaded."""
++        if not self._dsv41_alive(req_id):
++            return False
++        req_status = self._req_status[req_id]
++        request = req_status.req
++        if self._dsv41_has_load_job(req_status) or getattr(request, "dsv41_load_more", False):
++            return True
++        if request.status == RequestStatus.RUNNING:
++            return False
++        return req_status.dsv41_last_hit != 0
++
++    def _dsv41_inflight(self) -> int:
++        """Number of requests with offload work in flight; drops stale holders."""
++        stale = [rid for rid in self._dsv41_holders if not self._dsv41_holds(rid)]
++        for rid in stale:
++            self._dsv41_holders.discard(rid)
++        return len(self._dsv41_holders)
++
++    def _dsv41_probe(self, req_status: RequestOffloadState) -> LookupResult:
++        """Would the request's lookup promote from a secondary tier? Asks the manager without promoting
++        (TieringOffloadingManager.dsv41_probe_offloaded) for the keys of the first lookup group from the
++        computed prefix up to the load cap. Managers without the probe (no tiering) cannot promote: MISS."""
++        probe = getattr(self.manager, "dsv41_probe_offloaded", None)
++        if probe is None or not self._lookup_groups:
++            return LookupResult.MISS
++        group_idx = self._lookup_groups[0]
++        tokens_per_chunk = self.config.kv_group_configs[group_idx].tokens_per_chunk
++        keys = req_status.group_states[group_idx].offload_keys
++        local = req_status.num_locally_computed_tokens
++        end_tokens = req_status.req.num_tokens
++        if req_status.max_load_tokens is not None:
++            end_tokens = min(end_tokens, local + req_status.max_load_tokens)
++        start = local // tokens_per_chunk
++        end = min(len(keys), end_tokens // tokens_per_chunk)
++        if end <= start:
++            return LookupResult.MISS
++        return probe(keys[start:end], req_status.req_context)
++
++    def _dsv41_admit(self, req_status: RequestOffloadState) -> bool:
++        """True: run the lookup now. False: wait for a slot (the caller returns None, no lookup)."""
++        request = req_status.req
++        rid = request.request_id
++        # in flight already (incl. 0084 follow-up rounds), or gave up waiting: never blocked
++        if getattr(request, "dsv41_load_more", False) or req_status.dsv41_gave_up:
++            return True
++        if rid in self._dsv41_holders and self._dsv41_holds(rid):
++            return True
++        now = time.monotonic()
++        inflight = self._dsv41_inflight()
++        free = self._dsv41_max_loads - inflight
++        if free > 0:
++            rank = (request.priority, request.arrival_time)
++            ahead = sum(
++                1
++                for w, w_rank in self._dsv41_waiters.items()
++                if w != rid and w_rank < rank and self._dsv41_alive(w)
++            )
++            if ahead < free:
++                self._dsv41_holders.add(rid)
++                req_status.dsv41_last_hit = None  # holds the slot until its lookup says otherwise
++                if self._dsv41_waiters.pop(rid, None) is not None:
++                    logger.info(
++                        "dsv41 patch 0084 v26h: request %s admitted after %.1f s (in flight before: %d of %d)",
++                        rid, now - (req_status.dsv41_wait_since or now), inflight, self._dsv41_max_loads,
++                    )
++                return True
++        verdict = self._dsv41_probe(req_status)
++        if verdict is LookupResult.MISS:
++            # nothing to promote (fresh prompt, or CPU-tier hits only): never waits
++            if self._dsv41_waiters.pop(rid, None) is not None:
++                logger.info(
++                    "dsv41 patch 0084 v26h: request %s stops waiting after %.1f s: nothing left to promote "
++                    "(in flight: %d of %d)",
++                    rid, now - (req_status.dsv41_wait_since or now), inflight, self._dsv41_max_loads,
++                )
++            return True
++        if req_status.dsv41_wait_since is None:
++            req_status.dsv41_wait_since = now
++        waited = now - req_status.dsv41_wait_since
++        if waited >= _DSV41_ADMIT_WAIT_S:
++            req_status.dsv41_gave_up = True
++            self._dsv41_waiters.pop(rid, None)
++            logger.warning(
++                "dsv41 patch 0084 v26h: request %s gives up waiting for a slot after %.1f s (in flight: %d of "
++                "%d); CPU-tier hits or compute, as without admission control",
++                rid, waited, inflight, self._dsv41_max_loads,
++            )
++            return True
++        if rid not in self._dsv41_waiters:
++            logger.info(
++                "dsv41 patch 0084 v26h: request %s waits for a slot (next chunk %s; in flight: %d of %d; "
++                "waited so far %.1f s of %.0f s)",
++                rid, "offloaded" if verdict is not LookupResult.RETRY else "unknown yet",
++                inflight, self._dsv41_max_loads, waited, _DSV41_ADMIT_WAIT_S,
++            )
++        self._dsv41_waiters[rid] = (request.priority, request.arrival_time)
++        return False
++
++    def _dsv41_note_lookup(
++        self, req_status: RequestOffloadState, num_hit_tokens: int | None
++    ) -> None:
++        """Record a real lookup. A deferred lookup (promotions running) or a hit makes the request a holder,
++        also one that was not admitted (fresh prompt with CPU hits, gave up, or a race with the probe): it
++        has work in flight and is counted. A 0 result lets _dsv41_holds drop it (unless rounds pend)."""
++        req_status.dsv41_last_hit = num_hit_tokens
++        if num_hit_tokens is None or num_hit_tokens > 0:
++            self._dsv41_holders.add(req_status.req.request_id)
++
++    def _dsv41_drop(self, req_id: ReqId, why: str) -> None:
++        self._dsv41_holders.discard(req_id)
++        if self._dsv41_waiters.pop(req_id, None) is not None:
++            req_status = self._req_status.get(req_id)
++            since = req_status.dsv41_wait_since if req_status is not None else None
++            logger.info(
++                "dsv41 patch 0084 v26h: request %s %s while waiting for a slot (waited %.1f s)",
++                req_id, why, time.monotonic() - since if since is not None else 0.0,
++            )
++
++    def _dsv41_reconcile(self, scheduler_output: SchedulerOutput) -> None:
++        """Once per step: drop preempted and finished requests, then re-derive the holders from live state."""
++        for rid in scheduler_output.preempted_req_ids or ():
++            req_status = self._req_status.get(rid)
++            if req_status is not None:
++                req_status.dsv41_last_hit = 0
++            self._dsv41_holders.discard(rid)
++        for rid in scheduler_output.finished_req_ids or ():
++            self._dsv41_drop(rid, "finished")
++        self._dsv41_inflight()
++        for rid in [w for w in self._dsv41_waiters if not self._dsv41_alive(w)]:
++            self._dsv41_drop(rid, "gone")
++
      def update_state_after_alloc(
          self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
      ):
+@@ -1228,6 +1476,8 @@
+         # a load can only be issued when no other jobs are pending.
+         assert not req_status.transfer_jobs
+         req_status.transfer_jobs.add(load_job_id)
++        if self._dsv41_max_loads > 0:
++            self._dsv41_holders.add(request.request_id)  # dsv41 patch 0084 v26h
+         self._jobs[load_job_id] = TransferJobStatus(
+             req_id=request.request_id,
+             pending_count=self.config.num_workers,
+@@ -1814,6 +2064,9 @@
+         )
+         self.manager.on_schedule_end(schedule_end_context)
+ 
++        if self._dsv41_max_loads > 0:
++            self._dsv41_reconcile(scheduler_output)  # dsv41 patch 0084 v26h
++
+         # Flush jobs for preempted requests.
+         for req_id in scheduler_output.preempted_req_ids or ():
+             req_status = self._req_status.get(req_id)
+@@ -1930,6 +2183,10 @@
+                 self.manager.complete_store(job_status.keys, req_status.req_context)
+             else:
+                 self.manager.complete_load(job_status.keys, req_status.req_context)
++                if self._dsv41_max_loads > 0 and not req_status.dsv41_more:
++                    # dsv41 patch 0084 v26h: last (or only) round arrived: the slot is free. With more
++                    # rounds the request keeps it; the scheduler sets dsv41_load_more next step.
++                    req_status.dsv41_last_hit = 0
+                 if self._chunks_being_loaded:
+                     self._chunks_being_loaded.difference_update(job_status.keys)
+             if self._block_id_to_pending_jobs:
+@@ -1977,6 +2234,8 @@
+             returned by the engine.
+ 
+         """
++        if self._dsv41_max_loads > 0:
++            self._dsv41_drop(request.request_id, "finished or aborted")  # dsv41 patch 0084 v26h
+         req_status = self._req_status.get(request.request_id)
+ 
+         if req_status is None:
 diff -ru a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
---- a/vllm/v1/core/sched/scheduler.py	2026-10-24 20:53:26.825844796 +0200
-+++ b/vllm/v1/core/sched/scheduler.py	2026-10-24 20:53:26.829176127 +0200
+--- a/vllm/v1/core/sched/scheduler.py	2026-10-25 01:09:05.425467588 +0200
++++ b/vllm/v1/core/sched/scheduler.py	2026-10-25 01:09:05.429299176 +0200
 @@ -4,6 +4,12 @@
  # dsv41 fairness (18.10.2026): long_prefill_token_threshold + DP-style prefill deferral only for requests with
  # priority >= this (e.g. interactive 0, subagents 5, background jobs 10); 0 = all requests.
@@ -559,3 +818,52 @@ diff -ru a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
          # SWA bounded replay recomputes the tail of the hit, which covers the
          # last token; otherwise a full prompt hit re-computes that token so the
          # next one can be sampled.
+diff -ru a/vllm/v1/kv_offload/tiering/manager.py b/vllm/v1/kv_offload/tiering/manager.py
+--- a/vllm/v1/kv_offload/tiering/manager.py	2026-10-25 01:09:05.452274556 +0200
++++ b/vllm/v1/kv_offload/tiering/manager.py	2026-10-25 01:09:05.455197427 +0200
+@@ -464,6 +464,45 @@
+             return LookupResult.RETRY
+         return LookupResult.MISS
+ 
++    def dsv41_probe_offloaded(
++        self, keys: Sequence[OffloadKey], req_context: ReqContext
++    ) -> LookupResult:
++        """dsv41 patch 0084 v26h: would a lookup of `keys` (a request's next prefix, in order) have to promote?
++
++        Walks the primary (CPU) tier along `keys` and asks the secondary tiers ONLY for the first key the
++        primary does not hold. Never calls _initiate_promotion, never allocates in or evicts from the primary,
++        records no metrics. Returns:
++            MISS        -- nothing to promote: all keys are in the primary tier, or the first missing key is in
++                           no secondary tier (fresh prompt);
++            HIT         -- the first missing key is in a secondary tier (a lookup would promote it);
++            HIT_PENDING -- a key is being written into the primary tier (promotion or store in flight);
++            RETRY       -- a secondary tier's existence check is still running (unknown, ask again).
++        """
++        self._maybe_process_finished_jobs()
++        first_missing = None
++        for key in keys:
++            result = self.primary_tier.lookup(key, req_context)
++            if result is LookupResult.HIT:
++                continue
++            if result is LookupResult.HIT_PENDING:
++                return LookupResult.HIT_PENDING
++            first_missing = key
++            break
++        if first_missing is None:
++            return LookupResult.MISS
++        any_retry = False
++        for tier in self.secondary_tiers:
++            if not req_context.load_tier_filter.allows(tier.medium, tier.locality):
++                continue
++            # SecondaryTierManager.lookup only checks existence (fs: async faccessat via
++            # AsyncLookupManager, flushed in on_schedule_end); it does not touch the primary tier.
++            result = tier.lookup(first_missing, req_context)
++            if result is LookupResult.HIT:
++                return LookupResult.HIT
++            if result is LookupResult.RETRY:
++                any_retry = True
++        return LookupResult.RETRY if any_retry else LookupResult.MISS
++
+     def _initiate_promotion(
+         self,
+         tier_idx: int,
