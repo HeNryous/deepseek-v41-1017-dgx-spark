@@ -1,0 +1,79 @@
+dsv41 patch 0074b (24.10.2026, applies after 0084): larger background prefill chunks while no foreground request is present.
+Why: 0074 keeps background chunks (priority >= VLLM_PREFILL_THROTTLE_MIN_PRIO) at long_prefill_token_threshold even
+when the background request is alone, so a foreground request that arrives only waits for a short chunk. With 8 slots
+(threshold 512) a lone 950K background prefill takes 770 s instead of 440 s.
+How: while no foreground request runs, waits, or sits in kv_holding_waiting, the per-request cap becomes
+max(threshold, min(VLLM_DSV41_BG_IDLE_TOKENS, input budget) // eligible requests). Also extends 0073: a foreground
+request in kv_holding_waiting (reloading its prefix from the KV offload) now counts as waiting.
+Switches: VLLM_DSV41_BG_IDLE_TOKENS (0 = off), VLLM_DSV41_BG_IDLE_FILE (file, read at most every 2 s, overrides live).
+diff -ru a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py	2026-10-24 18:15:09.723807682 +0200
++++ b/vllm/v1/core/sched/scheduler.py	2026-10-24 18:15:09.723920718 +0200
+@@ -41,6 +41,12 @@
+ # the price of a slower background prefill in idle time. Only requests at or above VLLM_PREFILL_THROTTLE_MIN_PRIO are
+ # capped (0031), so a foreground request alone still uses the whole budget. VLLM_DSV41_BG_LPT_SOLO=1, default off.
+ _DSV41_BG_LPT_SOLO = _dsv41_os.environ.get("VLLM_DSV41_BG_LPT_SOLO", "0") == "1"
++# dsv41 patch 0074b (24.10.2026): while NO foreground request (priority below VLLM_PREFILL_THROTTLE_MIN_PRIO) runs or
++# waits, background prefill chunks share VLLM_DSV41_BG_IDLE_TOKENS per step (cap = max(LPT, that // requests)), so a
++# lone background prefill no longer crawls at LPT when nobody waits; with a foreground request present 0074 applies
++# unchanged. VLLM_DSV41_BG_IDLE_FILE (integer, 0 = off) overrides it live, read at most every 2 s. Default off.
++_DSV41_BG_IDLE_TOKENS = int(_dsv41_os.environ.get("VLLM_DSV41_BG_IDLE_TOKENS", "0") or 0)
++_DSV41_BG_IDLE_FILE = _dsv41_os.environ.get("VLLM_DSV41_BG_IDLE_FILE", "")
+ # dsv41 patch 0075 (22.10.2026): the worker skips the decoder replay (layers past the last KV source) of a prefill chunk
+ # that trims and leaves more than a window (models/deepseek_v41/replay_skip.py). That is exact only if the next chunk
+ # trims too (more than prefix_replay_tokens rows), so a text request with more than a window left never gets a chunk
+@@ -702,6 +708,8 @@
+             for r in self.running
+         ) or (_DSV41_FG_WAIT_THROTTLE and _DSV41_THROTTLE_MIN_PRIO > 0 and any(
+             r.priority < _DSV41_THROTTLE_MIN_PRIO for r in self.waiting
++        ) or any(  # dsv41 0074b (review 24.10.): also foreground requests waiting in kv_holding_waiting
++            r.priority < _DSV41_THROTTLE_MIN_PRIO for r in self.kv_holding_waiting
+         )))  # dsv41 0073: also while a foreground request WAITS (its admission step then carries no background
+         # chunk; before, the in-flight steps each held a ~0.7 s background chunk and the first token took 3-5 s).
+         # dsv41 0031c: with a priority floor, throttle while a foreground request runs (decode OR prefill;
+@@ -720,6 +728,23 @@
+             if num_eligible_reqs > 1 or (_DSV41_BG_LPT_SOLO and _DSV41_THROTTLE_MIN_PRIO > 0)  # dsv41 0074
+             else 0
+         )
++        if (
++            (_DSV41_BG_IDLE_TOKENS or _DSV41_BG_IDLE_FILE)
++            and long_prefill_token_threshold > 0
++            and _DSV41_THROTTLE_MIN_PRIO > 0
++        ):
++            bg_idle = min(self._dsv41_bg_idle_tokens(), input_budget)
++            if (
++                bg_idle > 0
++                and not any(r.priority < _DSV41_THROTTLE_MIN_PRIO for r in self.running)
++                and not any(r.priority < _DSV41_THROTTLE_MIN_PRIO for r in self.waiting)
++                # review 24.10.: foreground requests loading/holding KV wait in kv_holding_waiting
++                and not any(r.priority < _DSV41_THROTTLE_MIN_PRIO for r in self.kv_holding_waiting)
++            ):
++                # dsv41 patch 0074b: nobody in the foreground, background chunks share the idle budget
++                long_prefill_token_threshold = max(
++                    long_prefill_token_threshold, bg_idle // max(num_eligible_reqs, 1)
++                )
+         if long_prefill_token_threshold > 0 and self.adaptive_long_prefill_threshold:
+             # Floor the cap at a fair share of the input budget so it never
+             # cuts a request below max_num_batched_tokens / num requests.
+@@ -3307,6 +3332,21 @@
+             )
+         return delay_free or partial_tail_delay, kv_xfer_params
+ 
++    def _dsv41_bg_idle_tokens(self) -> int:
++        """dsv41 patch 0074b: the idle budget for background chunks (VLLM_DSV41_BG_IDLE_FILE read at most
++        every 2 s, else VLLM_DSV41_BG_IDLE_TOKENS)."""
++        if not _DSV41_BG_IDLE_FILE:
++            return _DSV41_BG_IDLE_TOKENS
++        now = time.monotonic()
++        if now - getattr(self, "_dsv41_bg_idle_read", -10.0) >= 2.0:
++            self._dsv41_bg_idle_read = now
++            try:
++                with open(_DSV41_BG_IDLE_FILE) as f:
++                    self._dsv41_bg_idle_val = int(f.read().strip() or 0)
++            except (OSError, ValueError):
++                self._dsv41_bg_idle_val = _DSV41_BG_IDLE_TOKENS
++        return getattr(self, "_dsv41_bg_idle_val", _DSV41_BG_IDLE_TOKENS)
++
+     def _request_remaining_blocks(self, request: Request) -> int:
+         """Blocks `request` still needs to hold its full sequence and be promoted."""
+         full_num_tokens = min(request.num_tokens, self.max_model_len)

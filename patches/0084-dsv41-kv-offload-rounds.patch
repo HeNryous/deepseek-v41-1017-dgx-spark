@@ -1,0 +1,561 @@
+dsv41 patch 0084 (23.–24.10.2026, v26f): KV offload, load a prefix larger than the per-request cap (0081) in rounds.
+Why: 0081 caps a load at 66,432 tokens (0.45 of the 256 MiB CPU tier) so that a large prefix cannot hang the tiering
+manager; everything past the cap was computed again. A 950K-token prefix after a restart therefore cost a full prefill
+(440 s at priority 0, 770 s at background priority with 0074) although all of it sat in the file tier.
+How: when a lookup was cut by the default cap and more of the prompt remains, the request keeps its blocks and its exact
+boundary after the load (no replay yet) and is looked up again from there in the next scheduling pass, one round of up
+to 66,432 tokens at a time, until a round comes back short; then the usual SWA-bounded replay runs. Each follow-up
+round is admitted by a side-effect-free check that mirrors allocate_slots after the round's preparation (blocks below
+the sliding window released, block tables padded with null blocks, as a first-time allocation lays them out) with the
+full-ISL gate kept on; a refused round keeps everything and waits (logged once per boundary, warned every 60 s). A
+round reserves only for running/loading prefills and block holders ahead of it, so the oldest holder can always finish
+(two reloads cannot wait for each other); a refused holder keeps new requests of the same or lower priority out of
+that pass, more urgent ones still go ahead. A follow-up lookup with 0 hits after a full round means the CPU tier is
+busy with other loads: retried for up to VLLM_DSV41_ROUND_ZERO_WAIT_S (30 s) before the rest is computed (v26f).
+Known limit: the CPU tier holds two 66K loads at a time. A third reload whose FIRST lookup comes while two loads are
+in flight gets MISS from the tiering manager (it cannot tell "not stored" from "stored, CPU tier full") and is
+computed as before: correct, but slow. Turning that MISS into a retry inside the manager livelocked three reloads
+(each partial promotion evicted the others' unpinned chunks), so the fix belongs into admission control instead.
+Rounds continue only past the 0081 default cap, never past a max_load_tokens the client set.
+Measured (24.10., 2× GB10, 1M context): 950K prefix after a restart, first token 11.2 s instead of 440 s, 300K 4.0 s;
+KL of the first 8 tokens' top-20 against a cold computation (cache_salt) <= 0.00003 (cold vs cold 0.00025), top-1 8/8.
+Two 950K and one 300K reload at once: interactive requests got their first token after 0.64–0.86 s.
+Switch: VLLM_DSV41_OFFLOAD_ROUNDS=1 (default off = behaviour of 0081).
+diff -ru a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py	2026-10-24 20:53:26.839241397 +0200
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py	2026-10-24 20:53:26.842232138 +0200
+@@ -70,6 +70,12 @@
+ # request loads at most what fits that share of the CPU tier; the rest is computed.
+ _DSV41_LOAD_FRACTION = float(os.environ.get("VLLM_DSV41_OFFLOAD_LOAD_FRACTION", "0") or 0)
+ 
++# dsv41 patch 0084: load a prefix larger than the per-request cap in rounds. When a lookup
++# was cut by the 0081 default cap and more of the prompt remains, the request is flagged; once
++# that load has arrived, the scheduler asks again from the reached boundary (0084 in
++# vllm/v1/core/sched/scheduler.py) until a round comes back short. Off by default.
++_DSV41_ROUNDS = os.environ.get("VLLM_DSV41_OFFLOAD_ROUNDS", "0") == "1"
++
+ KV_LOAD_TIERS_KEY = "kv_load_tiers"
+ MATCHER_MEDIUM_KEY = "medium"
+ MATCHER_LOCALITY_KEY = "locality"
+@@ -386,6 +392,14 @@
+     partial_tail_boundary: int | None = None
+     # True once on_request_finished has been signaled to the manager.
+     finished_signaled: bool = False
++    # dsv41 patch 0084: the last lookup was cut by max_load_tokens and more prompt remains
++    dsv41_more: bool = False
++    # dsv41 patch 0084: deferred follow-up lookups of this request (for the log)
++    dsv41_pending: int = 0
++    # dsv41 patch 0084: position of the last logged lookup (one log line per position)
++    dsv41_logged: int = -1
++    # dsv41 patch 0084 (v26e): max_load_tokens is the 0081 default, not set by the client
++    dsv41_default_cap: bool = False
+ 
+     def __post_init__(self) -> None:
+         self.group_states = tuple(
+@@ -641,6 +655,8 @@
+ 
+         # dsv41 patch 0081: default max_load_tokens from the CPU tier and the groups
+         self._dsv41_load_cap: int | None = None
++        # dsv41 patch 0084: a hit within a few chunks of the cap counts as cut by it
++        self._dsv41_chunk_tokens = max((g.tokens_per_chunk for g in self.config.kv_group_configs), default=0)
+         num_cpu_chunks = int(getattr(spec, "num_chunks", 0) or 0)
+         full = [g for g in self.config.kv_group_configs if g.sliding_window_size_in_chunks is None]
+         windowed = [g for g in self.config.kv_group_configs if g.sliding_window_size_in_chunks is not None]
+@@ -1061,6 +1077,7 @@
+         )
+         if req_status.max_load_tokens is None and self._dsv41_load_cap is not None:
+             req_status.max_load_tokens = self._dsv41_load_cap  # dsv41 patch 0081
++            req_status.dsv41_default_cap = True  # dsv41 patch 0084 (v26e)
+         self._req_status[request.request_id] = req_status
+ 
+     def get_num_new_matched_tokens(
+@@ -1119,10 +1136,40 @@
+                     req_status.deferred_lookup_start_time = lookup_start
+             else:
+                 self._maybe_observe_lookup_async_delay(req_status)
++        if _DSV41_ROUNDS:  # dsv41 patch 0084
++            # rounds only past the 0081 default cap, never past a cap the client set (v26e)
++            cap = req_status.max_load_tokens if req_status.dsv41_default_cap else None
++            tol = 4 * self._dsv41_chunk_tokens
++            req_status.dsv41_more = bool(
++                cap
++                and num_hit_tokens
++                and num_hit_tokens + tol >= cap
++                and num_computed_tokens + num_hit_tokens + tol < request.num_tokens
++            )
++            if num_hit_tokens is None:
++                if getattr(request, "dsv41_load_more", False):
++                    req_status.dsv41_pending += 1
++                    if req_status.dsv41_pending in (1, 100, 1000, 10000):
++                        logger.info("dsv41 patch 0084: lookup %s from %d pending (%d times)",
++                                    request.request_id, num_computed_tokens, req_status.dsv41_pending)
++            elif (
++                req_status.dsv41_more or getattr(request, "dsv41_load_more", False)
++            ) and req_status.dsv41_logged != num_computed_tokens:
++                req_status.dsv41_logged = num_computed_tokens
++                logger.info("dsv41 patch 0084: lookup %s from %d: hit %d of %d prompt tokens, cap %s, more %s",
++                            request.request_id, num_computed_tokens, num_hit_tokens, request.num_tokens,
++                            cap, req_status.dsv41_more)
++                req_status.dsv41_pending = 0
+         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
+ 
+         return num_hit_tokens, bool(num_hit_tokens)
+ 
++    def dsv41_wants_more(self, request: Request) -> bool:
++        """dsv41 patch 0084: True if the request's last lookup was cut by the load cap
++        while more of its prompt remains (the scheduler then loads the next round)."""
++        req_status = self._req_status.get(request.request_id)
++        return bool(req_status is not None and req_status.dsv41_more)
++
+     def update_state_after_alloc(
+         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
+     ):
+diff -ru a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py	2026-10-24 20:53:26.825844796 +0200
++++ b/vllm/v1/core/sched/scheduler.py	2026-10-24 20:53:26.829176127 +0200
+@@ -4,6 +4,12 @@
+ # dsv41 fairness (18.10.2026): long_prefill_token_threshold + DP-style prefill deferral only for requests with
+ # priority >= this (e.g. interactive 0, subagents 5, background jobs 10); 0 = all requests.
+ _DSV41_THROTTLE_MIN_PRIO = int(_dsv41_os.environ.get("VLLM_PREFILL_THROTTLE_MIN_PRIO", "0"))
++# dsv41 patch 0084 (23.10.2026, v26e 24.10.): KV offload, load a prefix larger than the per-request cap (0081) in
++# rounds, together with the offloading connector's 0084. Off by default.
++_DSV41_OFFLOAD_ROUNDS = _dsv41_os.environ.get("VLLM_DSV41_OFFLOAD_ROUNDS", "0") == "1"
++# dsv41 patch 0084 v26f: a follow-up lookup with 0 hits after a full round waits up to this long for CPU-tier room
++# (three long reloads at once) before the rounds end and the rest is computed.
++_DSV41_ROUND_ZERO_WAIT_S = float(_dsv41_os.environ.get("VLLM_DSV41_ROUND_ZERO_WAIT_S", "30") or 30)
+ # dsv41 patch 0047 (19.10.2026): adaptive verify window. With a dynamic speculation schedule, the next step's draft
+ # count k becomes min(schedule[n], max over the step's decode requests of ceil(EMA(accepted drafts) + margin)), at least
+ # K_MIN; requests without history (new, prefill) ask for the full schedule. A round that accepted every draft of its
+@@ -987,6 +993,9 @@
+         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+             step_skipped_waiting: deque[Request] = deque()
+             step_skipped_kv_holding: deque[Request] = deque()
++            # dsv41 patch 0084 (v26e): lowest priority value of a block holder whose round was
++            # refused in this pass (None = none refused)
++            dsv41_round_refused = None
+ 
+             def skip_request(from_queue: RequestQueue) -> None:
+                 request_to_skip = from_queue.pop_request()
+@@ -1001,6 +1010,16 @@
+                 request_queue = self.kv_holding_waiting or self.waiting
+                 if not request_queue or input_budget <= draft_slots:
+                     break
++                if (
++                    dsv41_round_refused is not None
++                    and request_queue is self.waiting
++                    and request_queue.peek_request().priority >= dsv41_round_refused
++                ):
++                    # dsv41 patch 0084 (v26e): a block holder's round waits for blocks, so no new
++                    # request of the same or a lower priority takes them in this pass (the holders
++                    # behind it were still scanned). A more urgent request still goes ahead (S8:
++                    # strict priority, an interactive request does not wait for a background reload).
++                    break
+                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
+                 # in `running` but still hold a model-runner request slot.
+                 num_running = len(self.running) + self.num_waiting_for_streaming_input
+@@ -1038,6 +1057,9 @@
+                 num_external_computed_tokens = 0
+                 load_kv_async = False
+                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
++                # dsv41 patch 0084 (v26e): a follow-up round admitted by _dsv41_round_fit loads up to here
++                dsv41_round_target = None
++                dsv41_round_reserved = 0
+                 did_prefix_cache_lookup = False
+ 
+                 # Get already-cached tokens.
+@@ -1164,6 +1186,98 @@
+                     num_new_local_computed_tokens = 0
+                     num_computed_tokens = request.num_computed_tokens
+ 
++                    # dsv41 patch 0084: next round of a prefix larger than one load.
++                    if getattr(request, "dsv41_load_more", False):
++                        ext_tokens, more_async = (
++                            self.connector.get_num_new_matched_tokens(
++                                request, num_computed_tokens
++                            )
++                        )
++                        if ext_tokens is None:
++                            # promotions from the file tier still in flight
++                            skip_request(request_queue)
++                            continue
++                        if self.prefix_replay_tokens:
++                            ext_tokens -= ext_tokens % self.block_size
++                        if ext_tokens <= 0 and self._dsv41_zero_hit_wait(
++                            request, num_computed_tokens
++                        ):
++                            # v26f: the last round was full, so more prefix was offloaded; 0 hits means the
++                            # CPU tier is busy with other loads. Keep blocks and boundary, look again later.
++                            skip_request(request_queue)
++                            continue
++                        fit = None
++                        if ext_tokens > 0 and more_async:
++                            # v26e: reserve for in-flight prefills that progress on their own
++                            # (running chunks, loads) and for block holders this pass already
++                            # skipped, i.e. ahead of this request. Not for itself (v26b), and
++                            # not for holders behind it: they reserve for it in turn, and two
++                            # reloads reserving for each other would wait for each other forever.
++                            ahead = set(step_skipped_kv_holding)
++                            dsv41_round_reserved = self._spec_decode_step_blocks() + sum(
++                                self._request_remaining_blocks(r)
++                                for r in self._inflight_prefills
++                                if r is not request
++                                and (
++                                    r.status
++                                    in (
++                                        RequestStatus.RUNNING,
++                                        RequestStatus.WAITING_FOR_REMOTE_KVS,
++                                    )
++                                    or r in ahead
++                                )
++                            )
++                            fit = self._dsv41_round_fit(
++                                request,
++                                num_computed_tokens + ext_tokens,
++                                dsv41_round_reserved,
++                            )
++                        if fit is not None and not fit[0]:
++                            # Refused before anything changed: the request keeps its blocks and
++                            # its boundary and waits. Holders behind it still get their turn in
++                            # this pass, new requests do not (dsv41_round_refused).
++                            self._dsv41_log_refused(
++                                request, num_computed_tokens, ext_tokens, fit[1]
++                            )
++                            dsv41_round_refused = (
++                                request.priority
++                                if dsv41_round_refused is None
++                                else min(dsv41_round_refused, request.priority)
++                            )
++                            skip_request(request_queue)
++                            continue
++                        if fit is not None:
++                            if getattr(request, "dsv41_logged", -1) != num_computed_tokens:
++                                request.dsv41_logged = num_computed_tokens
++                                logger.info(
++                                    "dsv41 patch 0084: request %s loads the next round "
++                                    "from %d: +%d tokens (%s)",
++                                    request.request_id,
++                                    num_computed_tokens,
++                                    ext_tokens,
++                                    fit[1],
++                                )
++                            dsv41_round_target = num_computed_tokens + ext_tokens
++                            num_external_computed_tokens = ext_tokens
++                            num_computed_tokens += ext_tokens
++                            load_kv_async = True
++                            self._set_kv_fetch_stage(
++                                request, KV_FETCH_WAITING_TO_START
++                            )
++                        else:
++                            # no further round (short or no hit, or a layout the check does not
++                            # cover): replay the window below the boundary and compute the rest
++                            dsv41_boundary = num_computed_tokens
++                            self._dsv41_clear(request)
++                            num_computed_tokens = self._dsv41_finish_rounds(request)
++                            logger.info(
++                                "dsv41 patch 0084: request %s rounds done at %d, computes "
++                                "from %d",
++                                request.request_id,
++                                dsv41_boundary,
++                                num_computed_tokens,
++                            )
++
+                     if self._ec_transfer_pending(request, num_computed_tokens):
+                         skip_request(request_queue)
+                         continue
+@@ -1319,7 +1433,13 @@
+                     )
+ 
+                 reserved_blocks = 0
+-                if load_kv_async:
++                if load_kv_async and dsv41_round_target is not None:
++                    # dsv41 patch 0084 (v26e): a follow-up round _dsv41_round_fit admitted. Release
++                    # the blocks below its window and pad with nulls, as a first-time allocation of
++                    # these tokens holds them; allocate_slots below keeps the full-ISL gate.
++                    reserved_blocks = dsv41_round_reserved
++                    self._dsv41_prepare_round(request, dsv41_round_target)
++                elif load_kv_async:
+                     # An async load holds its blocks for the whole transfer with
+                     # no forward progress and isn't preemptible here. Admit it
+                     # only if it fits in (free - other in-flight reservations)
+@@ -1347,6 +1467,18 @@
+                     has_scheduled_reqs=bool(self.running),
+                 )
+ 
++                if new_blocks is None and dsv41_round_target is not None:
++                    # dsv41 patch 0084 (v26e): ruled out by _dsv41_round_fit. The blocks below the
++                    # round's window are already released, so a replay from the old boundary would
++                    # read null blocks: start the request over instead.
++                    logger.error(
++                        "dsv41 patch 0084: request %s got no slots for its admitted round "
++                        "from %d; starting it over",
++                        request.request_id,
++                        request.num_computed_tokens,
++                    )
++                    self._dsv41_reset_request(request, request_queue)
++                    continue
+                 if new_blocks is None:
+                     # The request cannot be scheduled.
+ 
+@@ -1691,6 +1823,8 @@
+         self._inflight_prefills.discard(request)
+         request.status = RequestStatus.PREEMPTED
+         request.num_computed_tokens = 0
++        if _DSV41_OFFLOAD_ROUNDS:
++            self._dsv41_clear(request)  # dsv41 patch 0084 (v26e)
+         if request.spec_token_ids:
+             request.spec_token_ids = []
+         # Async scheduling: mark all in-flight output as stale. Its tokens are
+@@ -3232,6 +3366,228 @@
+         request.replay_start = num_hit_tokens - num_replay_tokens
+         return num_replay_tokens
+ 
++    def _dsv41_wants_more(self, request: Request) -> bool:
++        """dsv41 patch 0084: ask the offloading connector's scheduler side whether the
++        request's last load was cut by the per-request cap with more prompt left."""
++        if not _DSV41_OFFLOAD_ROUNDS or self.connector is None:
++            return False
++        side = getattr(self.connector, "connector_scheduler", None)
++        fn = getattr(side, "dsv41_wants_more", None)
++        return bool(fn(request)) if callable(fn) else False
++
++    def _dsv41_finish_rounds(self, request: Request) -> int:
++        """dsv41 patch 0084: no further round. Apply what _update_waiting_for_remote_kv
++        skipped for the rounds (SWA bounded replay, or the recompute of the last token of a
++        full hit) and return the computed tokens. The sliding-window blocks of the replayed
++        window are the ones the last round allocated (_dsv41_prepare_round keeps them)."""
++        num_replay_tokens = self._mark_prefix_replay(request, request.num_computed_tokens)
++        if num_replay_tokens > 0:
++            request.num_computed_tokens -= num_replay_tokens
++        elif request.num_computed_tokens == request.num_tokens:
++            request.num_computed_tokens = request.num_tokens - 1
++        return request.num_computed_tokens
++
++    @staticmethod
++    def _dsv41_zero_hit_wait(request: Request, pos: int) -> bool:
++        """dsv41 patch 0084 v26f: True while a follow-up lookup with 0 hits at `pos` should be retried (at most
++        _DSV41_ROUND_ZERO_WAIT_S seconds per boundary), False when the rounds should end."""
++        now = time.monotonic()
++        if getattr(request, "dsv41_zero_pos", -1) != pos:
++            request.dsv41_zero_pos = pos
++            request.dsv41_zero_since = now
++            logger.info(
++                "dsv41 patch 0084: request %s found 0 hits from %d after a full round; CPU tier busy, "
++                "retrying for up to %.0f s",
++                request.request_id, pos, _DSV41_ROUND_ZERO_WAIT_S,
++            )
++            return True
++        if now - request.dsv41_zero_since < _DSV41_ROUND_ZERO_WAIT_S:
++            return True
++        logger.warning(
++            "dsv41 patch 0084: request %s still 0 hits from %d after %.0f s; ending the rounds",
++            request.request_id, pos, now - request.dsv41_zero_since,
++        )
++        return False
++
++    @staticmethod
++    def _dsv41_clear(request: Request) -> None:
++        """dsv41 patch 0084 (v26e): forget a request's rounds (last round done, load failed,
++        preempted, started over)."""
++        request.dsv41_load_more = False
++        request.dsv41_logged = -1
++        request.dsv41_refused_pos = -1
++        request.dsv41_zero_pos = -1  # v26f
++
++    def _dsv41_round_fit(
++        self, request: Request, target: int, reserved: int
++    ) -> tuple[bool, str] | None:
++        """dsv41 patch 0084 (v26e): whether the round loading [num_computed_tokens, target)
++        gets its slots, without changing anything.
++
++        Mirrors allocate_slots as it runs after _dsv41_prepare_round: remove_skipped_blocks
++        frees the non-null run below each manager's skip boundary (read backwards, as
++        _remove_blocks_in_range does; a block returns to the pool only at ref_cnt 0), the
++        block table is padded with nulls up to the target's skip boundary, and a request the
++        manager already tracks takes the fast path of get_num_blocks_to_allocate: the blocks
++        between the padded length and the target (step check, against free - reserved) or the
++        full sequence capped by the admission cap (full-ISL gate, against free). Both checks
++        add the watermark as allocate_slots does. Returns (fits, numbers for the log), or
++        None if a manager is not one this mirror covers (the caller then ends the rounds).
++        """
++        from vllm.v1.core.single_type_kv_cache_manager import (
++            CircularBufferManager,
++            FullAttentionManager,
++            SlidingWindowManager,
++        )
++
++        rid = request.request_id
++        pool = self.kv_cache_manager.block_pool
++        full_tokens = min(request.num_tokens, self.max_model_len)
++        step_tokens = min(target, self.max_model_len)
++        processed = max(0, step_tokens - request.num_in_flight_tokens)
++        need_full = need_step = released = 0
++        for manager in self.kv_cache_manager.coordinator.single_type_managers:
++            if isinstance(manager, CircularBufferManager):
++                # one ring block for the request's lifetime, claimed by its first round
++                n = manager.get_num_blocks_to_allocate(
++                    rid,
++                    step_tokens,
++                    (),
++                    step_tokens,
++                    request.num_computed_tokens,
++                    step_tokens,
++                )
++                need_full += n
++                need_step += n
++                continue
++            if (
++                type(manager) not in (FullAttentionManager, SlidingWindowManager)
++                or rid not in manager.num_cached_block
++            ):
++                if not getattr(self, "_dsv41_fit_warned", False):
++                    self._dsv41_fit_warned = True
++                    logger.warning(
++                        "dsv41 patch 0084: KV cache manager %s (tracks %s: %s) is not "
++                        "covered by the round check; prefixes over the load cap are "
++                        "computed after the first load instead",
++                        type(manager).__name__,
++                        rid,
++                        rid in manager.num_cached_block,
++                    )
++                return None
++            blocks = manager.req_to_blocks.get(rid, ())
++            first_kept = manager.get_num_skipped_tokens(processed) // manager.block_size
++            for i in range(min(first_kept, len(blocks)) - 1, -1, -1):
++                block = blocks[i]
++                if block.is_null:
++                    break
++                if block.ref_cnt == 1 and (block.pool is None or block.pool is pool):
++                    released += 1
++            held = max(
++                len(blocks),
++                manager.get_num_skipped_tokens(step_tokens) // manager.block_size,
++            )
++            full_blocks = cdiv(full_tokens, manager.block_size)
++            if manager.max_admission_blocks_per_request is not None:
++                full_blocks = min(full_blocks, manager.max_admission_blocks_per_request)
++            need_full += max(full_blocks - held, 0)
++            need_step += max(cdiv(step_tokens, manager.block_size) - held, 0)
++        watermark = (
++            self.kv_cache_manager.watermark_blocks
++            if self.running
++            and request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
++            else 0
++        )
++        free = pool.get_num_free_blocks() + released
++        fits = need_step + watermark <= free - reserved and (
++            not self.scheduler_reserve_full_isl or need_full + watermark <= free
++        )
++        return fits, (
++            "free %d incl. %d released, reserved %d, watermark %d, round needs %d, "
++            "full sequence needs %d, full_isl_gate %s"
++            % (
++                free,
++                released,
++                reserved,
++                watermark,
++                need_step,
++                need_full,
++                self.scheduler_reserve_full_isl,
++            )
++        )
++
++    def _dsv41_prepare_round(self, request: Request, target: int) -> None:
++        """dsv41 patch 0084 (v26e): before allocating a round that _dsv41_round_fit
++        admitted, free the blocks below the round's window (the window of the old boundary
++        included) and pad the block tables with nulls up to the new window, the layout
++        add_local_computed_blocks gives a first-time allocation of `target` tokens. The round
++        then allocates only the window for sliding-window groups; v26d allocated the whole
++        round there and kept it through the next full-ISL check, which then never passed."""
++        from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager
++
++        rid = request.request_id
++        self.kv_cache_manager.remove_skipped_blocks(
++            rid,
++            max(0, target - request.num_in_flight_tokens),
++            num_prompt_tokens=request.num_prompt_tokens,
++        )
++        null_block = self.kv_cache_manager.block_pool.null_block
++        for manager in self.kv_cache_manager.coordinator.single_type_managers:
++            if isinstance(manager, CircularBufferManager):
++                continue
++            blocks = manager.req_to_blocks.get(rid)
++            if blocks is None:
++                continue
++            first_kept = manager.get_num_skipped_tokens(target) // manager.block_size
++            if len(blocks) < first_kept:
++                blocks.extend([null_block] * (first_kept - len(blocks)))
++
++    def _dsv41_log_refused(
++        self, request: Request, pos: int, ext_tokens: int, detail: str
++    ) -> None:
++        """dsv41 patch 0084 (v26e): log a refused round once per boundary, then a warning
++        every 60 s while it stays refused (a silent wait looked like a hang on 24.10.)."""
++        now = time.monotonic()
++        if getattr(request, "dsv41_refused_pos", -1) != pos:
++            request.dsv41_refused_pos = pos
++            request.dsv41_refused_since = now
++            request.dsv41_refused_logged = now
++            logger.info(
++                "dsv41 patch 0084: round of request %s from %d (+%d tokens) waits for "
++                "blocks: %s",
++                request.request_id,
++                pos,
++                ext_tokens,
++                detail,
++            )
++        elif now - request.dsv41_refused_logged >= 60.0:
++            request.dsv41_refused_logged = now
++            logger.warning(
++                "dsv41 patch 0084: round of request %s from %d still waits after %.0f s: %s",
++                request.request_id,
++                pos,
++                now - request.dsv41_refused_since,
++                detail,
++            )
++
++    def _dsv41_reset_request(
++        self, request: Request, request_queue: RequestQueue
++    ) -> None:
++        """dsv41 patch 0084 (v26e): start over a request whose blocks below the round's
++        window were released for a round that then got no slots (_dsv41_round_fit rules
++        this out). Free its blocks (the full-attention ones stay in the prefix cache), forget
++        the rounds and queue it as a new request at the front."""
++        popped = request_queue.pop_request()
++        assert popped is request
++        self.deferred_waiting.discard(request)
++        self._inflight_prefills.discard(request)
++        self._set_kv_fetch_stage(request, None)
++        self._free_request_blocks(request)
++        self.encoder_cache_manager.free(request)
++        request.num_computed_tokens = 0
++        self._dsv41_clear(request)
++        self.waiting.prepend_request(request)
++
+     def _update_waiting_for_remote_kv(self, request: Request) -> None:
+         """KV Connector: update request state after async recv is finished.
+ 
+@@ -3240,6 +3596,7 @@
+         WAITING_FOR_REMOTE_KV.
+         """
+         assert self.connector is not None
++        failed = request.request_id in self.failed_recving_kv_req_ids  # dsv41 patch 0084
+ 
+         if request.request_id in self.failed_recving_kv_req_ids:
+             # Request had KV load failures; num_computed_tokens was already
+@@ -3267,6 +3624,16 @@
+             # This will cache the blocks iff caching is enabled.
+             self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
+ 
++        if _DSV41_OFFLOAD_ROUNDS:
++            # dsv41 patch 0084: more of the prefix waits in the offload tiers than this load
++            # took. Keep the exact (chunk-aligned) boundary, no replay yet: the next round is
++            # looked up from here when the request is scheduled again. A failed load (blocks
++            # freed, count reset to 0 for multi-group layouts) or the last round ends the rounds.
++            if not failed and self._dsv41_wants_more(request):
++                request.dsv41_load_more = True
++                self.finished_recving_kv_req_ids.remove(request.request_id)
++                return
++            self._dsv41_clear(request)
+         # SWA bounded replay recomputes the tail of the hit, which covers the
+         # last token; otherwise a full prompt hit re-computes that token so the
+         # next one can be sampled.

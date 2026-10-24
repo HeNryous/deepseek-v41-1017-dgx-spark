@@ -536,6 +536,60 @@ A background stream's longest gap is roughly its prefill time behind everything 
 timeouts above it (we use 1,800 s for background). If a proxy in front caps background concurrency (ours did, at 1),
 raise the cap together with `max-num-seqs` and keep slots free for interactive requests (we allow 4 background requests).
 
+## Long prefixes come back from the KV offload in rounds (24.10.)
+
+0081 caps a load from the KV offload at 66,432 tokens (0.45 of the 256 MiB CPU tier) because a larger load hung the
+tiering manager. Everything past the cap was computed again, so a 950K-token prefix after a restart cost a full
+prefill even though it sat on the NVMe. Patch 0084 (`VLLM_DSV41_OFFLOAD_ROUNDS=1`) loads such a prefix in rounds of up
+to 66,432 tokens: after each load the request keeps its blocks and its exact boundary and is looked up again from there.
+
+Each follow-up round is admitted by a check without side effects that mirrors `allocate_slots` after the round's
+preparation (blocks below the sliding window freed, block tables padded with null blocks, the layout a first-time
+allocation produces). The full-ISL gate stays on. Our first version allocated the whole round for the sliding-window
+groups and kept those blocks into the next full-ISL check, which then refused forever (the engine ran zero-token steps
+with a request blocking the head of the queue); an adversarial review found that.
+
+`restore_kl.py` builds the same needle prompt from a label, computes it cold, then again after an engine restart (GPU
+cache empty, file tier kept), and compares the top-20 logprobs of the first 8 tokens (cold against cold: KL 0.00025):
+
+| prefix | cold, priority 0 | cold, priority 10 | back from the offload | KL to cold | top-1 |
+|---|---|---|---|---|---|
+| 943,928 tokens | 440 s | 770 s | 11.2 s (15 rounds) | 0.00001 | 8/8 |
+| 297,832 tokens | 136 s | 222 s | 4.0 s (5 rounds) | 0.00002 | 8/8 |
+
+**Several reloads at once.** Two 950K and one 300K reload started together at priority 10, with three interactive
+requests in between: the interactive requests got their first token after 0.6–1.5 s. Both 950K came back from the
+offload (37.8 / 44.7 s, KL ≤ 0.00001). The CPU tier holds two 66K loads at a time; a follow-up round that finds 0
+hits after a full round therefore waits up to 30 s for room instead of giving up (before that fix one 950K reload
+was computed again: 732 s). A third reload whose *first* lookup comes while two loads are in flight is still
+computed (correct output, 227 s for the 300K): the tiering manager returns MISS both for "not stored" and for
+"stored, but the CPU tier is full". Turning that MISS into a retry inside the manager livelocked three reloads (each
+partial promotion evicted the others' unpinned chunks), so we left it; the right fix is admission control before
+the lookup.
+
+Aborting a request 5 s into its rounds leaves no request behind and the pool empty.
+
+Two smaller changes in the same image, both switched by a file so they can be compared on one running engine:
+- **0085b** gives the allocator's unused cache back once the engine has been idle for 5 s after at least 131,072
+  prefill tokens (`VLLM_DSV41_RELEASE_FILE`). Ten alternating batteries (a cold 300K prefill plus our corruption test at
+  T=1, MemAvailable sampled every 0.5 s): corruption 0 in all ten; free memory at idle 5.7 vs 3.9 GiB on the head node and
+  6.5 vs 4.7 GiB on the worker (one release of 1,748 MiB per battery on each rank); the lowest free memory during the
+  next 300K prefill on the head node 3,804 vs 3,269 MiB; first token of that prefill unchanged (130–132 s both ways).
+- **0074b** lets background prefill chunks grow while no foreground request is present (`VLLM_DSV41_BG_IDLE_FILE`,
+  we use 2048 tokens per step shared by the background requests). A lone 300K background prefill (priority 10):
+
+  | | threshold only (512) | 0074b, 2048 |
+  |---|---|---|
+  | first token of the background request | 224.5 / 225.5 s | 146.9 / 146.5 s |
+  | first token of an interactive request arriving meanwhile | 0.66–0.71 s | 1.63–2.09 s |
+
+  The interactive request waits for up to two larger chunks already in flight (async scheduling). With four or more
+  background requests the threshold applies as before.
+
+The three patches (`patches/0084-*`, `0085b-*`, `0074b-*`, all off by default) are not in the published v24 image
+yet. Our serve settings: `VLLM_DSV41_OFFLOAD_ROUNDS=1`, `VLLM_DSV41_RELEASE_FILE` with 131072,
+`VLLM_DSV41_BG_IDLE_FILE` with 2048.
+
 ## Tips that helped on GB10
 
 - **Remove the kdump crash-kernel reservation** (`crashkernel=` on the kernel command line): +2.1 GiB usable memory per node.
@@ -554,6 +608,14 @@ raise the cap together with `max-num-seqs` and keep slots free for interactive r
   decode (v22 against v22 on 22.10.). Airflow around that node is worth more than most kernel tweaks.
 
 ## Tried, and not tried
+
+- **Block verification (`rejection_sample_method: block`, vLLM #46781) for prose at T=1: no gain with greedy drafts.**
+  DSpark proposes its argmax. With a deterministic draft, block verification accepts at least i drafts with probability
+  p(x₁)…p(xᵢ), exactly like token-wise verification, and no exact verifier can do better; it only helps with sampled
+  drafts. Our token-wise acceptance already matches that prediction (observed/predicted 1.00–1.01 at positions 1–5,
+  T=1). The published image also lacks #61161 (block mode reuses its random numbers across rounds, which biases T > 0
+  output) and #60945; do not switch block mode on in it. The forum's 39.2 → 49.9 tok/s comes from another engine,
+  most of it from switching that engine to greedy drafts, which we already use.
 
 - **Batch-aware depth à la TensorFold (0041 `confb`), confidence calibration for T > 0 (`cal=1`) and prompt-lookup drafts
   (0043): all in the image, all off by default, none beat the stock per-request rule** (measured with

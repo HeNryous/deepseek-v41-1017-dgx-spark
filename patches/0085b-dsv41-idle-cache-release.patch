@@ -1,0 +1,148 @@
+dsv41 patch 0085b (24.10.2026): give the allocator's unused cache back after long prefills, only while the engine is idle.
+Why: on GB10 GPU memory is system RAM. With PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True, torch.accelerator.empty_cache()
+can unmap the physical pages of unused cached segments, but the engine never asks, so after the longest prefill so far
+the transient memory stays reserved (measured +1.7–2.0 GiB MemAvailable after a release).
+How: the worker counts prefill tokens; when the engine core is about to block on an empty input queue with nothing in
+flight, at least one step ran, and no request arrives within VLLM_DSV41_RELEASE_GRACE_S (5 s), it calls
+collective_rpc("dsv41_release_if_due"); each rank then synchronizes and empties its cache once if the threshold was
+reached. The worker method never raises (a failure reply would desynchronize collective_rpc).
+Switches: VLLM_DSV41_RELEASE_TOKENS (threshold, 0 = off), VLLM_DSV41_RELEASE_FILE (file with the threshold, read at
+every idle check, overrides it live; set the same on all nodes). Neither set = original behaviour.
+diff -ru a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+--- a/vllm/v1/engine/core.py	2026-10-24 18:15:09.681640656 +0200
++++ b/vllm/v1/engine/core.py	2026-10-24 18:15:09.685049488 +0200
+@@ -109,6 +109,19 @@
+ 
+ _R = TypeVar("_R")  # Return type for collective_rpc
+ 
++# dsv41 patch 0085b: when the engine core goes idle after work, ask the workers to give back the allocator cache
++# (they decide by their prefill-token count, VLLM_DSV41_RELEASE_TOKENS / VLLM_DSV41_RELEASE_FILE). Off by default.
++def _dsv41_int_env(name: str) -> int:
++    try:
++        return int(os.environ.get(name, "0").strip() or 0)
++    except ValueError:
++        return 0
++_DSV41_RELEASE_IDLE = _dsv41_int_env("VLLM_DSV41_RELEASE_TOKENS") > 0 or bool(
++    os.environ.get("VLLM_DSV41_RELEASE_FILE", "")
++)
++# release only after this many seconds without a new request (Hermes tool loops send the next one within seconds)
++_DSV41_RELEASE_GRACE_S = float(os.environ.get("VLLM_DSV41_RELEASE_GRACE_S", "5") or 5)
++
+ 
+ class EngineCore:
+     """Inner loop of vLLM's Engine."""
+@@ -1512,6 +1525,21 @@
+             # Notify callbacks waiting for engine to become idle.
+             self._notify_idle_state_callbacks()
+             if self.input_queue.empty():
++                if (
++                    _DSV41_RELEASE_IDLE
++                    and self.process_input_queue_block
++                    and getattr(self, "_dsv41_steps_since_release", 0)
++                ):
++                    # dsv41 patch 0085b: idle after work, nothing in flight. Release only if no request
++                    # arrives within the grace period (review 24.10.: not at the first idle instant).
++                    try:
++                        req = self.input_queue.get(timeout=_DSV41_RELEASE_GRACE_S)
++                    except queue.Empty:
++                        self._dsv41_steps_since_release = 0
++                        self._dsv41_idle_release()
++                    else:
++                        self._handle_client_request(*req)
++                        continue
+                 # Drain aborts queue; all aborts are also processed via input_queue.
+                 with self.aborts_queue.mutex:
+                     self.aborts_queue.queue.clear()
+@@ -1539,6 +1567,8 @@
+         """Called only when there are unfinished local requests."""
+         # Step the engine core.
+         outputs, model_executed = self.step_fn()
++        if _DSV41_RELEASE_IDLE and model_executed:
++            self._dsv41_steps_since_release = getattr(self, "_dsv41_steps_since_release", 0) + 1  # 0085b
+         # Put EngineCoreOutputs into the output queue.
+         for output in outputs.items() if outputs else ():
+             self.output_queue.put_nowait(output)
+@@ -1553,6 +1583,12 @@
+ 
+         return model_executed
+ 
++    def _dsv41_idle_release(self) -> None:
++        """dsv41 patch 0085b: the engine is idle (no request, no batch in flight): let every rank give back
++        its allocator cache if enough prefill ran since its last release. The worker method never raises;
++        an error here would mean the ranks are out of step, so it is not swallowed (review 24.10.)."""
++        self.model_executor.collective_rpc("dsv41_release_if_due")
++
+     def _notify_idle_state_callbacks(self) -> None:
+         while self._idle_state_callbacks:
+             callback = self._idle_state_callbacks.pop()
+diff -ru a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+--- a/vllm/v1/worker/gpu_worker.py	2026-10-24 18:15:09.668950695 +0200
++++ b/vllm/v1/worker/gpu_worker.py	2026-10-24 18:15:09.671893233 +0200
+@@ -113,6 +113,16 @@
+ # scheduling every request scheduled now gets exactly that many draft placeholders, so the next step verifies at most
+ # that many drafts) goes to the DSpark speculator before this step runs, which then runs its Markov loop only that deep.
+ _DSV41_MARKOV_TRIM = os.environ.get("VLLM_DSV41_MARKOV_TRIM", "0").strip() not in ("", "0")
++# dsv41 patch 0085b: after at least this many prefill tokens, empty the allocator cache once when the engine core
++# goes idle (dsv41_release_if_due); a file named by VLLM_DSV41_RELEASE_FILE overrides it live (0 = off).
++def _dsv41_int_env(name: str) -> int:
++    try:
++        return int(os.environ.get(name, "0").strip() or 0)
++    except ValueError:
++        return 0
++_DSV41_RELEASE_TOKENS = _dsv41_int_env("VLLM_DSV41_RELEASE_TOKENS")
++_DSV41_RELEASE_FILE = os.environ.get("VLLM_DSV41_RELEASE_FILE", "")
++_DSV41_RELEASE_COUNT = _DSV41_RELEASE_TOKENS > 0 or bool(_DSV41_RELEASE_FILE)
+ 
+ 
+ def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> int:
+@@ -1266,6 +1276,37 @@
+     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+         return self.model_runner.sample_tokens(grammar_output)
+ 
++    def dsv41_release_if_due(self) -> None:
++        """dsv41 patch 0085b: called by the engine core on every rank when it goes idle. If at least the
++        threshold of prefill tokens ran since the last release, give the allocator's unused cache back once."""
++        try:
++            self._dsv41_release_if_due()
++        except Exception as e:  # noqa: BLE001  (never raise: a FAILURE reply would desync collective_rpc)
++            logger.warning("dsv41 patch 0085b: release failed: %r", e)
++
++    def _dsv41_release_if_due(self) -> None:
++        threshold = _DSV41_RELEASE_TOKENS
++        if _DSV41_RELEASE_FILE:
++            try:
++                with open(_DSV41_RELEASE_FILE) as f:
++                    threshold = int(f.read().strip() or 0)
++            except (OSError, ValueError):
++                pass
++        since = getattr(self, "_dsv41_prefill_since_release", 0)
++        if threshold <= 0 or since < threshold:
++            return
++        self._dsv41_prefill_since_release = 0
++        t0 = time.monotonic()
++        torch.cuda.synchronize()
++        before = torch.cuda.memory_reserved()
++        torch.accelerator.empty_cache()
++        after = torch.cuda.memory_reserved()
++        logger.info(
++            "dsv41 patch 0085b: idle, after %d prefill tokens released %.0f MiB of cached memory "
++            "(reserved %.0f -> %.0f MiB) in %.1f ms",
++            since, (before - after) / 2**20, before / 2**20, after / 2**20, (time.monotonic() - t0) * 1e3,
++        )
++
+     @torch.inference_mode()
+     @with_gpu_sync_check
+     def execute_model(
+@@ -1328,6 +1369,12 @@
+                 comm_postprocess=comm_postprocess,
+             )
+ 
++        if _DSV41_RELEASE_COUNT and forward_pass:
++            # dsv41 patch 0085b: count prefill tokens only; the release happens at idle
++            n = sum(t for t in scheduler_output.num_scheduled_tokens.values() if t > 32)
++            if n:
++                self._dsv41_prefill_since_release = getattr(self, "_dsv41_prefill_since_release", 0) + n
++
+         if _DSV41_MARKOV_TRIM:
+             # dsv41 patch 0066: read by this step's propose (sample_tokens follows execute_model on every rank)
+             set_next = getattr(
