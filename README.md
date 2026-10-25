@@ -621,6 +621,10 @@ patch 0090, all off). Same window, fresh boots, two interleaved runs per arm, T=
 The fixes cost nothing. The recipe pieces give nothing at 1 stream and lose 2.5 % at 4 streams (the extra prefetch
 competes with the routed experts' reads), so they stay off. The recipe's numbers (+4–6 %) are 1 stream, English, T=0.
 
+exllamav3 1.6.0 → 1.6.4 (image `:v32` = v30 + the new wheel, built in the recipe's build environment, 291 s): the EXL3
+GEMM/GEMV/MoE kernel sources are unchanged, T=0 text identical 8/8 to v30, 1 stream 55.1 tok/s over 7 runs (v30 55.9 over
+6, same spread), corruption 0. The gain is robustness: a CUDA error inside exllamav3 now raises instead of exit().
+
 ## Tips that helped on GB10
 
 - **Remove the kdump crash-kernel reservation** (`crashkernel=` on the kernel command line): +2.1 GiB usable memory per node.
