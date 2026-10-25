@@ -621,6 +621,13 @@ patch 0090, all off). Same window, fresh boots, two interleaved runs per arm, T=
 The fixes cost nothing. The recipe pieces give nothing at 1 stream and lose 2.5 % at 4 streams (the extra prefetch
 competes with the routed experts' reads), so they stay off. The recipe's numbers (+4–6 %) are 1 stream, English, T=0.
 
+Steps 2–4 of the recipe v2.0 engine, same method (fresh boots, two interleaved runs per arm, T=1 German prose):
+its 0029 rowmm and 0028 Engram row-parallel: 1 / 4 / 8 streams and sustained within noise of off (rowmm 56.0 / 109.2 /
+146.5 vs reference 56.4 / 108.1 / 146.3), T=0 6/8 resp. 5/8 (rounding class) — left off. Its 0026 own K4 drafter head
+(our K4 head already existed from the dense pass): tokens per round 2.072 vs 2.075, sustained +0.9 % (below our 1.5 %
+gate), +158 MiB per rank — not taken. Its 0036 depth-model feature capture changed T=0 text (5/8) although it should not;
+rolled back, cause open. On this workload the recipe's engine gains are already covered by our own patches.
+
 exllamav3 1.6.0 → 1.6.4 (image `:v32` = v30 + the new wheel, built in the recipe's build environment, 291 s): the EXL3
 GEMM/GEMV/MoE kernel sources are unchanged, T=0 text identical 8/8 to v30, 1 stream 55.1 tok/s over 7 runs (v30 55.9 over
 6, same spread), corruption 0. The gain is robustness: a CUDA error inside exllamav3 now raises instead of exit().
