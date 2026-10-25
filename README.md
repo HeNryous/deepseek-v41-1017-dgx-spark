@@ -594,9 +594,32 @@ Two smaller changes in the same image, both switched by a file so they can be co
   The interactive request waits for up to two larger chunks already in flight (async scheduling). With four or more
   background requests the threshold applies as before.
 
-The three patches (`patches/0084-*`, `0085b-*`, `0074b-*`, all off by default) are in the image
-`ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v29` (= v24 + these three). Our serve settings: `VLLM_DSV41_OFFLOAD_ROUNDS=1`, `VLLM_DSV41_RELEASE_FILE` with 131072,
+The three patches (`patches/0084-*`, `0085b-*`, `0074b-*`, all off by default) are in the images
+`ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v29` (= v24 + these three) and `:v30` (+ 0091, 0090 off). Our serve settings: `VLLM_DSV41_OFFLOAD_ROUNDS=1`, `VLLM_DSV41_RELEASE_FILE` with 131072,
 `VLLM_DSV41_BG_IDLE_FILE` with 2048.
+
+## Upstream fixes and recipe v2.0 pieces (25.10.)
+
+We stayed on vLLM 6e517b15. Latest main needs torch 2.14 and Triton 3.8 (since #52183), the recipe's build environment has
+torch 2.13, and upstream's DeepSeek-V4.1 speed work since then targets SM90/SM100. Instead we backported the fixes that
+can hit this setup (patch 0091, image `ghcr.io/henryous/deepseek-v41-1017-dgx-spark:v30`): #59096 (file-tier assert that
+kills the EngineCore when a load fails), #59880 (spec-decode blocks reserved for one KV cache group instead of all 18),
+#61174 (stale block-table rows), #63165 + #61000 (head-node shm_broadcast growth), #59504 (KV zeroing next to async loads).
+If you rebase later, v0.32.0rc0 (fe341a53d) is the last tag with the same toolchain.
+
+We also ported three pieces of the sudoingX recipe v2.0 engine (prefetch order with LM-head prefetch, its 0032, its 0030;
+patch 0090, all off). Same window, fresh boots, two interleaved runs per arm, T=1 German prose:
+
+| | v29 | v30 (0091) | v30 + 0090 on |
+|---|---|---|---|
+| 1 / 4 / 8 streams, tok/s | 55.9 / 107.3 / 144.6 | 55.9 / 110.2 / 144.8 | 56.0 / 107.4 / 146.0 |
+| sustained 4 x 90 s (kit_bench set b) | 130.0 | 131.1 | 131.9 |
+| 300K prefill | 135 s | 131 s | 130.5 s |
+| T=0 text vs v29 | – | identical 8/8 | 7/8 |
+| corruption batteries | 0/3 | 0/6 | 0/6 |
+
+The fixes cost nothing. The recipe pieces give nothing at 1 stream and lose 2.5 % at 4 streams (the extra prefetch
+competes with the routed experts' reads), so they stay off. The recipe's numbers (+4–6 %) are 1 stream, English, T=0.
 
 ## Tips that helped on GB10
 

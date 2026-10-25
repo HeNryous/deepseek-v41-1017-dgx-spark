@@ -1,0 +1,337 @@
+dsv41 patch 0090 (25.10.2026): pieces of the sudoingX recipe v2.0 engine, all OFF (in image v30, not used).
+EXL3_L2PF_ORDER=1 (prefetch order + 8 MiB moe cap + 4 MiB LM-head prefetch; EXL3_L2PF_MOE_CAP_MB / EXL3_L2PF_HEAD_MB),
+VLLM_SM12X_BMM_STREAMS=1 (recipe 0032), VLLM_DSPARK_MAIN_PROJ_ROWPAR=1 (recipe 0030, for our EXL3 K5 main_proj).
+Measured on our workload (T=1 German prose, 2 x 2 interleaved fresh boots): 1 stream 56.0 vs 55.9 tok/s (noise), 4 streams
+107.4 vs 110.2 (-2.5 %, all four runs below all four off runs; the extra prefetch competes with the routed experts' reads),
+8 streams +0.8 %, sustained +0.6 %, T=0 7/8 identical. Left off.
+diff -ruN a/vllm/model_executor/kernels/linear/mxfp8/sm12x_bmm.py b/vllm/model_executor/kernels/linear/mxfp8/sm12x_bmm.py
+--- a/vllm/model_executor/kernels/linear/mxfp8/sm12x_bmm.py	2026-10-25 06:11:04.179811716 +0100
++++ b/vllm/model_executor/kernels/linear/mxfp8/sm12x_bmm.py	2026-10-25 06:11:04.182541572 +0100
+@@ -7,8 +7,17 @@
+ is slow on GB10 (137 us per 1024 x 4096 group at m=1, measured). This kernel keeps the FP8 weight and runs one Marlin
+ MXFP8 (W8A16) GEMM per group, 26 us per group at m=1 on GB10 (the CUTLASS MXFP8 GEMM is 151 us there).
+ deep_gemm_fp8_o_proj routes to it when wo_a carries `sm12x_bmm_groups`.
++
++dsv41 patch 0090 (recipe v2.0 patch 0032): VLLM_SM12X_BMM_STREAMS=1 (default off): at decode sizes
++(<= VLLM_SM12X_BMM_STREAMS_MAX_TOKENS, default 16) the groups' GEMMs run concurrently, one per stream (the
++calling stream and groups - 1 side streams it forks and joins), instead of one after another: a group's Marlin
++GEMM at a few rows fills only a few SMs (~25 us for its 4.2 MB on GB10), so four in a row leave DRAM mostly idle.
++The same kernel on the same inputs per group: the output is bit-identical. In DSV4.1 on GB10 only the DSpark
++drafter's FP8 wo_a takes this path (the backbone's wo_a is EXL3 grouped_bmm).
+ """
+ 
++import os
++
+ import torch
+ from torch.nn.parameter import Parameter
+ 
+@@ -93,6 +102,49 @@
+         return out
+ 
+ 
++# dsv41 patch 0090 (recipe 0032)
++_STREAMS = os.environ.get("VLLM_SM12X_BMM_STREAMS", "0") == "1"
++_STREAMS_MAX_TOKENS = int(os.environ.get("VLLM_SM12X_BMM_STREAMS_MAX_TOKENS") or 16)
++_side_streams: dict[int, list[torch.cuda.Stream]] = {}
++
++
++def _streams(device: torch.device, count: int) -> list[torch.cuda.Stream]:
++    i = device.index if device.index is not None else torch.cuda.current_device()
++    have = _side_streams.setdefault(i, [])
++    while len(have) < count:
++        have.append(torch.cuda.Stream(device=device))
++    return have[:count]
++
++
++def _sm12x_marlin_bmm_streams(x, weight, scales, groups, n, k, apply):
++    """The groups' GEMMs concurrently: group 0 on the calling stream, the others on
++    side streams that wait for the calling stream's work so far and that the calling
++    stream waits for before the stack (a fork / join a CUDA graph captures too)."""
++    cur = torch.cuda.current_stream()
++    side = _streams(x.device, groups - 1)
++    outs: list[torch.Tensor | None] = [None] * groups
++    for s in side:
++        s.wait_stream(cur)
++    for i in range(groups):
++        s = cur if i == 0 else side[i - 1]
++        with torch.cuda.stream(s):
++            outs[i] = apply(
++                input=x[:, i, :].contiguous(),
++                weight=weight[i],
++                weight_scale=scales[i],
++                workspace=None,
++                size_n=n,
++                size_k=k,
++            )
++    for s in side:
++        cur.wait_stream(s)
++    # No record_stream: the side streams are this function's own, and each call first
++    # makes them wait for the calling stream, so a side-stream reuse of these outputs'
++    # blocks is ordered after the stack below (vLLM's multi-stream helpers rely on
++    # the same ordering).
++    return torch.stack(outs, dim=1)
++
++
+ def sm12x_marlin_bmm(
+     x: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor, groups: int, n: int, k: int
+ ) -> torch.Tensor:
+@@ -102,6 +154,10 @@
+ 
+     tokens, g, _ = x.shape
+     assert g == groups, (g, groups)
++    if _STREAMS and 1 < groups and tokens <= _STREAMS_MAX_TOKENS and x.is_cuda:   # patch 0090 (recipe 0032)
++        return _sm12x_marlin_bmm_streams(
++            x, weight, scales, groups, n, k, apply_mxfp8_marlin_linear
++        )
+     out = torch.empty((tokens, groups, n), dtype=x.dtype, device=x.device)
+     for i in range(groups):
+         out[:, i, :] = apply_mxfp8_marlin_linear(
+diff -ruN a/vllm/models/deepseek_v41/nvidia/dspark.py b/vllm/models/deepseek_v41/nvidia/dspark.py
+--- a/vllm/models/deepseek_v41/nvidia/dspark.py	2026-10-25 06:11:04.167146190 +0100
++++ b/vllm/models/deepseek_v41/nvidia/dspark.py	2026-10-25 06:11:04.170033860 +0100
+@@ -35,7 +35,7 @@
+     fused_moe_make_expert_params_mapping,
+ )
+ from vllm.model_executor.layers.layernorm import RMSNorm
+-from vllm.model_executor.layers.linear import ReplicatedLinear
++from vllm.model_executor.layers.linear import ReplicatedLinear, RowParallelLinear
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     ParallelLMHead,
+@@ -116,14 +116,53 @@
+             prefix=maybe_prefix(prefix, "embed_tokens"),
+         )
+ 
+-        self.main_proj = ReplicatedLinear(
+-            config.hidden_size * len(self.target_layer_ids),
+-            config.hidden_size,
+-            bias=False,
+-            return_bias=False,
+-            quant_config=vllm_config.quant_config,
+-            prefix=maybe_prefix(prefix, "main_proj"),
++        # dsv41 patch 0090 (recipe v2.0 patch 0030): VLLM_DSPARK_MAIN_PROJ_ROWPAR=1 makes main_proj row-parallel
++        # over the concatenated target taps: each rank multiplies its share of the taps by the matching input rows
++        # (half the weight bytes a rank at TP=2) and one all-reduce sums the partials; replicated otherwise (= v29).
++        # Our pack stores main_proj as EXL3 K5 (exl3_moe.dense.drafter.main_proj): the plugin cuts a row-parallel
++        # EXL3 matrix at whole 128-wide Hadamard blocks (dense.rank_cut), so the split must keep 128-column blocks
++        # (also covers an MXFP8 main_proj's 32-column scale blocks, the recipe's case). Drafter-only, rounding
++        # class: each rank's partial is rounded to bf16 before the sum; target outputs are untouched.
++        main_in = config.hidden_size * len(self.target_layer_ids)
++        tp_size = get_tensor_model_parallel_world_size()
++        want_rowpar = os.environ.get("VLLM_DSPARK_MAIN_PROJ_ROWPAR", "0") == "1"
++        self.main_proj_rowpar = (
++            want_rowpar
++            and tp_size > 1
++            and not self.use_sequence_parallel
++            and main_in % (128 * tp_size) == 0
+         )
++        if want_rowpar and not self.main_proj_rowpar:
++            logger.warning(
++                "VLLM_DSPARK_MAIN_PROJ_ROWPAR=1 needs TP > 1 without sequence "
++                "parallelism and a 128-column-block input split; main_proj stays "
++                "replicated"
++            )
++        if self.main_proj_rowpar:
++            self.main_proj = RowParallelLinear(
++                main_in,
++                config.hidden_size,
++                bias=False,
++                input_is_parallel=False,
++                reduce_results=True,
++                return_bias=False,
++                quant_config=vllm_config.quant_config,
++                prefix=maybe_prefix(prefix, "main_proj"),
++            )
++            logger.info(
++                "DSpark main_proj row-parallel over %d ranks "
++                "(VLLM_DSPARK_MAIN_PROJ_ROWPAR=1, patch 0090)",
++                tp_size,
++            )
++        else:
++            self.main_proj = ReplicatedLinear(
++                config.hidden_size * len(self.target_layer_ids),
++                config.hidden_size,
++                bias=False,
++                return_bias=False,
++                quant_config=vllm_config.quant_config,
++                prefix=maybe_prefix(prefix, "main_proj"),
++            )
+         self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+ 
+         self.topk_indices_buffer = torch.empty(
+diff -ruN a/vllm_exl3_moe/head.py b/vllm_exl3_moe/head.py
+--- a/vllm_exl3_moe/head.py	2026-10-25 06:11:04.154337443 +0100
++++ b/vllm_exl3_moe/head.py	2026-10-25 06:11:04.157334742 +0100
+@@ -20,6 +20,7 @@
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbeddingMethod
+ 
++from . import l2pf                    # dsv41 patch 0090: the head's first bytes into L2 (EXL3_L2PF_HEAD_MB)
+ from .dense import MROW_MAX_ROWS
+ from .hostcopy import copy_from_host
+ 
+@@ -128,6 +129,10 @@
+             layer._mrow = MrowGroup([(layer.trellis.data, layer.suh.data, layer.svh.data, 0, 0)], self.k)
+         logger.info("lm_head: EXL3 K%d (%d x %d per rank)%s", self.k, d, n,
+                     f", exl3_mrow at <= {HEAD_MROW_MAX_ROWS} rows" if layer._mrow else "")
++        # dsv41 patch 0090 (recipe v2.0): register the trellis for l2pf's head prefetch (a no-op unless
++        # EXL3_L2PF is on and EXL3_L2PF_HEAD_MB / EXL3_L2PF_ORDER gives a head budget). The DSpark drafter shares
++        # this module (no own head: recipe 0026 is not ported), so there is one head to register.
++        l2pf.register_head([layer.trellis.data])
+ 
+     def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+         rows = x.numel() // x.shape[-1]
+diff -ruN a/vllm_exl3_moe/l2pf.py b/vllm_exl3_moe/l2pf.py
+--- a/vllm_exl3_moe/l2pf.py	2026-10-25 06:11:04.141532844 +0100
++++ b/vllm_exl3_moe/l2pf.py	2026-10-25 06:11:04.144501958 +0100
+@@ -18,6 +18,19 @@
+ (bf16 384 x 5120, 3.75 MiB), first in their fork: `moe` takes this layer's hc_ffn_fn + gate (read right after the
+ attention all-reduce), `next` the next layer's hc_attn_fn. TensorFold prefetches its mix weights and router the same
+ way. They are registered by patch 0017 (register_decoder_layers, after the model's weights load).
++
++dsv41 patch 0090 (from the sudoingX recipe v2.0, f8f20b3; all default off = the v1.1 file):
++EXL3_L2PF_ORDER=1 (the order TensorFold's rounds use): the critical kernel's weights first, `moe` pulls the router
++gate before hc_ffn_fn and `next` wq_a + wkv before hc_attn_fn. Under VLLM_DSV41_MHC_OVERLAP=1 a sublayer's mix
++statistics run on a side stream and are needed only at its post, while the gate GEMV and wq_a + wkv start the
++sublayer on the main stream. Same bytes per fork, another order. With the flag the next two default to 8 / 4.
++EXL3_L2PF_MOE_CAP_MB: cap of the `moe` fork (0 = BUDGET as before): gate, mix and the shared expert's first
++bytes; TensorFold measured 16 MB there slower than 8 (the routed experts evicted the shared expert).
++EXL3_L2PF_HEAD_MB: the LM head's first bytes (its trellis's first k-rows of every column, head.py registers it)
++after the last layer's MoE, during its all-reduce, mHC post, collapse and final norm. The head runs in
++compute_logits, outside the captured forward, so register_decoder_layers puts a forward hook on the model's final
++norm that joins the fork: a captured forward still ends with nothing in flight. Without the hook or without an
++EXL3 head the last layer only joins, as before. A prefetch writes nothing: outputs keep their bits.
+ """
+ 
+ from __future__ import annotations
+@@ -38,6 +51,17 @@
+ DELAY_NS = int(os.environ.get("EXL3_L2PF_DELAY_NS") or 3000)
+ 
+ HC = os.environ.get("EXL3_L2PF_HC", "0") == "1"
++# dsv41 patch 0090 (recipe v2.0): critical-first order, moe fork cap, LM head prefetch; all off by default
++ORDER = os.environ.get("EXL3_L2PF_ORDER", "0") == "1"
++
++
++def _mib(env: str, default: float) -> int:
++    v = os.environ.get(env)
++    return int(float(v if v else default) * (1 << 20))
++
++
++MOE_CAP = _mib("EXL3_L2PF_MOE_CAP_MB", 8 if ORDER else 0)        # 0: the `moe` fork takes BUDGET like the others
++HEAD_BUDGET = _mib("EXL3_L2PF_HEAD_MB", 4 if ORDER else 0)       # 0: no head prefetch
+ 
+ # What each point prefetches: (layer offset, module) in the order the forward reads them.
+ PLAN = {
+@@ -46,10 +70,16 @@
+                                                          (0, "ffn.shared_experts.down_proj")),
+     "next": ((1, "hc_attn_fn"),) * HC + ((1, "attn.fused_wqa_wkv"), (1, "attn.wq_b")),
+ }
++if ORDER:            # patch 0090: the main stream's first reader before the mix weights the side stream reads
++    PLAN["moe"] = ((0, "ffn.gate"), (0, "hc_ffn_fn")) * HC + ((0, "ffn.shared_experts.gate_up_proj"),
++                                                             (0, "ffn.shared_experts.down_proj"))
++    PLAN["next"] = ((1, "attn.fused_wqa_wkv"),) + ((1, "hc_attn_fn"),) * HC + ((1, "attn.wq_b"),)
+ 
+ _ext = None
+ _reg: dict[tuple[int, str], list[torch.Tensor]] = {}
+ _last_layer = -1
++_head: list[torch.Tensor] = []         # patch 0090: the LM head's weights (register_head)
++_head_hooked = False                   # patch 0090: the final norm joins (register_decoder_layers)
+ _stream: torch.cuda.Stream | None = None
+ _pending = False
+ _announced = False
+@@ -76,9 +106,36 @@
+     _last_layer = max(_last_layer, layer)
+ 
+ 
++def register_head(tensors) -> None:
++    """dsv41 patch 0090: the LM head's weights, in the order of their bytes (head.py, an EXL3 head: its trellis)."""
++    global _head
++    if not enabled() or HEAD_BUDGET <= 0:
++        return
++    _head = [t for t in tensors if t is not None and t.is_cuda and t.is_contiguous()]
++
++
++def _join_hook(module, args, output) -> None:
++    join()
++
++
++def _hook_final_norm(model) -> None:
++    """dsv41 patch 0090: a forward hook on the final norm joins the head prefetch the last layer's MoE forks."""
++    global _head_hooked
++    norm = getattr(model, "norm", None)
++    if not (isinstance(norm, torch.nn.Module) and type(norm).__name__ != "PPMissingLayer" and "next" in POINTS):
++        return
++    if not getattr(norm, "_exl3_l2pf_join", False):
++        norm.register_forward_hook(_join_hook)
++        norm._exl3_l2pf_join = True
++    _head_hooked = True
++    logger.info("EXL3 L2 prefetch: the final norm joins the LM head prefetch (%d MiB)", HEAD_BUDGET >> 20)
++
++
+ def register_decoder_layers(model) -> None:
+     """The mHC mix weights and router gate of every backbone layer of a DeepseekV4Model (EXL3_L2PF_HC=1; called by
+     patch 0017 once the weights are loaded)."""
++    if enabled() and HEAD_BUDGET > 0:      # patch 0090 (EXL3_L2PF_HEAD_MB / EXL3_L2PF_ORDER)
++        _hook_final_norm(model)
+     if not enabled() or not HC:
+         return
+     n = 0
+@@ -98,7 +155,7 @@
+ 
+ 
+ def _ranges(layer: int, point: str) -> tuple[list[int], list[int]]:
+-    ptrs, sizes, left = [], [], BUDGET
++    ptrs, sizes, left = [], [], (min(BUDGET, MOE_CAP) if point == "moe" and MOE_CAP > 0 else BUDGET)  # 0090
+     for off, module in PLAN[point]:
+         for t in _reg.get((layer + off, module), ()):
+             n = min(t.numel() * t.element_size(), left) // 16 * 16
+@@ -114,6 +171,23 @@
+     return ptrs[:cap], sizes[:cap]
+ 
+ 
++def _head_ranges() -> tuple[list[int], list[int]]:
++    """dsv41 patch 0090: the head trellis's first HEAD_BUDGET bytes, cut like _ranges."""
++    ptrs, sizes, left = [], [], HEAD_BUDGET
++    for t in _head:
++        n = min(t.numel() * t.element_size(), left) // 16 * 16
++        p = t.data_ptr()
++        if n <= 0 or p % 16:
++            continue
++        ptrs.append(p)
++        sizes.append(n)
++        left -= n
++        if left < 16:
++            break
++    cap = 24                                   # PMAX in csrc/exl3_l2pf.cu
++    return ptrs[:cap], sizes[:cap]
++
++
+ def join() -> None:
+     global _pending
+     if _pending:
+@@ -130,9 +204,14 @@
+     if name not in POINTS and not last:
+         return
+     join()
+-    if last or name not in POINTS:
++    if last and name in POINTS and layer == _last_layer and _head_hooked and _head:
++        # patch 0090: the last backbone layer's MoE forks the LM head's first bytes; the final norm's hook joins
++        # them (draft layers past the backbone never fork here)
++        ptrs, sizes = _head_ranges()
++    elif last or name not in POINTS:
+         return                                 # the last layer's MoE: the forward ends with nothing in flight
+-    ptrs, sizes = _ranges(layer, name)
++    else:
++        ptrs, sizes = _ranges(layer, name)
+     if not ptrs:
+         return
+     cur = torch.cuda.current_stream()
+@@ -147,3 +226,8 @@
+         _announced = True
+         logger.info("EXL3 L2 prefetch on: points %s, %d MiB a fork, %.0f GB/s pacing, %d modules registered "
+                     "(layers 0-%d)", ",".join(sorted(POINTS)), BUDGET >> 20, RATE_GBPS, len(_reg), _last_layer)
++        if ORDER or MOE_CAP > 0 or HEAD_BUDGET > 0:
++            logger.info("EXL3 L2 prefetch (patch 0090): %s order, moe fork %d MiB, head %d MiB",
++                        "critical-first" if ORDER else "default",
++                        (min(BUDGET, MOE_CAP) if MOE_CAP > 0 else BUDGET) >> 20,
++                        HEAD_BUDGET >> 20 if _head_hooked and _head else 0)

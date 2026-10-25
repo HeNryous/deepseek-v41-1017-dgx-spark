@@ -1,0 +1,299 @@
+dsv41 patch 0091 (25.10.2026): upstream vLLM bug fixes backported onto 6e517b15 (in image v30).
+#59096 file-tier mark_miss assert (EngineCore crash when a load fails while another request probes the same key);
+#59880 spec-decode step blocks reserved in every KV cache group, not once (async loads, incl. 0084 rounds;
+VLLM_DSV41_SPEC_RESERVE_PER_GROUP=0 restores the old count); #61174 stale block-table rows after a batch shrinks;
+#63165 + #61000 shm_broadcast queue growth on the head node and buffer ownership; #59504 KV zeroing skipped only for the
+groups an async load writes. Skipped #60767 (our SM120 sparse-SWA path reads only window slots, never whole pages).
+Measured (A/B 25.10., same window, fresh boots): T=0 text identical 8/8 to v29; 1 / 4 / 8 streams 55.9 / 110.2 / 144.8
+tok/s (v29 55.9 / 107.3 / 144.6), sustained 4x90 s 131.1 (130.0), 300K prefill 131 s (135 s), corruption 0 in 6 batteries.
+diff -ruN a/vllm/distributed/device_communicators/shm_broadcast.py b/vllm/distributed/device_communicators/shm_broadcast.py
+--- a/vllm/distributed/device_communicators/shm_broadcast.py	2026-10-25 06:11:04.054015974 +0100
++++ b/vllm/distributed/device_communicators/shm_broadcast.py	2026-10-25 06:11:04.058448802 +0100
+@@ -70,6 +70,10 @@
+ # written-flag. Bounds lost-notify recovery latency to ~5s while the periodic
+ # wakeup stays negligible (one flag check per reader every 5s).
+ SHM_READER_RECHECK_INTERVAL_MS = 5000
++# dsv41 patch 0091 (upstream #63165): how often a busy reader polls its notify socket. CONFLATE
++# keeps one message, but libzmq still queues an internal command per notification until the socket
++# is polled, so a reader that never goes idle would grow without bound.
++SHM_NOTIFY_POLL_INTERVAL_S = 2.0
+ 
+ 
+ from_bytes_big = functools.partial(int.from_bytes, byteorder="big")
+@@ -142,6 +146,8 @@
+         if is_reader:
+             # Time of last shm buffer read
+             self.last_read = time.monotonic()
++            # Time a busy reader last polled the notify socket
++            self.last_notify_poll = self.last_read  # dsv41 patch 0091 (upstream #63165)
+ 
+             # Time to keep busy-looping on the shm buffer before going idle
+             self.busy_loop_s = busy_loop_s
+@@ -184,6 +190,13 @@
+ 
+     def record_read(self):
+         self.last_read = time.monotonic()
++        # dsv41 patch 0091 (upstream #63165)
++        if self.last_read - self.last_notify_poll >= SHM_NOTIFY_POLL_INTERVAL_S:
++            self.last_notify_poll = self.last_read
++            # poll() makes libzmq process the queued commands; a bare recv()
++            # returns the pending message without doing so.
++            if self.local_notify_socket.poll(timeout=0):
++                self.local_notify_socket.recv(flags=zmq.NOBLOCK, copy=False)
+ 
+     def cancel(self):
+         # Sends cancellation ping that will cause the reader to wake up.
+@@ -408,8 +421,8 @@
+     Counterpart of `_reduce_tensor`. Note that pickle passes the original
+     buffer-providing object from `loads(buffers=...)` straight to this
+     function (no `PickleBuffer` wrapper on the receiving side), so `buf` is
+-    a `zmq.Frame`, a `memoryview` of a shared-memory ring chunk, or `bytes`
+-    if the buffer was serialized in-band.
++    a `zmq.Frame`, an owned `bytearray` from the shared-memory ring, or
++    `bytes`/`bytearray` if the buffer was serialized in-band.
+     """
+     dtype = getattr(torch, dtype_str)
+     assert isinstance(dtype, torch.dtype)
+@@ -423,11 +436,9 @@
+         except ValueError:
+             # Empty or read-only frame buffer; fall through to the copy path.
+             pass
+-    # Shared-memory ring buffer chunks are reused by the writer once all
+-    # readers have marked them read, so we must copy out of them. bytearray
+-    # (vs bytes) keeps the resulting tensor writable, matching normal tensor
+-    # semantics.
+-    raw = bytearray(buf)
++    # dsv41 patch 0091 (upstream #61000): dequeue already owns SHM buffers. Copy other
++    # buffers to keep them writable.
++    raw = buf if isinstance(buf, bytearray) else bytearray(buf)
+     if not raw:
+         assert 0 in shape
+         return torch.empty(shape, dtype=dtype)
+@@ -912,7 +923,10 @@
+                         buf_offset = offset + 4
+                         buf_len = from_bytes_big(buf[offset:buf_offset])
+                         offset = buf_offset + buf_len
+-                        all_buffers.append(buf[buf_offset:offset])
++                        buffer = buf[buf_offset:offset]
++                        # dsv41 patch 0091 (upstream #61000): out-of-band arrays may
++                        # outlive this reusable ring slot.
++                        all_buffers.append(buffer if i == 0 else bytearray(buffer))
+                     obj = pickle.loads(all_buffers[0], buffers=all_buffers[1:])
+             if overflow:
+                 obj = MessageQueue.recv(self.local_socket, timeout)
+diff -ruN a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py	2026-10-25 06:11:04.068410527 +0100
++++ b/vllm/v1/core/sched/scheduler.py	2026-10-25 06:11:04.070015889 +0100
+@@ -47,6 +47,12 @@
+ # unchanged. VLLM_DSV41_BG_IDLE_FILE (integer, 0 = off) overrides it live, read at most every 2 s. Default off.
+ _DSV41_BG_IDLE_TOKENS = int(_dsv41_os.environ.get("VLLM_DSV41_BG_IDLE_TOKENS", "0") or 0)
+ _DSV41_BG_IDLE_FILE = _dsv41_os.environ.get("VLLM_DSV41_BG_IDLE_FILE", "")
++# dsv41 patch 0091 (upstream #59880): the spec decode step's extra KV slots are reserved in
++# every KV cache group (base: cdiv(1 + k + lookahead, block_size) once). VLLM_DSV41_SPEC_RESERVE_PER_GROUP=0
++# restores the old count. Default on.
++_DSV41_SPEC_RESERVE_PER_GROUP = (
++    _dsv41_os.environ.get("VLLM_DSV41_SPEC_RESERVE_PER_GROUP", "1").strip() != "0"
++)
+ # dsv41 patch 0075 (22.10.2026): the worker skips the decoder replay (layers past the last KV source) of a prefill chunk
+ # that trims and leaves more than a window (models/deepseek_v41/replay_skip.py). That is exact only if the next chunk
+ # trims too (more than prefix_replay_tokens rows), so a text request with more than a window left never gets a chunk
+@@ -418,6 +424,28 @@
+                 self.cache_config.enable_mamba_shared_prefix_checkpoint
+             ),
+         )
++        # dsv41 patch 0091 (upstream #59880): blocks for the spec decode step's extra slots,
++        # summed over the KV cache groups. Mamba managers already account for their
++        # speculative state blocks.
++        _dsv41_spec_step_tokens = (
++            1 + self.num_spec_tokens + self.num_lookahead_tokens
++            if self.num_spec_tokens
++            else 0
++        )
++        self._dsv41_spec_step_blocks = sum(
++            cdiv(_dsv41_spec_step_tokens, manager.block_size)
++            for manager in self.kv_cache_manager.coordinator.single_type_managers
++            if not isinstance(manager.kv_cache_spec, MambaSpec)
++        )
++        if self.num_spec_tokens:
++            logger.info(
++                "dsv41 patch 0091 (#59880): spec decode step reserves %d blocks over %d KV "
++                "cache groups (old count %d, per-group count %s)",
++                self._dsv41_spec_step_blocks,
++                len(self.kv_cache_manager.coordinator.single_type_managers),
++                cdiv(_dsv41_spec_step_tokens, self.block_size),
++                "on" if _DSV41_SPEC_RESERVE_PER_GROUP else "off",
++            )
+         # Bind after construction so connectors can access the cache manager.
+         if self.connector is not None:
+             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
+@@ -1562,9 +1590,10 @@
+                     if self.needs_kv_cache_zeroing:
+                         # Skip zeroing of the blocks the async load will
+                         # overwrite; the zeroing could race the write.
++                        # dsv41 patch 0091 (upstream #59504): only the groups the load writes
+                         self._skip_zero_block_ids.update(
+-                            self.kv_cache_manager.get_zeroing_block_ids_in_range(
+-                                request_id,
++                            self._dsv41_zeroing_block_ids_in_range(
++                                request,
+                                 num_new_local_computed_tokens,
+                                 num_computed_tokens,
+                             )
+@@ -3350,9 +3379,13 @@
+     def _request_remaining_blocks(self, request: Request) -> int:
+         """Blocks `request` still needs to hold its full sequence and be promoted."""
+         full_num_tokens = min(request.num_tokens, self.max_model_len)
++        num_tokens = full_num_tokens
++        if _DSV41_SPEC_RESERVE_PER_GROUP and self.num_spec_tokens:
++            # dsv41 patch 0091 (upstream #59880): each group counts the step's slots itself
++            num_tokens += 1 + self.num_spec_tokens + self.num_lookahead_tokens
+         num_blocks = self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
+             request_id=request.request_id,
+-            num_tokens=full_num_tokens,
++            num_tokens=num_tokens,
+             new_computed_blocks=self.kv_cache_manager.empty_kv_cache_blocks.blocks,
+             num_encoder_tokens=0,
+             total_computed_tokens=request.num_computed_tokens,
+@@ -3361,6 +3394,8 @@
+             apply_admission_cap=True,
+             prefill_end=max(request.num_prompt_tokens, request.num_tokens - 1),
+         )
++        if _DSV41_SPEC_RESERVE_PER_GROUP:
++            return num_blocks  # dsv41 patch 0091 (upstream #59880)
+         return num_blocks + self._spec_decode_step_blocks()
+ 
+     def _spec_decode_step_blocks(self) -> int:
+@@ -3370,12 +3405,57 @@
+         full sequence + the spec decode step, otherwise request cannot be
+         able to run after the async_load if we are out of kv blocks.
+         """
++        if _DSV41_SPEC_RESERVE_PER_GROUP:
++            # dsv41 patch 0091 (upstream #59880): per KV cache group (__init__); also used by
++            # the 0084 follow-up rounds (dsv41_round_reserved)
++            return self._dsv41_spec_step_blocks
+         if not self.num_spec_tokens:
+             return 0
+         return cdiv(
+             1 + self.num_spec_tokens + self.num_lookahead_tokens, self.block_size
+         )
+ 
++    def _dsv41_zeroing_block_ids_in_range(
++        self, request: Request, start_token: int, end_token: int
++    ) -> list[int]:
++        """dsv41 patch 0091 (upstream #59504): the request's block ids covering
++        [start_token, end_token) in the groups whose new blocks the worker zeroes AND
++        that the connector's async load writes. Base took every zeroed group, so blocks of
++        groups the load does not write (for us the bounded-replay SWA groups) kept stale
++        bytes. Upstream skips recording them at allocation (record_for_zeroing); this
++        filters the same blocks here, without touching the KV cache manager files."""
++        fn = getattr(self.connector, "get_loaded_kv_cache_group_ids", None)
++        loaded = set(
++            fn(request)
++            if callable(fn)
++            else self.kv_cache_config.prefix_cacheable_group_ids
++        )
++        if not getattr(self, "_dsv41_zero_logged", False):
++            self._dsv41_zero_logged = True
++            logger.info(
++                "dsv41 patch 0091 (#59504): async KV loads exempt groups %s from zeroing "
++                "(zeroed groups: %s)",
++                sorted(loaded),
++                [
++                    i
++                    for i, m in enumerate(
++                        self.kv_cache_manager.coordinator.single_type_managers
++                    )
++                    if m.records_new_block_ids
++                ],
++            )
++        ids: list[int] = []
++        for gid, mgr in enumerate(
++            self.kv_cache_manager.coordinator.single_type_managers
++        ):
++            if gid not in loaded or not mgr.records_new_block_ids:
++                continue
++            start_idx = start_token // mgr.block_size
++            end_idx = cdiv(end_token, mgr.block_size)
++            blocks = mgr.req_to_blocks.get(request.request_id, ())
++            ids.extend(blk.block_id for blk in blocks[start_idx:end_idx])
++        return ids
++
+     def _set_kv_fetch_stage(self, request: Request, stage: str | None) -> None:
+         kv_fetch_stages = self._kv_fetch_stages
+         if kv_fetch_stages is not None:
+diff -ruN a/vllm/v1/kv_offload/tiering/async_lookup.py b/vllm/v1/kv_offload/tiering/async_lookup.py
+--- a/vllm/v1/kv_offload/tiering/async_lookup.py	2026-10-25 06:11:04.081685494 +0100
++++ b/vllm/v1/kv_offload/tiering/async_lookup.py	2026-10-25 06:11:04.084487628 +0100
+@@ -216,12 +216,15 @@
+     def mark_miss(self, keys: Collection[OffloadKey]) -> None:
+         """Force the cached verdict for ``keys`` to False after a failed load, so
+         the scheduler stops re-issuing the doomed promotion (livelock, #49176).
+-        Keys with no cached entry are skipped."""
++        Keys with no cached entry are skipped, and so are keys whose entry is
++        a newer probe still PENDING or IN_FLIGHT: its own result will land,
++        and forcing it to RESOLVED here would trip the phase asserts in
++        flush() / drain_results() on the scheduler thread."""
+         for key in keys:
+             state = self._lookup_state.get(key)
+-            if state is not None:
++            # dsv41 patch 0091 (upstream #59096)
++            if state is not None and state.phase is LookupPhase.RESOLVED:
+                 state.result = False
+-                state.phase = LookupPhase.RESOLVED
+ 
+     def cleanup(self, req_id: str) -> None:
+         """Release request references, retaining in-flight lookups.
+diff -ruN a/vllm/v1/worker/gpu/block_table.py b/vllm/v1/worker/gpu/block_table.py
+--- a/vllm/v1/worker/gpu/block_table.py	2026-10-25 06:11:04.094111428 +0100
++++ b/vllm/v1/worker/gpu/block_table.py	2026-10-25 06:11:04.096905006 +0100
+@@ -81,6 +81,9 @@
+         self.input_block_tables: list[torch.Tensor] = [
+             torch.zeros_like(b.gpu) for b in self.block_tables
+         ]
++        # dsv41 patch 0091 (upstream #61174): rows of the shared input tables that may hold
++        # block ids beyond the current batch (left by a larger earlier batch)
++        self._num_dirty_rows = 0
+ 
+         self.slot_mappings = torch.zeros(
+             self.num_kv_cache_groups,
+@@ -164,15 +167,20 @@
+     ) -> tuple[torch.Tensor, ...]:
+         if self.num_kv_cache_groups == 0:
+             return ()
++        num_reqs = idx_mapping.shape[0]
++        num_rows = num_reqs_padded
+         if out is None:
+             out = tuple(self.input_block_tables)
+             out_ptrs = self.input_block_table_ptrs
++            # dsv41 patch 0091 (upstream #61174)
++            num_rows = max(num_rows, self._num_dirty_rows)
++            self._num_dirty_rows = num_reqs
+         else:
+             assert out_ptrs is not None
+             assert len(out) == self.num_kv_cache_groups
+-        num_reqs = idx_mapping.shape[0]
+-        # Launch kernel with num_reqs_padded to fuse zeroing of padded rows.
+-        _gather_block_tables_kernel[(self.num_kv_cache_groups, num_reqs_padded)](
++        # Launch with num_reqs_padded (fused zeroing of padded rows) and also clear
++        # rows left by a larger batch in the shared buffer (patch 0091, #61174).
++        _gather_block_tables_kernel[(self.num_kv_cache_groups, num_rows)](
+             idx_mapping,
+             self.block_table_ptrs,
+             out_ptrs,
+@@ -193,9 +201,13 @@
+         # Zero the rows so dummy runs write mamba state to the reserved null
+         # block rather than through the previous real step's (stale) block
+         # ids, which may point at blocks since freed and reallocated.
+-        return tuple(
+-            block_table[:num_reqs].zero_() for block_table in self.input_block_tables
+-        )
++        # dsv41 patch 0091 (upstream #61174)
++        num_rows = max(num_reqs, self._num_dirty_rows)
++        for block_table in self.input_block_tables:
++            block_table[:num_rows].zero_()
++        # Profiling may populate the returned rows with valid block IDs.
++        self._num_dirty_rows = num_reqs
++        return tuple(block_table[:num_reqs] for block_table in self.input_block_tables)
+ 
+     def compute_slot_mappings(
+         self,
