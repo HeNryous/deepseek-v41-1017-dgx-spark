@@ -634,6 +634,15 @@ GEMM/GEMV/MoE kernel sources are unchanged, T=0 text identical 8/8 to v30, 1 str
 
 ## Tips that helped on GB10
 
+- **Shrink the display reservation headless (ASUS GX10, BIOS 0107.2026.1016).** The UEFI option "Display Reserved
+  Memory" (default 2 GB) can be set from Linux: the firmware reads the request variable `NvidiaDispFrmSizeRequest`
+  (GUID 284e19b9-235f-4aab-ae4c-190456d1bd76) at every boot, checks it (0 Auto, 1 = 0.5 GB, 2 = 1 GB, 3 = 2 GB, 5 = 4 GB),
+  applies it and deletes it. As root: `printf '\007\000\000\000\001' > /sys/firmware/efi/efivars/NvidiaDispFrmSizeRequest-284e19b9-235f-4aab-ae4c-190456d1bd76`,
+  reboot, then `od -An -tx1 /sys/firmware/efi/efivars/NvidiaDispFrmStatus-284e19b9-235f-4aab-ae4c-190456d1bd76` should read
+  `06 00 00 00 01 00 02 00 00` (512 MiB). MemTotal went from 124,544 to 126,077 MiB per node; we put 1 GiB of it into the
+  KV pool (3.5 → 4.5 GiB per rank, 1.82M → 2.35M tokens). Found by reading the October capsule's IFR and SsmpuDxe; an
+  invalid value is rejected by the firmware. A BIOS update may reset it, so check the status after updates. Do one node
+  first, and only if you can reach it with a monitor in the worst case.
 - **Remove the kdump crash-kernel reservation** (`crashkernel=` on the kernel command line): +2.1 GiB usable memory per node.
 - **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** (together with 0033): ~1.3 GiB more free at the 314K peak.
 - **Don't upload, hash or copy big files on a node that is serving.** GB10 CUDA allocations don't reclaim page cache; an

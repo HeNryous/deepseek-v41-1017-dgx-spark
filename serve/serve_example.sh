@@ -19,7 +19,9 @@ export SERVED=DeepSeek-V4.1-Flash-1017-EXL3-Spark-TP2
 export TEXT_ONLY=0 MAX_LEN=1048576 MAX_SEQS=8 MAX_BATCH=4096 UTIL=0.86   # 1M context since 22.10. (needle at 949K 3/3, needs 0076);
                                                  # 8 slots since 23.10. (README: "Eight slots with strict priority")
 export KV_BYTES=3758096384                       # 3.5 GiB per rank (256 MiB of the head node go to the offload's CPU tier)
-                                                 # -> 1,824,938 tokens at MAX_LEN 1048576; UTIL then only gates the startup check
+                                                 # -> 1,824,938 tokens at MAX_LEN 1048576; UTIL then only gates the startup check.
+                                                 # With the display reservation at 0.5 GB (README, "Tips") we run 4831838208
+                                                 # (4.5 GiB, 2,346,339 tokens; lowest free memory under load 2.6 GiB head node)
 # 0040: DSpark k = 5 at 1-4 streams (at most 24 verify rows, kept on exl3_mrow by 0042b; until 21.10. k = 4 at 3-4),
 # k = 3 at 5-8 streams (at most 32 rows)
 export SPEC='{"method":"dspark","num_speculative_tokens":5,"num_speculative_tokens_per_batch_size":[[1,4,5],[5,8,3]]}'
